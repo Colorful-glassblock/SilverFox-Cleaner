@@ -26,7 +26,11 @@
 #define MAXF 1024
 
 static const char *C2_IOCS[]  = {"4d.skendh.com", "de.sjd82.org", "skendh.com", "sjd82.org", "dmo/client"};
-static const char *NAME_HITS[] = {"ekxzjr", "dd9ocged", "srl.exe", "wdybq.dll", "drivers.dat", "drivers.dat.0"};
+static const char *NAME_HITS[] = {"ekxzjr", "dd9ocged", "srl.exe", "wdybq.dll",
+    "drivers.dat", "drivers.dat.0",
+    "wow64log.dll", "vafdska.sys", "vmservice.sys",  /* 旧版变种驱动/劫持 DLL (社区工具 IOC) */
+    "1.bat", "fhq.bat", "z_1.bat"};
+static const char *DIR_HITS[] = {"diamondage", "roning", "minifilterdrv"};
 static const char *SVC_PATS[][2] = {{"EkxZJr", "1"}, {"SrL.exe", "1"}, {"cd /d", "0"}};
 
 typedef struct { char kind[12]; char detail[700]; int high; char action[400]; } Finding;
@@ -360,6 +364,9 @@ static int tree_contains(HKEY k, const char *pat, int depth)
     return 0;
 }
 
+/* 旧版变种驱动服务黑名单 (社区清理工具交叉引用) */
+static const char *SVC_BLACK[] = {"vafdska", "MiniFilterDrv", "vmservice", "MicrosoftSoftware2ShadowCop4yProvider"};
+
 static void scan_services(void)
 {
     HKEY rk; DWORD i, subs = 0;
@@ -375,6 +382,18 @@ static void scan_services(void)
             if (RegEnumKeyExA(rk, i, name, &l, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) continue;
             for (j = 0; j < nseen; j++) if (!_stricmp(seen[j], name)) { dup = 1; break; }
             if (dup) continue;
+            {
+                int b;
+                for (b = 0; b < (int)(sizeof SVC_BLACK / sizeof SVC_BLACK[0]); b++) {
+                    if (!_stricmp(name, SVC_BLACK[b])) {
+                        char det[300], act[300];
+                        _snprintf(det, sizeof det - 1, "%s [银狐变种驱动服务]", name);
+                        _snprintf(act, sizeof act - 1, "sc delete \"%s\"", name);
+                        addf("SERVICE", 1, det, act);
+                        break;
+                    }
+                }
+            }
             if (RegOpenKeyExA(rk, name, 0, KEY_READ, &sk) != ERROR_SUCCESS) continue;
             if (tree_contains(sk, SVC_PATS[p][0], 0)) {
                 RegCloseKey(sk);
@@ -516,6 +535,19 @@ static void file_cb(const char *full, void *unused)
     sz = ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
     {
         char md[64] = "";
+        {
+            static const char *exts[] = {".exe", ".dll", ".sys", ".xl", ".xlez"};
+            size_t fl = strlen(lfnm);
+            int k, isExt = 0;
+            for (k = 0; k < (int)(sizeof exts / sizeof exts[0]); k++) {
+                size_t el = strlen(exts[k]);
+                if (fl > el && !_stricmp(lfnm + fl - el, exts[k])) { isExt = 1; break; }
+            }
+            if (isExt && (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)))
+                strcat(md, " [隐藏+系统]");
+            if (strstr(low, "\\public\\downloads\\") && isExt && (fd.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM))
+                strcat(md, " [公共下载可疑]");
+        }
         if (sz > 100 * 1024) {
             FILE *f = fopen(full, "rb");
             if (f) {
@@ -554,6 +586,74 @@ static void scan_files(void)
     }
 }
 
+/* 默认 hosts 内容 (Windows 出厂样式) */
+static const char *DEFAULT_HOSTS =
+    "# Copyright (c) 1993-2009 Microsoft Corp.\r\n"
+    "#\r\n"
+    "# This is a sample HOSTS file used by Microsoft TCP/IP for Windows.\r\n"
+    "# This file contains the mappings of IP addresses to host names. Each\r\n"
+    "# entry should be kept on an individual line. The IP address should\r\n"
+    "# be placed in the first column followed by the corresponding host name.\r\n"
+    "# The IP address and the host name should be separated by at least one space.\r\n"
+    "#\r\n"
+    "# localhost name resolution is handled within DNS itself.\r\n"
+    "#\t127.0.0.1       localhost\r\n"
+    "#\t::1             localhost\r\n";
+
+/* hosts 篡改检测: 任何非注释活动条目且非 localhost 映射即判定可疑 (银狐常用于封杀软更新域) */
+static void scan_hosts(void)
+{
+    const char *hp = "C:\\Windows\\System32\\drivers\\etc\\hosts";
+    FILE *f = fopen(hp, "r");
+    char line[1024];
+    int suspicious = 0;
+    if (!f) return;
+    while (fgets(line, sizeof line, f)) {
+        char *c = line;
+        while (*c == ' ' || *c == '\t') c++;
+        if (*c == 0 || *c == '\n' || *c == '\r' || *c == '#') continue;
+        if (strncmp(c, "127.0.0.1", 9) != 0 && strncmp(c, "::1", 3) != 0) {
+            suspicious = 1;
+            break;
+        }
+    }
+    fclose(f);
+    if (suspicious) {
+        addf("HOSTS", 1, "hosts 文件被篡改 (存在活动解析条目)", "重置为默认并隔离原件");
+    }
+}
+
+/* Windows 更新服务篡改检测 (银狐尾巴; 单独恢复脚本由社区作者发布) */
+static void scan_wu(void)
+{
+    static const char *wus[] = {"wuauserv", "UsoSvc", "uhssvc", "WaaSMedicSvc"};
+    int i;
+    for (i = 0; i < (int)(sizeof wus / sizeof wus[0]); i++) {
+        HKEY sk;
+        char path[128];
+        DWORD start = 0, cb = sizeof start, typ = 0;
+        char dep[512]; DWORD dcb = sizeof dep;
+        _snprintf(path, sizeof path - 1, "SYSTEM\\CurrentControlSet\\Services\\%s", wus[i]);
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, path, 0, KEY_READ, &sk) != ERROR_SUCCESS) continue;
+        RegQueryValueExA(sk, "Start", NULL, &typ, (BYTE *)&start, &cb);
+        dep[0] = 0;
+        RegQueryValueExA(sk, "DependOnService", NULL, &typ, (BYTE *)dep, &dcb);
+        RegCloseKey(sk);
+        if (start != 2) {
+            char det[300], act[300];
+            _snprintf(det, sizeof det - 1, "Windows 更新服务被禁用: %s (Start=%lu)", wus[i], (unsigned long)start);
+            _snprintf(act, sizeof act - 1, "sc config %s start= auto", wus[i]);
+            addf("WU", 1, det, act);
+        }
+        if (dep[0] && !strstr(dep, "RpcSs")) {
+            char det[300], act[300];
+            _snprintf(det, sizeof det - 1, "更新服务依赖被篡改: %s", wus[i]);
+            _snprintf(act, sizeof act - 1, "sc config %s depend= RpcSs", wus[i]);
+            addf("WU", 0, det, act);
+        }
+    }
+}
+
 static void scan_all(void)
 {
     enable_privs();
@@ -563,6 +663,8 @@ static void scan_all(void)
     scan_procs();
     scan_ctfmon();
     scan_files();
+    scan_wu();
+    scan_hosts();
 }
 
 /* ---- 清除 ---- */
@@ -615,6 +717,23 @@ static void do_clean(char *extra, size_t esz)
             c = strstr(src, " [");
             if (c) *c = 0;
             s = quarantine_one(src, qdir);
+        } else if (!strcmp(g_f[i].kind, "WU")) {
+            char svc[64];
+            if (sscanf(g_f[i].detail, "Windows %*[^:]: %[^  ]", svc) < 1) strcpy(svc, g_f[i].detail);
+            s = run_cmd("sc config %s start= auto", svc);
+            run_cmd("sc config %s depend= RpcSs", svc);
+            run_cmd("sc start %s", svc);
+        } else if (!strcmp(g_f[i].kind, "HOSTS")) {
+            const char *hp = "C:\\Windows\\System32\\drivers\\etc\\hosts";
+            s = quarantine_one(hp, qdir);           /* 加密隔离原件 (失败也不阻塞) */
+            {
+                FILE *o = fopen(hp, "w");
+                if (o) {
+                    fwrite(DEFAULT_HOSTS, 1, strlen(DEFAULT_HOSTS), o);
+                    fclose(o);
+                    s = 1;
+                } else s = 0;
+            }
         }
         if (s) ok++; else fail++;
     }
