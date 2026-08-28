@@ -47,7 +47,7 @@
             </Button>
             <Button x:Name="BtnNomore" Click="Nomore_Click">
                 <StackPanel Orientation="Horizontal" Spacing="8">
-                    <SymbolIcon Symbol="Shield"/>
+                    <SymbolIcon Symbol="Permissions"/>
                     <TextBlock Text="不客气"/>
                 </StackPanel>
             </Button>
