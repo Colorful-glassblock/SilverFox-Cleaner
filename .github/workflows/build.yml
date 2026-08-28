@@ -1,7 +1,7 @@
-name: build
+name: C Build (x86 + x64 + driver)
 on: [push, workflow_dispatch]
 jobs:
-  build:
+  exe:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,8 +17,22 @@ jobs:
           x86_64-w64-mingw32-gcc -O2 -s -Wall -Wno-pointer-sign -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 -finput-charset=UTF-8 -fexec-charset=GBK -mwindows -Wl,--major-subsystem-version,6 -Wl,--minor-subsystem-version,1 -o SFCleaner_x64.exe sfcleaner.c /tmp/mf64.o
       - uses: actions/upload-artifact@v4
         with:
-          name: SFCleaner-C
+          name: SFCleaner-C-exe
           path: |
             SFCleaner_x86.exe
             SFCleaner_x64.exe
-            sfcleaner_drv/Driver.c
+  driver:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build kernel driver (MSVC, native subsystem)
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64
+          lib.exe /def:ntoskrnl.def /out:ntoskrnl.lib /machine:x64
+          cl.exe /nologo /c /GS- /Gs- /guard:cf- /sdl- /kernel /Zl /W3 sfcleaner_drv\Driver.c
+          link.exe /NODEFAULTLIB /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /DRIVER /out:SFCleanerDrv.sys Driver.obj ntoskrnl.lib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SFCleanerDrv
+          path: SFCleanerDrv.sys

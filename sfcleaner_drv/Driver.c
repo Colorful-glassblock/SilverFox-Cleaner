@@ -17,6 +17,21 @@
 
 #define REG_KEY_PATH  L"\\Registry\\Machine\\SOFTWARE\\SFCleaner"
 
+/* 内核无 CRT: 自备字符串辅助 */
+static inline ULONG drv_wcslen(PCWSTR s)
+{
+    ULONG n = 0;
+    while (s && *s++) n++;
+    return n;
+}
+
+static inline ULONG strnlen_w(const WCHAR *s, ULONG max)
+{
+    ULONG n = 0;
+    while (n < max && s[n]) n++;
+    return n;
+}
+
 static void drv_reg_close(HANDLE h)
 {
     if (h) ZwClose(h);
@@ -82,7 +97,7 @@ static void drv_kill_by_name(PCWSTR name)
         PSYSTEM_PROCESS_INFORMATION cur = spi;
         for (;;) {
             UNICODE_STRING im = cur->ImageName;
-            im.Length = (USHORT)strnlen_w(im.Buffer, im.MaximumLength / 2) * 2; /* 安全截断 */
+            im.Length = (USHORT)(strnlen_w(im.Buffer, im.MaximumLength / 2) * 2);
             if (RtlEqualUnicodeString(&im, &probeW, TRUE)) {
                 HANDLE ph = NULL;
                 OBJECT_ATTRIBUTES oa;
@@ -108,7 +123,7 @@ static void drv_delete_file(PCWSTR path)
     HANDLE h = NULL;
     FILE_DISPOSITION_INFORMATION disp;
     NTSTATUS st;
-    USHORT l = (USHORT)(wcslen(path) * sizeof(WCHAR));
+    USHORT l = (USHORT)(drv_wcslen(path) * sizeof(WCHAR));
 
     us.Length = l; us.MaximumLength = l + 2; us.Buffer = (PWSTR)path;
     InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
@@ -171,7 +186,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING regPath)
     /* 1) 杀进程 (配置或内置) */
     procs = drv_reg_read_msz(L"DrvProcs", &cbR);
     if (procs) {
-        for (p = procs; *p; p += wcslen(p) + 1) drv_kill_by_name(p);
+        for (p = procs; *p; p += drv_wcslen(p) + 1) drv_kill_by_name(p);
         ExFreePoolWithTag(procs, 'fcsD');
     }
     drv_kill_by_name(L"srl.exe");
@@ -180,7 +195,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING regPath)
     /* 2) 删路径 (配置或内置) */
     paths = drv_reg_read_msz(L"DrvPaths", &cbP);
     if (paths) {
-        for (p = paths; *p; p += wcslen(p) + 1) drv_delete_file(p);
+        for (p = paths; *p; p += drv_wcslen(p) + 1) drv_delete_file(p);
         ExFreePoolWithTag(paths, 'fcsD');
     }
     drv_wipe_subtree(NULL);
