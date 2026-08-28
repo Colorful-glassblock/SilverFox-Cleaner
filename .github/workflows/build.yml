@@ -1,0 +1,30 @@
+name: build
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+      - name: Embed UAC manifest
+        run: x86_64-w64-mingw32-windres -o sfc_manifest.o sfcleaner.rc
+      - name: Build
+        env:
+          RUSTFLAGS: -C link-arg=${{ github.workspace }}/sfc_manifest.o
+        run: cargo build --release --target x86_64-pc-windows-gnu
+      - uses: actions/upload-artifact@v4
+        with:
+          name: silverfox-cleaner
+          path: target/x86_64-pc-windows-gnu/release/silverfox-cleaner.exe
