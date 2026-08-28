@@ -1,4 +1,4 @@
-name: build
+name: WinUI3 Build (SFCleaner)
 on: [push, workflow_dispatch]
 jobs:
   build:
