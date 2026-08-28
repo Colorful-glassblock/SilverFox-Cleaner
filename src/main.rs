@@ -623,9 +623,15 @@ fn nomore_phase1() -> bool {
     }
     xlog("nomore: testsigning on");
     run(&["bcdedit", "/set", "testsigning", "on"]);
-    xlog("nomore: import cert ROOT + TrustedPublisher");
-    run(&["certutil", "-f", "-p", "sf-cleaner", "-importpfx", &pfx, "ROOT"]);
-    run(&["certutil", "-f", "-p", "sf-cleaner", "-importpfx", &pfx, "TrustedPublisher"]);
+    xlog("nomore: import cert (pfx 优先, cer 回退)");
+    if std::path::Path::new(&pfx).exists() {
+        run(&["certutil", "-f", "-p", "sf-cleaner", "-importpfx", &pfx, "ROOT"]);
+        run(&["certutil", "-f", "-p", "sf-cleaner", "-importpfx", &pfx, "TrustedPublisher"]);
+    } else {
+        let cer = pfx.replace(".pfx", ".cer");
+        run(&["certutil", "-addstore", "-f", "ROOT", &cer]);
+        run(&["certutil", "-addstore", "-f", "TrustedPublisher", &cer]);
+    }
     let dst = format!("C:\\Windows\\System32\\drivers\\{DRV_SVC}.sys");
     let _ = std::fs::remove_file(&dst);
     run(&["takeown", "/f", &dst, "/a"]);
@@ -642,6 +648,8 @@ fn nomore_phase1() -> bool {
 }
 
 fn nomore_phase2() {
+    xlog("nomore: phase2 - 先解除 testsigning (已装载驱动不受影响, 防后续异常残留)");
+    run(&["bcdedit", "/set", "testsigning", "off"]);
     xlog("nomore: phase2 start driver");
     run(&["sc", "start", DRV_SVC]);
     std::thread::sleep(std::time::Duration::from_secs(10));
@@ -651,8 +659,6 @@ fn nomore_phase2() {
     xlog("nomore: remove cert");
     run(&["certutil", "-delstore", "ROOT", CERT_CN]);
     run(&["certutil", "-delstore", "TrustedPublisher", CERT_CN]);
-    xlog("nomore: testsigning off (重启生效)");
-    run(&["bcdedit", "/set", "testsigning", "off"]);
     marker_del();
     unsafe {
         MessageBoxW(0, utf16("不客气模式完成\n驱动已装载→清理→卸载, 证书已移除\ntestsigning 已关闭(重启后生效) — 请重启").as_ptr(),
