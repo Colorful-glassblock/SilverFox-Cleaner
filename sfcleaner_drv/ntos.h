@@ -98,7 +98,9 @@ typedef struct _FILE_DISPOSITION_INFORMATION {
 #ifndef REG_MULTI_SZ
 #define REG_MULTI_SZ 7
 #endif
-#define REG_SZ       1
+#ifndef REG_SZ
+#define REG_SZ 1
+#endif
 typedef struct _KEY_VALUE_PARTIAL_INFORMATION {
     ULONG TitleIndex;
     ULONG Type;
