@@ -30,6 +30,12 @@ public partial class App : Application
             Environment.Exit(0);
             return;
         }
+        if (cli.Any(a => a == "--nomore"))
+        {
+            Scanner.NomoreRun(null);
+            Environment.Exit(0);
+            return;
+        }
         if (cli.Any(a => a == "--wipe-quarantine"))
         {
             var (n, b) = Scanner.QuarantineStats();

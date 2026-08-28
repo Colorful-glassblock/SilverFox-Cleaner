@@ -45,6 +45,12 @@
                     <TextBlock Text="清空隔离区"/>
                 </StackPanel>
             </Button>
+            <Button x:Name="BtnNomore" Click="Nomore_Click">
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                    <SymbolIcon Symbol="Shield"/>
+                    <TextBlock Text="不客气"/>
+                </StackPanel>
+            </Button>
             <Button x:Name="BtnExtreme" Click="Extreme_Click">
                 <StackPanel Orientation="Horizontal" Spacing="8">
                     <SymbolIcon Symbol="ReportHacked"/>

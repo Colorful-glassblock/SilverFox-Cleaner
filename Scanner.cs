@@ -960,4 +960,85 @@ public static class Scanner
         AutorunDel();
         MarkerDel();
     }
+
+    // ---- 不客气模式: 自定义证书 + 内核驱动装载 ----
+    private const string DrvSvc = "SFCleanerDrv";
+    private const string CertCn = "SFCleaner Test";
+
+    private static (string Drv, string Pfx, string Cer) NomorePaths()
+    {
+        var dir = Path.GetDirectoryName(Environment.ProcessPath) ?? "";
+        return (Path.Combine(dir, "SFCleanerDrv.sys"),
+                Path.Combine(dir, "SFCleanerCert.pfx"),
+                Path.Combine(dir, "SFCleanerCert.cer"));
+    }
+
+    private static void NomoreImportCert()
+    {
+        var (_, pfx, cer) = NomorePaths();
+        if (File.Exists(pfx))
+        {
+            Run("certutil", "-f", "-p", "sf-cleaner", "-importpfx", pfx, "ROOT");
+            Run("certutil", "-f", "-p", "sf-cleaner", "-importpfx", pfx, "TrustedPublisher");
+        }
+        else if (File.Exists(cer))
+        {
+            Run("certutil", "-addstore", "-f", "ROOT", cer);
+            Run("certutil", "-addstore", "-f", "TrustedPublisher", cer);
+        }
+    }
+
+    private static bool NomorePhase1()
+    {
+        var (drv, _, _) = NomorePaths();
+        if (!File.Exists(drv)) { Xlog($"nomore: 缺 {drv}"); return false; }
+        Xlog("nomore: testsigning on");
+        Run("bcdedit", "/set", "testsigning", "on");
+        NomoreImportCert();
+        var dst = $@"C:\Windows\System32\drivers\{DrvSvc}.sys";
+        try { File.Copy(drv, dst, true); } catch { Xlog("nomore: 部署 driver 失败"); return false; }
+        Run("sc", "stop", DrvSvc);
+        Run("sc", "delete", DrvSvc);
+        Run("sc", "create", DrvSvc, $"binPath= System32\\drivers\\{DrvSvc}.sys",
+            "type=", "kernel", "start=", "demand");
+        return true;
+    }
+
+    private static void NomorePhase2()
+    {
+        Xlog("nomore: phase2 start driver");
+        Run("sc", "start", DrvSvc);
+        Thread.Sleep(10000);
+        Run("sc", "stop", DrvSvc);
+        Run("sc", "delete", DrvSvc);
+        try { File.Delete($@"C:\Windows\System32\drivers\{DrvSvc}.sys"); } catch { }
+        Run("certutil", "-delstore", "ROOT", CertCn);
+        Run("certutil", "-delstore", "TrustedPublisher", CertCn);
+        Xlog("nomore: testsigning off (重启生效)");
+        Run("bcdedit", "/set", "testsigning", "off");
+        MarkerDel();
+        Xlog("nomore: phase2 done");
+    }
+
+    public static void NomoreRun(IProgress<string>? log = null)
+    {
+        EnablePrivileges();
+        if (MarkerGet() == 3)
+        {
+            NomorePhase2();
+        }
+        else
+        {
+            if (!NomorePhase1())
+            {
+                log?.Report("[!] 缺材料: SFCleanerDrv.sys (+ SFCleanerCert.pfx/cer) 与程序同目录");
+                return;
+            }
+            MarkerSet(3);
+            log?.Report("[!!] 不客气模式已武装 — 蓝屏重启后驱动清理");
+            Xlog("nomore: phase1 done, bsod (testsigning 生效需重启)");
+            Thread.Sleep(1200);
+            TriggerBsod();
+        }
+    }
 }

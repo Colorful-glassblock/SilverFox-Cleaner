@@ -227,6 +227,35 @@ public sealed partial class MainWindow : Window
         _busy = false;
     }
 
+    private async void Nomore_Click(object sender, RoutedEventArgs e)
+    {
+        if (_busy) return;
+        var dlg = new ContentDialog
+        {
+            XamlRoot = Content.XamlRoot,
+            Title = "⚡ 不客气模式确认",
+            Content = new TextBlock
+            {
+                TextWrapping = TextWrapping.Wrap,
+                MaxWidth = 440,
+                Text = "导入自定义证书 + 装载内核驱动清理\n"
+                     + "testsigning ON → 蓝屏重启 → 驱动清理 → 卸载 → 删证书 → testsigning OFF\n\n"
+                     + "材料: SFCleanerDrv.sys + SFCleanerCert.pfx/cer 与程序同目录",
+            },
+            PrimaryButtonText = "启动不客气模式",
+            CloseButtonText = "取消",
+            DefaultButton = ContentDialogButton.Close,
+        };
+        if (await dlg.ShowAsync() != ContentDialogResult.Primary) return;
+        _busy = true;
+        BusyRing.IsActive = true;
+        TblStatus.Text = "不客气模式执行中…";
+        var log = new Progress<string>(AppendLog);
+        await Task.Run(() => Scanner.NomoreRun(log));
+        BusyRing.IsActive = false;
+        _busy = false;
+    }
+
     // ---- 关于 ----
 
     private async void About_Click(object sender, RoutedEventArgs e)
