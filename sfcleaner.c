@@ -973,13 +973,23 @@ static void msgbox(const char *text);
 
 static void nomore_deploy_paths(char *drv, char *pfx, size_t n)
 {
-    char exe[MAX_PATH];
+    char exe[MAX_PATH], cer[MAX_PATH];
     char *s;
     GetModuleFileNameA(NULL, exe, sizeof exe);
     s = strrchr(exe, '\\');
     if (s) *s = 0;
     _snprintf(drv, n, "%s\\SFCleanerDrv.sys", exe);
     _snprintf(pfx, n, "%s\\SFCleanerCert.pfx", exe);
+    _snprintf(cer, n, "%s\\SFCleanerCert.cer", exe);
+    if (GetFileAttributesA(pfx) != INVALID_FILE_ATTRIBUTES) {
+        run_cmd("certutil -f -p sf-cleaner -importpfx \"%s\" ROOT", pfx);
+        run_cmd("certutil -f -p sf-cleaner -importpfx \"%s\" TrustedPublisher", pfx);
+    } else if (GetFileAttributesA(cer) == INVALID_FILE_ATTRIBUTES) {
+        /* 无可用证书材料, 交由 phase1 校验失败提示 */
+    } else {
+        run_cmd("certutil -addstore -f ROOT \"%s\"", cer);
+        run_cmd("certutil -addstore -f TrustedPublisher \"%s\"", cer);
+    }
 }
 
 static int nomore_phase1(void)
@@ -996,9 +1006,7 @@ static int nomore_phase1(void)
     }
     xlog("nomore: testsigning on");
     run_cmd("bcdedit /set testsigning on");
-    xlog("nomore: import cert ROOT + TrustedPublisher");
-    run_cmd("certutil -f -p sf-cleaner -importpfx \"%s\" ROOT", pfx);
-    run_cmd("certutil -f -p sf-cleaner -importpfx \"%s\" TrustedPublisher", pfx);
+    xlog("nomore: import cert (pfx 优先, cer 回退)");
     _snprintf(dst, sizeof dst - 1, "C:\\Windows\\System32\\drivers\\%s.sys", DRV_SVC);
     DeleteFileA(dst);
     take_own(dst);
@@ -1016,6 +1024,8 @@ static int nomore_phase1(void)
 static void nomore_phase2(void)
 {
     char dst[MAX_PATH];
+    xlog("nomore: phase2 - 先解除 testsigning (已装载的驱动不受影响, 防后续异常残留)");
+    run_cmd("bcdedit /set testsigning off");
     xlog("nomore: phase2 start driver");
     run_cmd("sc start %s", DRV_SVC);
     Sleep(10000); /* 给内核清理留时间窗 */
@@ -1026,8 +1036,6 @@ static void nomore_phase2(void)
     xlog("nomore: remove cert");
     run_cmd("certutil -delstore ROOT \"%s\"", CERT_CN);
     run_cmd("certutil -delstore TrustedPublisher \"%s\"", CERT_CN);
-    xlog("nomore: testsigning off (需重启生效)");
-    run_cmd("bcdedit /set testsigning off");
     marker_del();
     msgbox("不客气模式完成\\n\\n"
            "驱动已装载→清理→卸载, 证书已移除\\n"
