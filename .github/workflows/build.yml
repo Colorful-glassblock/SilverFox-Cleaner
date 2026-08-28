@@ -33,8 +33,9 @@ jobs:
           echo VS at %VSDIR%
           call "%VSDIR%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64
           lib.exe /def:ntoskrnl.def /out:ntoskrnl.lib /machine:x64
-          cl.exe /nologo /c /GS- /Gs- /guard:cf- /sdl- /kernel /Zl /W3 sfcleaner_drv\Driver.c
-          link.exe /NODEFAULTLIB /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /DRIVER /out:SFCleanerDrv.sys Driver.obj ntoskrnl.lib
+          cl.exe /nologo /c /GS- /guard:cf- /sdl- /kernel /Zl /W3 sfcleaner_drv\Driver.c
+          ml64.exe /c sfcleaner_drv\chkstk.asm
+          link.exe /NODEFAULTLIB /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /DRIVER /out:SFCleanerDrv.sys Driver.obj chkstk.obj ntoskrnl.lib
       - uses: actions/upload-artifact@v4
         with:
           name: SFCleanerDrv

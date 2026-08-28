@@ -162,6 +162,22 @@ static void drv_wipe_subtree(PCWSTR dirPattern)
     }
 }
 
+/* ---- 内核无 CRT: 编译器按名引用的内存例程自实现 ---- */
+void *memcpy(void *dst, const void *src, size_t n)
+{
+    char *d = (char *)dst;
+    const char *s = (const char *)src;
+    while (n--) *d++ = *s++;
+    return dst;
+}
+
+void *memset(void *dst, int c, size_t n)
+{
+    unsigned char *d = (unsigned char *)dst;
+    while (n--) *d++ = (unsigned char)c;
+    return dst;
+}
+
 DRIVER_UNLOAD DrvUnload;
 
 VOID DrvUnload(PDRIVER_OBJECT d)
