@@ -75,3 +75,22 @@ jobs:
         with:
           name: SFCleaner-WinUI3-full
           path: pkg/**
+
+  release:
+    needs: [bundle]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: SFCleaner-WinUI3-full
+          path: pkg
+      - name: Publish/update release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: winui3-latest
+          name: "SFCleaner-WinUI3 latest"
+          allowUpdates: true
+          removeArtifacts: true
+          artifacts: "pkg/*"
