@@ -47,7 +47,6 @@ jobs:
       - name: Stage embedded assets
         run: |
           copy embed-src\SFCleanerDrv.sys SFCleanerDrv.sys
-          copy SFCleanerCert.cer SFCleanerCert.cer
       - name: Publish self-contained
         run: dotnet publish -c Release -p:Platform=x64 -p:WindowsPackageType=None -p:SelfContained=true
       - name: Stage self-contained
