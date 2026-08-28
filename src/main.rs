@@ -136,7 +136,8 @@ fn scan_all() -> Vec<Finding> {
     }));
     let r3 = Arc::clone(&results);
     handles.push(thread::spawn(move || {
-        let f = scan_files();
+        let mut f = scan_files();
+        f.extend(scan_hosts());
         r3.lock().unwrap().extend(f);
     }));
     for h in handles { h.join().unwrap(); }
@@ -253,6 +254,25 @@ fn scan_ctfmon() -> Vec<Finding> {
     out
 }
 
+const DEFAULT_HOSTS: &str = "# Copyright (c) 1993-2009 Microsoft Corp.\r\n#\r\n# This is a sample HOSTS file used by Microsoft TCP/IP for Windows.\r\n# This file contains the mappings of IP addresses to host names. Each\r\n# entry should be kept on an individual line. The IP address should\r\n# be placed in the first column followed by the corresponding host name.\r\n# The IP address and the host name should be separated by at least one space.\r\n#\r\n# localhost name resolution is handled within DNS itself.\r\n#\t127.0.0.1       localhost\r\n#\t::1             localhost\r\n";
+
+fn scan_hosts() -> Vec<Finding> {
+    let hp = r"C:\Windows\System32\drivers\etc\hosts";
+    let mut out = Vec::new();
+    if let Ok(content) = fs::read_to_string(hp) {
+        for line in content.lines() {
+            let c = line.trim_start();
+            if c.is_empty() || c.starts_with('#') { continue; }
+            if !c.starts_with("127.0.0.1") && !c.starts_with("::1") {
+                out.push(Finding { kind: "HOSTS".into(), detail: "hosts 文件被篡改 (存在活动解析条目)".into(),
+                                  high: true, action: "重置为默认并隔离原件".into() });
+                break;
+            }
+        }
+    }
+    out
+}
+
 fn scan_files() -> Vec<Finding> {
     let mut out = Vec::new();
     let roots: Vec<PathBuf> = [
@@ -323,6 +343,12 @@ fn do_clean(f: &[Finding]) -> (usize, usize, String) {
                 let src = PathBuf::from(x.detail.split(" [").next().unwrap_or(""));
                 take_own(&src.to_string_lossy());
                 quarantine(&src, &qd)
+            }
+            "HOSTS" => {
+                let hp = Path::new(r"C:\Windows\System32\drivers\etc\hosts");
+                let _ = quarantine(hp, &qd);           // 隔离原件 (失败不阻塞)
+                take_own(&hp.to_string_lossy());
+                fs::write(hp, DEFAULT_HOSTS).is_ok()
             }
             _ => true,
         };
