@@ -71,10 +71,17 @@ jobs:
         with:
           name: SFCleaner-WinUI3
           path: pkg
+      - name: Zip self-contained for release
+        run: |
+          cd pkg
+          python3 -m zipfile -c SFCleaner-self-contained.zip self-contained
+          rm -rf self-contained
       - uses: actions/upload-artifact@v4
         with:
           name: SFCleaner-WinUI3-full
-          path: pkg/**
+          path: |
+            pkg/*.msix
+            pkg/*.zip
   release:
     needs: [bundle]
     runs-on: ubuntu-latest
