@@ -49,7 +49,7 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
       - name: Stage embedded assets
-        run: cp embed-src/SFCleanerDrv.sys . && cp SFCleanerCert.cer .
+        run: cp embed-src/SFCleanerDrv.sys .
       - name: Embed UAC manifest
         run: x86_64-w64-mingw32-windres -o sfc_manifest.o sfcleaner.rc
       - name: Build
