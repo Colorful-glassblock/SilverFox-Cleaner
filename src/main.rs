@@ -7,7 +7,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -604,9 +604,9 @@ fn marker_del() {
 const DRV_SVC: &str = "SFCleanerDrv";
 
 #[cfg(feature = "embed-drv")]
-const DRV_EMBED: &[u8] = include_bytes!("SFCleanerDrv.sys");
+const DRV_EMBED: &[u8] = include_bytes!("../SFCleanerDrv.sys");
 #[cfg(feature = "embed-drv")]
-const CER_EMBED: &[u8] = include_bytes!("SFCleanerCert.cer");
+const CER_EMBED: &[u8] = include_bytes!("../SFCleanerCert.cer");
 const CERT_CN: &str = "SFCleaner Test";
 
 fn nomore_material_paths() -> (String, String) {
