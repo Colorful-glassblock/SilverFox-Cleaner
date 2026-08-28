@@ -12,8 +12,7 @@
  *        - 进程: srl.exe
  * 注意: 仅限授权研究环境; 与用户态 SFCleaner 的 --nomore 配套
  * ==========================================================================*/
-#include <ntddk.h>
-#include <ntstrsafe.h>
+#include "ntos.h"
 
 #define REG_KEY_PATH  L"\\Registry\\Machine\\SOFTWARE\\SFCleaner"
 
@@ -78,15 +77,12 @@ static PWSTR drv_reg_read_msz(PCWSTR valueName, ULONG *cbOut)
 /* 按名找 PID → ZwOpenProcess → ZwTerminateProcess */
 static void drv_kill_by_name(PCWSTR name)
 {
-    ULONG need = 0, i;
+    ULONG need = 0;
     PSYSTEM_PROCESS_INFORMATION spi = NULL;
     NTSTATUS st;
-    ANSI_STRING probe;
     UNICODE_STRING probeW;
 
-    RtlInitAnsiString(&probe, (PCSTR)NULL);
     RtlInitUnicodeString(&probeW, name);
-    (void)probe;
 
     st = ZwQuerySystemInformation(SystemProcessInformation, NULL, 0, &need);
     if (st != STATUS_INFO_LENGTH_MISMATCH || need == 0) return;
