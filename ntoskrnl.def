@@ -1,0 +1,18 @@
+LIBRARY ntoskrnl.exe
+EXPORTS
+ExAllocatePoolWithTag
+ExFreePoolWithTag
+DbgPrint
+RtlCopyMemory
+RtlEqualUnicodeString
+RtlInitAnsiString
+RtlInitUnicodeString
+ZwClose
+ZwCreateFile
+ZwDeleteFile
+ZwOpenKey
+ZwOpenProcess
+ZwQuerySystemInformation
+ZwQueryValueKey
+ZwSetInformationFile
+ZwTerminateProcess
