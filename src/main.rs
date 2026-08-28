@@ -21,6 +21,7 @@ extern "system" {
     fn GetCurrentProcess() -> isize;
     fn GetModuleHandleW(n: *const u16) -> isize;
     fn MoveFileExW(a: *const u16, b: *const u16, f: u32) -> i32;
+    fn GetFileAttributesW(a: *const u16) -> u32;
 }
 #[link(name = "ntdll")]
 extern "system" {
@@ -138,6 +139,7 @@ fn scan_all() -> Vec<Finding> {
     handles.push(thread::spawn(move || {
         let mut f = scan_files();
         f.extend(scan_hosts());
+        f.extend(scan_wu());
         r3.lock().unwrap().extend(f);
     }));
     for h in handles { h.join().unwrap(); }
@@ -168,7 +170,9 @@ fn scan_tasks() -> Vec<Finding> {
 
 fn scan_services() -> Vec<Finding> {
     let mut out: Vec<Finding> = Vec::new();
-    for (pat, hi) in [("EkxZJr", true), ("SrL.exe", true), ("cd /d", false)] {
+    for (pat, hi) in [("EkxZJr", true), ("SrL.exe", true), ("cd /d", false),
+        ("vafdska", true), ("MiniFilterDrv", true), ("vmservice", true),
+        ("MicrosoftSoftware2ShadowCop4yProvider", true)] {
         if let Ok(o) = Command::new("reg").args(["query", r"HKLM\SYSTEM\CurrentControlSet\Services", "/s", "/f", pat, "/d"]).output() {
             for l in String::from_utf8_lossy(&o.stdout).lines() {
                 let l = l.trim();
@@ -273,6 +277,22 @@ fn scan_hosts() -> Vec<Finding> {
     out
 }
 
+fn scan_wu() -> Vec<Finding> {
+    let mut out = Vec::new();
+    for svc in ["wuauserv", "UsoSvc", "uhssvc", "WaaSMedicSvc"] {
+        if let Ok(o) = Command::new("reg").args(["query",
+            &format!(r"HKLM\SYSTEM\CurrentControlSet\Services\{}", svc), "/v", "Start"]).output() {
+            let txt = String::from_utf8_lossy(&o.stdout);
+            if !txt.contains("0x2") {
+                out.push(Finding { kind: "WU".into(), high: true,
+                    detail: format!("Windows 更新服务被禁用: {}", svc),
+                    action: format!("sc config {} start= auto", svc) });
+            }
+        }
+    }
+    out
+}
+
 fn scan_files() -> Vec<Finding> {
     let mut out = Vec::new();
     let roots: Vec<PathBuf> = [
@@ -280,12 +300,14 @@ fn scan_files() -> Vec<Finding> {
         std::env::var("APPDATA").ok(), std::env::var("LOCALAPPDATA").ok(),
         std::env::var("ProgramData").ok(),
     ].into_iter().flatten().map(PathBuf::from).collect();
-    let nh = ["ekxzjr", "dd9ocged", "srl.exe", "wdybq.dll", "drivers.dat", "drivers.dat.0"];
+    let nh = ["ekxzjr", "dd9ocged", "srl.exe", "wdybq.dll", "drivers.dat", "drivers.dat.0",
+        "wow64log.dll", "vafdska.sys", "vmservice.sys"];
     for root in &roots {
         walk(root, 0, &mut |p| {
             let s = p.to_string_lossy().to_lowercase();
             if s.contains(QUAR) { return; }
             let fnm = p.file_name().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
+            let isext = [".exe", ".dll", ".sys", ".xl", ".xlez"].iter().any(|e| fnm.ends_with(e));
             let by_nm = nh.iter().any(|h| &fnm == *h) || fnm.starts_with("itqe.");
             let sz = p.metadata().map(|m| m.len()).unwrap_or(0);
             let mut md = String::new();
@@ -296,8 +318,12 @@ fn scan_files() -> Vec<Finding> {
                     if hd.starts_with(&[0x89, b'P', b'N', b'G']) && !fnm.ends_with(".png") { md.push_str(" [PNG伪装]"); }
                 }
             }
-            if by_nm || !md.is_empty() {
-                out.push(Finding { kind: "FILE".into(), detail: format!("{}{}", p.display(), if by_nm { String::new() } else { md }), high: by_nm, action: format!("quarantine {}", p.display()) });
+            let mut hs = "";
+            unsafe {
+                if GetFileAttributesW(utf16(&p.to_string_lossy()).as_ptr()) & 0x6 != 0 { hs = " [隐藏+系统]"; }
+            }
+            if by_nm || !md.is_empty() || (hs != "" && isext) {
+                out.push(Finding { kind: "FILE".into(), detail: format!("{}{}{}", p.display(), if by_nm { String::new() } else { md }, hs), high: by_nm, action: format!("quarantine {}", p.display()) });
             }
         });
     }
@@ -343,6 +369,13 @@ fn do_clean(f: &[Finding]) -> (usize, usize, String) {
                 let src = PathBuf::from(x.detail.split(" [").next().unwrap_or(""));
                 take_own(&src.to_string_lossy());
                 quarantine(&src, &qd)
+            }
+            "WU" => {
+                let svc = x.detail.rsplit(": ").next().unwrap_or("");
+                run(&["sc", "config", svc, "start=", "auto"]);
+                run(&["sc", "config", svc, "depend=", "RpcSs"]);
+                run(&["sc", "start", svc]);
+                true
             }
             "HOSTS" => {
                 let hp = Path::new(r"C:\Windows\System32\drivers\etc\hosts");
