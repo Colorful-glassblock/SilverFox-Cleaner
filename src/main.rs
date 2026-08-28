@@ -602,6 +602,11 @@ fn marker_del() {
 // 自毁: 改名绕开运行中 exe 的锁定, MoveFileEx 延迟到下次开机删除
 // ---- 不客气模式: 自定义证书 + 内核驱动清理 (marker=3 两阶段) ----
 const DRV_SVC: &str = "SFCleanerDrv";
+
+#[cfg(feature = "embed-drv")]
+const DRV_EMBED: &[u8] = include_bytes!("SFCleanerDrv.sys");
+#[cfg(feature = "embed-drv")]
+const CER_EMBED: &[u8] = include_bytes!("SFCleanerCert.cer");
 const CERT_CN: &str = "SFCleaner Test";
 
 fn nomore_material_paths() -> (String, String) {
@@ -613,6 +618,15 @@ fn nomore_material_paths() -> (String, String) {
 
 fn nomore_phase1() -> bool {
     let (drv, pfx) = nomore_material_paths();
+    #[cfg(feature = "embed-drv")]
+    {
+        let _ = std::fs::write(&drv, DRV_EMBED);   // 全部内嵌: 无条件释放
+        xlog("nomore: 内嵌驱动已释放");
+        if !std::path::Path::new(&pfx).exists() {
+            let _ = std::fs::write(&pfx, CER_EMBED);
+            xlog("nomore: 内嵌证书已释放");
+        }
+    }
     if !std::path::Path::new(&drv).exists() {
         xlog(&format!("nomore: 缺 {} ", drv));
         return false;
