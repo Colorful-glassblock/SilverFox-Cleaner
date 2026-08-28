@@ -51,3 +51,21 @@ jobs:
         with:
           name: SFCleanerDrv
           path: SFCleanerDrv.sys
+  bundle:
+    needs: [exe, driver]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: full
+      - name: Stage full package
+        run: |
+          mkdir -p pkg
+          cp SFCleanerCert.cer pkg/ 2>/dev/null || true
+          cp -r full/*/. pkg/ 2>/dev/null || true
+          ls -la pkg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SFCleaner-C-full
+          path: pkg/**
