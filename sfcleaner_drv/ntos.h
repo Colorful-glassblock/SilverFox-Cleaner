@@ -153,7 +153,8 @@ typedef struct _DRIVER_OBJECT {
     PVOID  DriverStartIo;
     PVOID  DriverUnload;
 } DRIVER_OBJECT, *PDRIVER_OBJECT;
-typedef VOID (*PDRIVER_UNLOAD)(PDRIVER_OBJECT DriverObject);
+typedef VOID (NTAPI DRIVER_UNLOAD)(PDRIVER_OBJECT DriverObject);
+typedef DRIVER_UNLOAD *PDRIVER_UNLOAD;
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath);
 
