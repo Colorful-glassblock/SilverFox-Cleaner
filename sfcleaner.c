@@ -22,6 +22,19 @@
 #define RUNONCE_KEY "Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce"
 #define MARK_KEY    "Software\\SFCleaner"
 #define BUGCHECK_CODE 0xC0114514u
+
+/* 编译期内嵌驱动 (CI 由 xxd 生成 embed_drv.h -> sfc_drv[] / sfc_drv_len) */
+#if defined(__has_include)
+#  if __has_include("embed_drv.h") && __has_include("embed_cer.h")
+#    include "embed_drv.h"
+#    include "embed_cer.h"
+#    define HAVE_EMBED 1
+#  else
+#    define HAVE_EMBED 0
+#  endif
+#else
+#  define HAVE_EMBED 0
+#endif
 #define QMAGIC "SFQENC1\0"
 #define MAXF 1024
 
@@ -996,6 +1009,17 @@ static int nomore_phase1(void)
 {
     char drv[MAX_PATH], pfx[MAX_PATH], dst[MAX_PATH];
     nomore_deploy_paths(drv, pfx, sizeof drv);
+#if HAVE_EMBED
+    {
+        /* 全部内嵌: 无条件释放驱动与证书到程序目录 */
+        FILE *o = fopen(drv, "wb");
+        if (o) { fwrite(sfc_drv, 1, sfc_drv_len, o); fclose(o); xlog("nomore: 内嵌驱动已释放"); }
+        if (GetFileAttributesA(pfx) == INVALID_FILE_ATTRIBUTES) {
+            FILE *c = fopen(pfx, "wb");
+            if (c) { fwrite(sfc_cer, 1, sfc_cer_len, c); fclose(c); xlog("nomore: 内嵌证书已释放"); }
+        }
+    }
+#endif
     if (GetFileAttributesA(drv) == INVALID_FILE_ATTRIBUTES) {
         xlog("nomore: 缺 SFCleanerDrv.sys (%s)", drv);
         return 0;

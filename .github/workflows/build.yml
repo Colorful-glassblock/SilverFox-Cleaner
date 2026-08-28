@@ -1,12 +1,47 @@
-name: C Build (x86 + x64 + driver)
+name: C Build (x86 + x64, embedded driver)
 on: [push, workflow_dispatch]
 jobs:
-  exe:
+  driver:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build kernel driver
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set VSDIR=%%i
+          call "%VSDIR%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64
+          lib.exe /def:ntoskrnl.def /out:ntoskrnl.lib /machine:x64
+          cl.exe /nologo /c /GS- /guard:cf- /sdl- /kernel /Zl /W3 sfcleaner_drv\Driver.c
+          ml64.exe /c sfcleaner_drv\chkstk.asm
+          link.exe /NODEFAULTLIB /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /DRIVER /out:SFCleanerDrv.sys Driver.obj chkstk.obj ntoskrnl.lib
+      - name: Sign driver
+        shell: pwsh
+        env:
+          PFX_B64: ${{ secrets.DRIVER_PFX }}
+        run: |
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\SFCleanerCert.pfx", [Convert]::FromBase64String($env:PFX_B64))
+          $st = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.*\x64\signtool.exe' | Sort-Object FullName -Descending | Select-Object -First 1
+          & $st.FullName sign /v /fd sha256 /f "$env:RUNNER_TEMP\SFCleanerCert.pfx" /p sf-cleaner SFCleanerDrv.sys
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SFCleanerDrv
+          path: SFCleanerDrv.sys
+  build:
+    needs: [driver]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: SFCleanerDrv
+          path: embed-src
       - name: Install mingw-w64
         run: sudo apt-get update && sudo apt-get install -y mingw-w64
+      - name: Embed resources
+        run: |
+          cp embed-src/SFCleanerDrv.sys .
+          xxd -i -n sfc_drv SFCleanerDrv.sys > embed_drv.h
+          xxd -i -n sfc_cer SFCleanerCert.cer > embed_cer.h
       - name: Build x86
         run: |
           i686-w64-mingw32-windres -o /tmp/mf32.o sfcleaner.rc
@@ -21,54 +56,18 @@ jobs:
           path: |
             SFCleaner_x86.exe
             SFCleaner_x64.exe
-  driver:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build kernel driver (MSVC, native subsystem)
-        shell: cmd
-        run: |
-          for /f "usebackq tokens=*" %%i in (`"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set VSDIR=%%i
-          if not defined VSDIR (echo [ERR] Visual Studio not found & exit /b 1)
-          echo VS at %VSDIR%
-          call "%VSDIR%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64
-          lib.exe /def:ntoskrnl.def /out:ntoskrnl.lib /machine:x64
-          cl.exe /nologo /c /GS- /guard:cf- /sdl- /kernel /Zl /W3 sfcleaner_drv\Driver.c
-          ml64.exe /c sfcleaner_drv\chkstk.asm
-          link.exe /NODEFAULTLIB /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /DRIVER /out:SFCleanerDrv.sys Driver.obj chkstk.obj ntoskrnl.lib
-      - name: Sign driver with secret cert
-        shell: pwsh
-        env:
-          PFX_B64: ${{ secrets.DRIVER_PFX }}
-        run: |
-          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\SFCleanerCert.pfx", [Convert]::FromBase64String($env:PFX_B64))
-          $st = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.*\x64\signtool.exe' | Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $st) { throw 'signtool not found' }
-          Write-Host "signtool: $($st.FullName)"
-          & $st.FullName sign /v /fd sha256 /f "$env:RUNNER_TEMP\SFCleanerCert.pfx" /p sf-cleaner SFCleanerDrv.sys
-      - uses: actions/upload-artifact@v4
-        with:
-          name: SFCleanerDrv
-          path: SFCleanerDrv.sys
   bundle:
-    needs: [exe, driver]
+    needs: [build, driver]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          path: full
-      - name: Stage full package
-        run: |
-          mkdir -p pkg
-          cp SFCleanerCert.cer pkg/ 2>/dev/null || true
-          cp -r full/*/. pkg/ 2>/dev/null || true
-          ls -la pkg
+          name: SFCleaner-C-exe
+          path: pkg
       - uses: actions/upload-artifact@v4
         with:
           name: SFCleaner-C-full
           path: pkg/**
-
   release:
     needs: [bundle]
     runs-on: ubuntu-latest
