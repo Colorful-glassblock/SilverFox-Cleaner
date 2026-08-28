@@ -73,3 +73,22 @@ jobs:
         with:
           name: silverfox-cleaner-full
           path: pkg/**
+
+  release:
+    needs: [bundle]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: silverfox-cleaner-full
+          path: pkg
+      - name: Publish/update release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: rust-latest
+          name: "silverfox-cleaner latest"
+          allowUpdates: true
+          removeArtifacts: true
+          artifacts: "pkg/*"
