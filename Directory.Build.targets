@@ -1,0 +1,11 @@
+<Project>
+  <!-- 自包含部署不需要 Bootstrap（WinAppSDK 运行时 DLL 就在 exe 旁边）。
+       若 WinAppSDK 把 MddBootstrapAutoInitializer.cs 编进了自包含构建，
+       在无 MSIX 运行时的机器上 MddBootstrapInitialize 失败 → RoFailFast
+       → 0xC000027B 静默退出（无窗口）。
+       条件剥离之；框架依赖构建 (WindowsAppSDKSelfContained=false) 不受影响。 -->
+  <ItemGroup Condition="'$(WindowsAppSDKSelfContained)'=='true'">
+    <Compile Remove="$(NuGetPackageRoot)microsoft.windowsappsdk\**\include\MddBootstrapAutoInitializer.cs" />
+    <Compile Remove="$(USERPROFILE)\.nuget\packages\microsoft.windowsappsdk\**\include\MddBootstrapAutoInitializer.cs" />
+  </ItemGroup>
+</Project>
