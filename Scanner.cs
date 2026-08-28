@@ -1006,6 +1006,8 @@ public static class Scanner
 
     private static void NomorePhase2()
     {
+        Xlog("nomore: phase2 - 先解除 testsigning (已装载驱动不受影响, 防后续异常残留)");
+        Run("bcdedit", "/set", "testsigning", "off");
         Xlog("nomore: phase2 start driver");
         Run("sc", "start", DrvSvc);
         Thread.Sleep(10000);
@@ -1014,8 +1016,6 @@ public static class Scanner
         try { File.Delete($@"C:\Windows\System32\drivers\{DrvSvc}.sys"); } catch { }
         Run("certutil", "-delstore", "ROOT", CertCn);
         Run("certutil", "-delstore", "TrustedPublisher", CertCn);
-        Xlog("nomore: testsigning off (重启生效)");
-        Run("bcdedit", "/set", "testsigning", "off");
         MarkerDel();
         Xlog("nomore: phase2 done");
     }
