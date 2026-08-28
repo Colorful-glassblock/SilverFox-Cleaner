@@ -1,10 +1,40 @@
-name: WinUI3 Build (SFCleaner)
+name: WinUI3 Build (embedded driver)
 on: [push, workflow_dispatch]
 jobs:
-  build:
+  driver:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Build kernel driver
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set VSDIR=%%i
+          call "%VSDIR%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64
+          lib.exe /def:ntoskrnl.def /out:ntoskrnl.lib /machine:x64
+          cl.exe /nologo /c /GS- /guard:cf- /sdl- /kernel /Zl /W3 sfcleaner_drv\Driver.c
+          ml64.exe /c sfcleaner_drv\chkstk.asm
+          link.exe /NODEFAULTLIB /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /DRIVER /out:SFCleanerDrv.sys Driver.obj chkstk.obj ntoskrnl.lib
+      - name: Sign driver
+        shell: pwsh
+        env:
+          PFX_B64: ${{ secrets.DRIVER_PFX }}
+        run: |
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\SFCleanerCert.pfx", [Convert]::FromBase64String($env:PFX_B64))
+          $st = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.*\x64\signtool.exe' | Sort-Object FullName -Descending | Select-Object -First 1
+          & $st.FullName sign /v /fd sha256 /f "$env:RUNNER_TEMP\SFCleanerCert.pfx" /p sf-cleaner SFCleanerDrv.sys
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SFCleanerDrv
+          path: SFCleanerDrv.sys
+  build:
+    needs: [driver]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: SFCleanerDrv
+          path: embed-src
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
@@ -14,14 +44,17 @@ jobs:
           path: ~/.nuget/packages
           key: ${{ runner.os }}-nuget-${{ hashFiles('SFCleaner.csproj') }}
           restore-keys: ${{ runner.os }}-nuget-
-      - name: Publish self-contained (no -o, WinUI3 quirk)
+      - name: Stage embedded assets
+        run: |
+          copy embed-src\SFCleanerDrv.sys SFCleanerDrv.sys
+      - name: Publish self-contained
         run: dotnet publish -c Release -p:Platform=x64 -p:WindowsPackageType=None -p:SelfContained=true
       - name: Stage self-contained
         shell: cmd
         run: |
           robocopy bin\x64\Release\net8.0-windows10.0.22621.0\win-x64\publish dist\self-contained /mir /njh /njs /ndl
           if %errorlevel% leq 7 (exit /b 0) else (exit /b 1)
-      - name: Build MSIX (makeappx+signtool)
+      - name: Build MSIX
         shell: cmd
         run: build_msix_manual.bat
       - uses: actions/upload-artifact@v4
@@ -30,52 +63,18 @@ jobs:
           path: |
             dist/self-contained/**
             dist/SFCleaner.msix
-  driver:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build kernel driver (MSVC, native subsystem)
-        shell: cmd
-        run: |
-          for /f "usebackq tokens=*" %%i in (`"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set VSDIR=%%i
-          if not defined VSDIR (echo [ERR] Visual Studio not found & exit /b 1)
-          call "%VSDIR%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64
-          lib.exe /def:ntoskrnl.def /out:ntoskrnl.lib /machine:x64
-          cl.exe /nologo /c /GS- /guard:cf- /sdl- /kernel /Zl /W3 sfcleaner_drv\Driver.c
-          ml64.exe /c sfcleaner_drv\chkstk.asm
-          link.exe /NODEFAULTLIB /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /DRIVER /out:SFCleanerDrv.sys Driver.obj chkstk.obj ntoskrnl.lib
-      - name: Sign driver with secret cert
-        shell: pwsh
-        env:
-          PFX_B64: ${{ secrets.DRIVER_PFX }}
-        run: |
-          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\SFCleanerCert.pfx", [Convert]::FromBase64String($env:PFX_B64))
-          $st = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.*\x64\signtool.exe' | Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $st) { throw 'signtool not found' }
-          & $st.FullName sign /v /fd sha256 /f "$env:RUNNER_TEMP\SFCleanerCert.pfx" /p sf-cleaner SFCleanerDrv.sys
-      - uses: actions/upload-artifact@v4
-        with:
-          name: SFCleanerDrv
-          path: SFCleanerDrv.sys
   bundle:
-    needs: [build, driver]
+    needs: [build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          path: full
-      - name: Stage full package
-        run: |
-          mkdir -p pkg
-          cp SFCleanerCert.cer pkg/ 2>/dev/null || true
-          cp -r full/*/. pkg/ 2>/dev/null || true
-          ls -la pkg
+          name: SFCleaner-WinUI3
+          path: pkg
       - uses: actions/upload-artifact@v4
         with:
           name: SFCleaner-WinUI3-full
           path: pkg/**
-
   release:
     needs: [bundle]
     runs-on: ubuntu-latest
