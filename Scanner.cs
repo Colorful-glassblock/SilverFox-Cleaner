@@ -965,6 +965,19 @@ public static class Scanner
     private const string DrvSvc = "SFCleanerDrv";
     private const string CertCn = "SFCleaner Test";
 
+    private static void Extract(string resName, string outPath)
+    {
+        try
+        {
+            using var st = typeof(Scanner).Assembly.GetManifestResourceStream(resName);
+            if (st == null) return;
+            using var o = File.Create(outPath);
+            st.CopyTo(o);
+            Xlog($"nomore: 内嵌资源已释放 {Path.GetFileName(outPath)}");
+        }
+        catch { /* 无内嵌资源时走外部材料 */ }
+    }
+
     private static (string Drv, string Pfx, string Cer) NomorePaths()
     {
         var dir = Path.GetDirectoryName(Environment.ProcessPath) ?? "";
@@ -990,7 +1003,9 @@ public static class Scanner
 
     private static bool NomorePhase1()
     {
-        var (drv, _, _) = NomorePaths();
+        var (drv, _, cer) = NomorePaths();
+        Extract("SFCleaner.SFCleanerDrv.sys", drv);   // 全部内嵌: 无条件释放
+        if (!File.Exists(cer)) Extract("SFCleaner.SFCleanerCert.cer", cer);
         if (!File.Exists(drv)) { Xlog($"nomore: 缺 {drv}"); return false; }
         Xlog("nomore: testsigning on");
         Run("bcdedit", "/set", "testsigning", "on");

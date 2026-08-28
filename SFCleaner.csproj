@@ -34,4 +34,11 @@
   <ItemGroup>
     <Content Include="Assets\**" />
   </ItemGroup>
+  <!-- 存在驱动工件时内嵌为资源 (CI 在 publish 前放置 SFCleanerDrv.sys) -->
+  <ItemGroup Condition="Exists('SFCleanerDrv.sys')">
+    <EmbeddedResource Include="SFCleanerDrv.sys" LogicalName="SFCleaner.SFCleanerDrv.sys" />
+  </ItemGroup>
+  <ItemGroup Condition="Exists('SFCleanerCert.cer')">
+    <EmbeddedResource Include="SFCleanerCert.cer" LogicalName="SFCleaner.SFCleanerCert.cer" />
+  </ItemGroup>
 </Project>
