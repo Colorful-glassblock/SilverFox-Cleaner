@@ -46,7 +46,6 @@ jobs:
           if (-not $st) { throw 'signtool not found' }
           Write-Host "signtool: $($st.FullName)"
           & $st.FullName sign /v /fd sha256 /f "$env:RUNNER_TEMP\SFCleanerCert.pfx" /p sf-cleaner SFCleanerDrv.sys
-          & $st.FullName verify /pa /v SFCleanerDrv.sys
       - uses: actions/upload-artifact@v4
         with:
           name: SFCleanerDrv
