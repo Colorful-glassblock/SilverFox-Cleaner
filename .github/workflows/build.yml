@@ -1,10 +1,40 @@
-name: Rust Build (silverfox-cleaner)
+name: Rust Build (embedded driver)
 on: [push, workflow_dispatch]
 jobs:
+  driver:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build kernel driver
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set VSDIR=%%i
+          call "%VSDIR%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64
+          lib.exe /def:ntoskrnl.def /out:ntoskrnl.lib /machine:x64
+          cl.exe /nologo /c /GS- /guard:cf- /sdl- /kernel /Zl /W3 sfcleaner_drv\Driver.c
+          ml64.exe /c sfcleaner_drv\chkstk.asm
+          link.exe /NODEFAULTLIB /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /DRIVER /out:SFCleanerDrv.sys Driver.obj chkstk.obj ntoskrnl.lib
+      - name: Sign driver
+        shell: pwsh
+        env:
+          PFX_B64: ${{ secrets.DRIVER_PFX }}
+        run: |
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\SFCleanerCert.pfx", [Convert]::FromBase64String($env:PFX_B64))
+          $st = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.*\x64\signtool.exe' | Sort-Object FullName -Descending | Select-Object -First 1
+          & $st.FullName sign /v /fd sha256 /f "$env:RUNNER_TEMP\SFCleanerCert.pfx" /p sf-cleaner SFCleanerDrv.sys
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SFCleanerDrv
+          path: SFCleanerDrv.sys
   build:
+    needs: [driver]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: SFCleanerDrv
+          path: embed-src
       - name: Install mingw-w64
         run: sudo apt-get update && sudo apt-get install -y mingw-w64
       - uses: dtolnay/rust-toolchain@stable
@@ -18,62 +48,30 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+      - name: Stage embedded assets
+        run: cp embed-src/SFCleanerDrv.sys .
       - name: Embed UAC manifest
         run: x86_64-w64-mingw32-windres -o sfc_manifest.o sfcleaner.rc
       - name: Build
         env:
           RUSTFLAGS: -C link-arg=${{ github.workspace }}/sfc_manifest.o
-        run: cargo build --release --target x86_64-pc-windows-gnu
+        run: cargo build --release --features embed-drv --target x86_64-pc-windows-gnu
       - uses: actions/upload-artifact@v4
         with:
           name: silverfox-cleaner
           path: target/x86_64-pc-windows-gnu/release/silverfox-cleaner.exe
-  driver:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build kernel driver (MSVC, native subsystem)
-        shell: cmd
-        run: |
-          for /f "usebackq tokens=*" %%i in (`"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set VSDIR=%%i
-          if not defined VSDIR (echo [ERR] Visual Studio not found & exit /b 1)
-          call "%VSDIR%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64
-          lib.exe /def:ntoskrnl.def /out:ntoskrnl.lib /machine:x64
-          cl.exe /nologo /c /GS- /guard:cf- /sdl- /kernel /Zl /W3 sfcleaner_drv\Driver.c
-          ml64.exe /c sfcleaner_drv\chkstk.asm
-          link.exe /NODEFAULTLIB /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /DRIVER /out:SFCleanerDrv.sys Driver.obj chkstk.obj ntoskrnl.lib
-      - name: Sign driver with secret cert
-        shell: pwsh
-        env:
-          PFX_B64: ${{ secrets.DRIVER_PFX }}
-        run: |
-          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\SFCleanerCert.pfx", [Convert]::FromBase64String($env:PFX_B64))
-          $st = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.*\x64\signtool.exe' | Sort-Object FullName -Descending | Select-Object -First 1
-          if (-not $st) { throw 'signtool not found' }
-          & $st.FullName sign /v /fd sha256 /f "$env:RUNNER_TEMP\SFCleanerCert.pfx" /p sf-cleaner SFCleanerDrv.sys
-      - uses: actions/upload-artifact@v4
-        with:
-          name: SFCleanerDrv
-          path: SFCleanerDrv.sys
   bundle:
-    needs: [build, driver]
+    needs: [build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          path: full
-      - name: Stage full package
-        run: |
-          mkdir -p pkg
-          cp SFCleanerCert.cer pkg/ 2>/dev/null || true
-          cp -r full/*/. pkg/ 2>/dev/null || true
-          ls -la pkg
+          name: silverfox-cleaner
+          path: pkg
       - uses: actions/upload-artifact@v4
         with:
           name: silverfox-cleaner-full
           path: pkg/**
-
   release:
     needs: [bundle]
     runs-on: ubuntu-latest
