@@ -28,7 +28,10 @@ jobs:
       - name: Build kernel driver (MSVC, native subsystem)
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64
+          for /f "usebackq tokens=*" %%i in (`"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set VSDIR=%%i
+          if not defined VSDIR (echo [ERR] Visual Studio not found & exit /b 1)
+          echo VS at %VSDIR%
+          call "%VSDIR%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64
           lib.exe /def:ntoskrnl.def /out:ntoskrnl.lib /machine:x64
           cl.exe /nologo /c /GS- /Gs- /guard:cf- /sdl- /kernel /Zl /W3 sfcleaner_drv\Driver.c
           link.exe /NODEFAULTLIB /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /DRIVER /out:SFCleanerDrv.sys Driver.obj ntoskrnl.lib
