@@ -56,26 +56,48 @@ typedef struct _CLIENT_ID {
 #define ULONG_TO_HANDLE(x) ((HANDLE)(ULONG_PTR)(x))
 
 /* ---- 访问权限/文件标志 ---- */
-#define DELETE              0x00010000
-#define SYNCHRONIZE         0x00100000
-#define PROCESS_TERMINATE   0x00000001
-#define KEY_READ            0x00020019
-
-#define FILE_SHARE_READ      0x00000001
-#define FILE_SHARE_WRITE     0x00000002
-#define FILE_SHARE_DELETE    0x00000004
-#define FILE_OPEN            0x00000001
-#define FILE_SUPERSEDE       0x00000000
+#ifndef DELETE
+#define DELETE 0x00010000
+#endif
+#ifndef SYNCHRONIZE
+#define SYNCHRONIZE 0x00100000
+#endif
+#ifndef PROCESS_TERMINATE
+#define PROCESS_TERMINATE 0x00000001
+#endif
+#ifndef KEY_READ
+#define KEY_READ 0x00020019
+#endif
+#ifndef FILE_SHARE_READ
+#define FILE_SHARE_READ 0x00000001
+#endif
+#ifndef FILE_SHARE_WRITE
+#define FILE_SHARE_WRITE 0x00000002
+#endif
+#ifndef FILE_SHARE_DELETE
+#define FILE_SHARE_DELETE 0x00000004
+#endif
+#ifndef FILE_OPEN
+#define FILE_OPEN 0x00000001
+#endif
+#ifndef FILE_SUPERSEDE
+#define FILE_SUPERSEDE 0x00000000
+#endif
+#ifndef FILE_NON_DIRECTORY_FILE
 #define FILE_NON_DIRECTORY_FILE 0x00000040
-#define FILE_ATTRIBUTE_NORMAL   0x00000080
-
+#endif
+#ifndef FILE_ATTRIBUTE_NORMAL
+#define FILE_ATTRIBUTE_NORMAL 0x00000080
+#endif
 #define FileDispositionInformation 13
 typedef struct _FILE_DISPOSITION_INFORMATION {
     BOOLEAN DeleteFile;
 } FILE_DISPOSITION_INFORMATION, *PFILE_DISPOSITION_INFORMATION;
 
 #define KeyValuePartialInformation 7
+#ifndef REG_MULTI_SZ
 #define REG_MULTI_SZ 7
+#endif
 #define REG_SZ       1
 typedef struct _KEY_VALUE_PARTIAL_INFORMATION {
     ULONG TitleIndex;
@@ -114,8 +136,8 @@ typedef SFC_PROC_INFO SYSTEM_PROCESS_INFORMATION, *PSYSTEM_PROCESS_INFORMATION;
 
 /* ---- 驱动对象 ---- */
 typedef struct _DRIVER_OBJECT {
-    CSHORT Type;
-    CSHORT Size;
+    SHORT  Type;
+    SHORT  Size;
     PVOID  DeviceObject;
     ULONG  Flags;
     PVOID  DriverStart;
@@ -134,7 +156,9 @@ typedef VOID (*PDRIVER_UNLOAD)(PDRIVER_OBJECT DriverObject);
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath);
 
 /* ---- 内核导出原型 (x64, 与 ntoskrnl.def 对应) ---- */
+#ifndef NTSYSAPI
 #define NTSYSAPI __declspec(dllimport)
+#endif
 #define NTAPI    __stdcall
 
 NTSYSAPI VOID  NTAPI RtlInitUnicodeString(PUNICODE_STRING, PCWSTR);
@@ -156,9 +180,11 @@ NTSYSAPI NTSTATUS NTAPI ZwCreateFile(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, P
 NTSYSAPI NTSTATUS NTAPI ZwSetInformationFile(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG,
                                             FILE_INFORMATION_CLASS);
 
-/* 内核无 CRT: RtlCopyMemory 用编译器自有循环 */
+/* 内核无 CRT: winnt.h 若没给 RtlCopyMemory 就自造循环版 */
+#ifndef RtlCopyMemory
 #define RtlCopyMemory(Dst, Src, Len) \
     do { SIZE_T _i; for (_i = 0; _i < (SIZE_T)(Len); _i++) ((char *)(Dst))[_i] = ((const char *)(Src))[_i]; } while (0)
+#endif
 
 #ifdef __cplusplus
 }
