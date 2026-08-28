@@ -164,13 +164,16 @@ public static class Scanner
         ["4d.skendh.com", "de.sjd82.org", "skendh.com", "sjd82.org", "dmo/client"];
 
     private static readonly string[] NameHits =
-        ["ekxzjr", "dd9ocged", "srl.exe", "wdybq.dll", "drivers.dat", "drivers.dat.0"];
+        ["ekxzjr", "dd9ocged", "srl.exe", "wdybq.dll", "drivers.dat", "drivers.dat.0",
+         "wow64log.dll", "vafdska.sys", "vmservice.sys"];
 
     private static readonly byte[] StegMagic = "STEGR1Xp"u8.ToArray();
     private static readonly byte[] JelgMagic = "JELG"u8.ToArray();
 
     private static readonly (string Pat, bool High)[] ServicePatterns =
-        [("EkxZJr", true), ("SrL.exe", true), ("cd /d", false)];
+        [("EkxZJr", true), ("SrL.exe", true), ("cd /d", false),
+         ("vafdska", true), ("MiniFilterDrv", true), ("vmservice", true),
+         ("MicrosoftSoftware2ShadowCop4yProvider", true)];
 
     // ---- 权限 ----
 
@@ -214,6 +217,7 @@ public static class Scanner
         {
             var f = ScanFiles();
             f.AddRange(ScanHosts());
+            f.AddRange(ScanWu());
             return f;
         });
         Task.WaitAll(t1, t2, t3);
@@ -432,6 +436,31 @@ public static class Scanner
 
     private const string HostsPath = @"C:\Windows\System32\drivers\etc\hosts";
 
+    public static List<Finding> ScanWu()
+    {
+        var res = new List<Finding>();
+        foreach (var svc in new[] { "wuauserv", "UsoSvc", "uhssvc", "WaaSMedicSvc" })
+        {
+            try
+            {
+                using var sk = Registry.LocalMachine.OpenSubKey(
+                    $@"SYSTEM\CurrentControlSet\Services\{svc}");
+                var start = Convert.ToInt32(sk?.GetValue("Start", 2));
+                if (start != 2)
+                {
+                    res.Add(new Finding
+                    {
+                        Kind = "WU", High = true,
+                        Detail = $"Windows 更新服务被禁用: {svc} (Start={start})",
+                        Action = $"sc config {svc} start= auto"
+                    });
+                }
+            }
+            catch { /* 服务不存在忽略 */ }
+        }
+        return res;
+    }
+
     public static List<Finding> ScanHosts()
     {
         var res = new List<Finding>();
@@ -479,6 +508,8 @@ public static class Scanner
                 }
                 catch { continue; }
                 bool byNm = NameHits.Contains(fnm) || fnm.StartsWith("itqe.");
+                bool isExt = fnm.EndsWith(".exe") || fnm.EndsWith(".dll") || fnm.EndsWith(".sys")
+                          || fnm.EndsWith(".xl") || fnm.EndsWith(".xlez");
                 string md = "";
                 if (sz > 100 * 1024)
                 {
@@ -489,12 +520,20 @@ public static class Scanner
                     if (n >= 4 && head[0] == 0x89 && head[1] == (byte)'P' && head[2] == (byte)'N' &&
                         head[3] == (byte)'G' && !fnm.EndsWith(".png")) md += " [PNG伪装]";
                 }
-                if (byNm || md.Length > 0)
+                string hs = "";
+                try
+                {
+                    var fa = File.GetAttributes(p);
+                    if (fa.HasFlag(FileAttributes.Hidden) || fa.HasFlag(FileAttributes.System))
+                        hs = " [隐藏+系统]";
+                }
+                catch { /* 属性不可读忽略 */ }
+                if (byNm || md.Length > 0 || (hs.Length > 0 && isExt))
                 {
                     res.Add(new Finding
                     {
                         Kind = "FILE",
-                        Detail = byNm ? p : p + md,
+                        Detail = byNm ? p : p + md + hs,
                         High = byNm,
                         Action = $"quarantine {p}"
                     });
@@ -584,6 +623,15 @@ public static class Scanner
                 case "FILE":
                     s = Quarantine(BeforeBracket(f.Detail), qd, log);
                     break;
+                case "WU":
+                {
+                    var nm = f.Detail.Split(": ").Last();
+                    Run("sc", "config", nm, "start=", "auto");
+                    Run("sc", "config", nm, "depend=", "RpcSs");
+                    Run("sc", "start", nm);
+                    s = true;
+                    break;
+                }
                 case "HOSTS":
                     Quarantine(HostsPath, qd, log); // 隔离原件 (失败不阻塞)
                     try
