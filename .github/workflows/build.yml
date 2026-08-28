@@ -42,8 +42,11 @@ jobs:
           PFX_B64: ${{ secrets.DRIVER_PFX }}
         run: |
           [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\SFCleanerCert.pfx", [Convert]::FromBase64String($env:PFX_B64))
-          signtool.exe sign /v /fd sha256 /f "$env:RUNNER_TEMP\SFCleanerCert.pfx" /p sf-cleaner SFCleanerDrv.sys
-          signtool.exe verify /pa /v SFCleanerDrv.sys
+          $st = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.*\x64\signtool.exe' | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $st) { throw 'signtool not found' }
+          Write-Host "signtool: $($st.FullName)"
+          & $st.FullName sign /v /fd sha256 /f "$env:RUNNER_TEMP\SFCleanerCert.pfx" /p sf-cleaner SFCleanerDrv.sys
+          & $st.FullName verify /pa /v SFCleanerDrv.sys
       - uses: actions/upload-artifact@v4
         with:
           name: SFCleanerDrv
