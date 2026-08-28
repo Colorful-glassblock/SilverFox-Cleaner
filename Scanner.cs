@@ -210,7 +210,12 @@ public static class Scanner
             f.AddRange(ScanCtfmon());
             return f;
         });
-        var t3 = Task.Run(ScanFiles);
+        var t3 = Task.Run(() =>
+        {
+            var f = ScanFiles();
+            f.AddRange(ScanHosts());
+            return f;
+        });
         Task.WaitAll(t1, t2, t3);
         var all = t1.Result.Concat(t2.Result).Concat(t3.Result).ToList();
         all.Sort((a, b) => b.High.CompareTo(a.High));
@@ -415,6 +420,42 @@ public static class Scanner
 
     // ---- 落盘文件 ----
 
+    // hosts 篡改检测 (银狐常用手法: 封杀软更新域)
+    private const string DefaultHosts =
+        "# Copyright (c) 1993-2009 Microsoft Corp.\r\n" +
+        "# This is a sample HOSTS file used by Microsoft TCP/IP for Windows.\r\n" +
+        "# This file contains the mappings of IP addresses to host names.\r\n" +
+        "#\r\n" +
+        "# localhost name resolution is handled within DNS itself.\r\n" +
+        "#\t127.0.0.1       localhost\r\n" +
+        "#\t::1             localhost\r\n";
+
+    private const string HostsPath = @"C:\Windows\System32\drivers\etc\hosts";
+
+    public static List<Finding> ScanHosts()
+    {
+        var res = new List<Finding>();
+        try
+        {
+            foreach (var line in File.ReadAllLines(HostsPath))
+            {
+                var c = line.TrimStart();
+                if (c.Length == 0 || c[0] == '#') continue;
+                if (!c.StartsWith("127.0.0.1") && !c.StartsWith("::1"))
+                {
+                    res.Add(new Finding
+                    {
+                        Kind = "HOSTS", High = true, Detail = "hosts 文件被篡改 (存在活动解析条目)",
+                        Action = "重置为默认并隔离原件"
+                    });
+                    break;
+                }
+            }
+        }
+        catch { /* 文件不可读忽略 */ }
+        return res;
+    }
+
     public static List<Finding> ScanFiles()
     {
         var res = new List<Finding>();
@@ -542,6 +583,15 @@ public static class Scanner
                 }
                 case "FILE":
                     s = Quarantine(BeforeBracket(f.Detail), qd, log);
+                    break;
+                case "HOSTS":
+                    Quarantine(HostsPath, qd, log); // 隔离原件 (失败不阻塞)
+                    try
+                    {
+                        File.WriteAllText(HostsPath, DefaultHosts);
+                        s = true;
+                    }
+                    catch { s = false; }
                     break;
                 default: s = true; break;
             }
