@@ -36,6 +36,13 @@ public partial class App : Application
             Environment.Exit(0);
             return;
         }
+        if (cli.Any(a => a == "--nomore2"))
+        {
+            // RunOnce 自动链专用: 只允许 phase2, marker 不在绝不重演 phase1
+            Scanner.NomorePhase2Auto();
+            Environment.Exit(0);
+            return;
+        }
         if (cli.Any(a => a == "--wipe-quarantine"))
         {
             var (n, b) = Scanner.QuarantineStats();
