@@ -255,12 +255,16 @@ public static class Scanner
             var f = ScanFiles();
             f.AddRange(ScanHosts());
             f.AddRange(ScanWu());
-            f.AddRange(ScanWb());
+            return f;
+        });
+        var t4 = Task.Run(() =>
+        {
+            var f = ScanWb();
             f.AddRange(ScanWd());
             return f;
         });
-        Task.WaitAll(t1, t2, t3);
-        var all = t1.Result.Concat(t2.Result).Concat(t3.Result).ToList();
+        Task.WaitAll(t1, t2, t3, t4);
+        var all = t1.Result.Concat(t2.Result).Concat(t3.Result).Concat(t4.Result).ToList();
         all.Sort((a, b) => b.High.CompareTo(a.High));
         return all;
     }
@@ -578,9 +582,10 @@ public static class Scanner
         if (depth > 4) return;
         string low = dir.ToLowerInvariant();
         if (low.Contains("sf_quarantine") || WbWhitelist.Any(w => low.Contains(w))) return;
-        bool se = false, ud = false;
-        string? hit = null;
-        List<string> subs = new();
+        /* 枚举先行: 无 exe 或无 dll 的目录 (绝大多数) 0 次验签; 配对才查, 找到即停 */
+        var exes = new List<string>(24);
+        var dlls = new List<string>(64);
+        var subs = new List<string>();
         string[] entries;
         try { entries = Directory.GetFileSystemEntries(dir); } catch { return; }
         foreach (var e in entries)
@@ -593,17 +598,25 @@ public static class Scanner
                 continue;
             }
             string fnm = Path.GetFileName(e).ToLowerInvariant();
-            if (fnm.EndsWith(".exe") && !se && IsValidSigned(e)) se = true;
-            else if (fnm.EndsWith(".dll") && !ud && !IsValidSigned(e)) { ud = true; hit = e; }
+            if (fnm.EndsWith(".exe")) { if (exes.Count < 24) exes.Add(e); }
+            else if (fnm.EndsWith(".dll")) { if (dlls.Count < 64) dlls.Add(e); }
         }
-        if (se && ud && hit != null)
-            res.Add(new Finding
+        if (exes.Count > 0 && dlls.Count > 0)
+        {
+            bool se = exes.Any(IsValidSigned);
+            if (se)
             {
-                Kind = "FILE",
-                Detail = $"{hit} [白加黑: 有效签名EXE+未签名DLL]",
-                High = false,
-                Action = $"quarantine {hit}",
-            });
+                string? hit = dlls.FirstOrDefault(d => !IsValidSigned(d));
+                if (hit != null)
+                    res.Add(new Finding
+                    {
+                        Kind = "FILE",
+                        Detail = $"{hit} [白加黑: 有效签名EXE+未签名DLL]",
+                        High = false,
+                        Action = $"quarantine {hit}",
+                    });
+            }
+        }
         foreach (var sd in subs) ScanWbDir(sd, depth + 1, res);
     }
 
