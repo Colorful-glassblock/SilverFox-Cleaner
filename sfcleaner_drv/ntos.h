@@ -288,7 +288,7 @@ NTSYSAPI NTSTATUS NTAPI ZwDuplicateObjectEx(HANDLE, HANDLE, HANDLE, PHANDLE, ACC
 #ifndef PROCESS_DUP_HANDLE
 #define PROCESS_DUP_HANDLE              0x0040L
 #endif
-typedef struct _SFC_SEC_OBJ { PVOID Data; PVOID SharedCacheMap; PVOID ImageSectionObject; } SFC_SEC_OBJ, *PSFC_SEC_OBJ;
+typedef struct _SFC_SEC_OBJ { PVOID DataSectionObject; PVOID SharedCacheMap; PVOID ImageSectionObject; } SFC_SEC_OBJ, *PSFC_SEC_OBJ;
 typedef struct _SFC_FILE_OBJECT {   /* FILE_OBJECT 头部视图 (x64, SectionObjectPointer@40 稳定) */
     SHORT  Type;
     SHORT  Size;
