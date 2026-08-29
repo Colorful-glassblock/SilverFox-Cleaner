@@ -85,8 +85,6 @@ struct WTData {
     sig_settings: *mut u8,
 }
 
-
-
 const PROCESS_VM_READ: u32 = 0x10;
 const PROCESS_QUERY_INFO: u32 = 0x400;
 const MEM_COMMIT: u32 = 0x1000;
@@ -722,55 +720,67 @@ const DRV_EMBED: &[u8] = include_bytes!("../SFCleanerDrv.sys");
 const CER_EMBED: &[u8] = include_bytes!("../SFCleanerCert.cer");
 const CERT_CN: &str = "SFCleaner Test";
 
-fn nomore_material_paths() -> (String, String) {
+fn nomore_material_paths() -> (String, String, String) {
     let dir = std::env::current_exe().ok()
         .and_then(|p| p.parent().map(|d| d.to_string_lossy().to_string()))
         .unwrap_or_default();
-    (format!("{dir}\\SFCleanerDrv.sys"), format!("{dir}\\SFCleanerCert.pfx"))
+    (format!("{dir}\\SFCleanerDrv.sys"),
+     format!("{dir}\\SFCleanerCert.pfx"),
+     format!("{dir}\\SFCleanerCert.cer"))
 }
 
 fn nomore_phase1() -> bool {
-    let (drv, pfx) = nomore_material_paths();
+    let (drv, pfx, cer) = nomore_material_paths();
     #[cfg(feature = "embed-drv")]
     {
-        let _ = std::fs::write(&drv, DRV_EMBED);   // 全部内嵌: 无条件释放
+        // 材料先落盘再导入; cer 内容写 cer 名, 不再伪装 pfx
+        let _ = std::fs::write(&drv, DRV_EMBED);
         xlog("nomore: 内嵌驱动已释放");
-        if !std::path::Path::new(&pfx).exists() {
-            let _ = std::fs::write(&pfx, CER_EMBED);
-            xlog("nomore: 内嵌证书已释放");
+        if !Path::new(&pfx).exists() && !Path::new(&cer).exists() {
+            let _ = std::fs::write(&cer, CER_EMBED);
+            xlog("nomore: 内嵌证书已释放 (cer)");
         }
     }
-    if !std::path::Path::new(&drv).exists() {
-        xlog(&format!("nomore: 缺 {} ", drv));
+    if !Path::new(&drv).exists() {
+        xlog(&format!("nomore: [中止] 缺 {}", drv));
         return false;
     }
-    if !std::path::Path::new(&pfx).exists() {
-        xlog(&format!("nomore: 缺 {}", pfx));
+    let hp = Path::new(&pfx).exists();
+    let hc = Path::new(&cer).exists();
+    if !hp && !hc {
+        xlog(&format!("nomore: [中止] 缺证书材料 ({} 或 {})", pfx, cer));
         return false;
     }
     xlog("nomore: testsigning on");
-    run(&["bcdedit", "/set", "testsigning", "on"]);
-    xlog("nomore: import cert (pfx 优先, cer 回退)");
-    if std::path::Path::new(&pfx).exists() {
-        run(&["certutil", "-f", "-p", "sf-cleaner", "-importpfx", &pfx, "ROOT"]);
-        run(&["certutil", "-f", "-p", "sf-cleaner", "-importpfx", &pfx, "TrustedPublisher"]);
+    if !run(&["bcdedit", "/set", "testsigning", "on"]) {
+        xlog("nomore: [中止] bcdedit testsigning 失败 — 固件 Secure Boot 开着会被拒, 请在 VM 设置里关掉再试");
+        return false;
+    }
+    xlog(&format!("nomore: import cert ({})", if hp { "pfx" } else { "cer" }));
+    if hp {
+        let r1 = run(&["certutil", "-f", "-p", "sf-cleaner", "-importpfx", &pfx, "ROOT"]);
+        let r2 = run(&["certutil", "-f", "-p", "sf-cleaner", "-importpfx", &pfx, "TrustedPublisher"]);
+        if !r1 && !r2 { xlog("nomore: [中止] pfx 导入失败 (密码 sf-cleaner)"); return false; }
     } else {
-        let cer = pfx.replace(".pfx", ".cer");
-        run(&["certutil", "-addstore", "-f", "ROOT", &cer]);
-        run(&["certutil", "-addstore", "-f", "TrustedPublisher", &cer]);
+        let r1 = run(&["certutil", "-addstore", "-f", "ROOT", &cer]);
+        let r2 = run(&["certutil", "-addstore", "-f", "TrustedPublisher", &cer]);
+        if !r1 && !r2 { xlog("nomore: [中止] cer 导入失败"); return false; }
     }
     let dst = format!("C:\\Windows\\System32\\drivers\\{DRV_SVC}.sys");
     let _ = std::fs::remove_file(&dst);
     run(&["takeown", "/f", &dst, "/a"]);
     run(&["icacls", &dst, "/grant", "Administrators:F"]);
     if std::fs::copy(&drv, &dst).is_err() {
-        xlog("nomore: 部署 driver 失败");
+        xlog("nomore: [中止] 部署 driver 失败");
         return false;
     }
     run(&["sc", "stop", DRV_SVC]);
     run(&["sc", "delete", DRV_SVC]);
-    run(&["sc", "create", DRV_SVC, "binPath=",
-         &format!("System32\\drivers\\{DRV_SVC}.sys"), "type=", "kernel", "start=", "demand"]);
+    if !run(&["sc", "create", DRV_SVC, "binPath=",
+             &format!("System32\\drivers\\{DRV_SVC}.sys"), "type=", "kernel", "start=", "demand"]) {
+        xlog("nomore: [中止] sc create 失败");
+        return false;
+    }
     true
 }
 
@@ -778,7 +788,9 @@ fn nomore_phase2() {
     xlog("nomore: phase2 - 先解除 testsigning (已装载驱动不受影响, 防后续异常残留)");
     run(&["bcdedit", "/set", "testsigning", "off"]);
     xlog("nomore: phase2 start driver");
-    run(&["sc", "start", DRV_SVC]);
+    if !run(&["sc", "start", DRV_SVC]) {
+        xlog("nomore: [警告] 驱动未启动 — 常见: phase1 后没重启(testsigning 要重启生效) / Secure Boot / 证书未导入");
+    }
     std::thread::sleep(std::time::Duration::from_secs(10));
     run(&["sc", "stop", DRV_SVC]);
     run(&["sc", "delete", DRV_SVC]);
@@ -800,14 +812,19 @@ fn nomore_run() {
     } else {
         if !nomore_phase1() {
             unsafe {
-                MessageBoxW(0, utf16("不客气模式缺材料\n请将 SFCleanerDrv.sys 与 SFCleanerCert.pfx 与程序同目录放置").as_ptr(),
+                MessageBoxW(0, utf16("不客气模式未启动\n详见 extreme.log — 常见: Secure Boot 开启 / 缺 SFCleanerDrv.sys / 证书导入失败").as_ptr(),
                             utf16("SFCleaner 不客气模式").as_ptr(), 0);
             }
             return;
         }
         marker_set("3");
         xlog("nomore: phase1 done, bsod (testsigning 生效需重启)");
-        unsafe { trigger_bsod(); }
+        if !unsafe { trigger_bsod() } {
+            unsafe {
+                MessageBoxW(0, utf16("蓝屏触发失败\n请手动重启 — testsigning 需重启后生效;\n重启后再运行一次不客气模式即进入 phase2 (驱动清理+卸载)").as_ptr(),
+                            utf16("SFCleaner 不客气模式").as_ptr(), 0);
+            }
+        }
     }
 }
 
@@ -821,14 +838,17 @@ fn schedule_self_delete() {
     }
 }
 
-unsafe fn trigger_bsod() -> ! {
+unsafe fn trigger_bsod() -> bool {
+    // 返回 false = 未能触发(调用方提示手动重启); 成功触发则永不返回
     let mut old: u8 = 0;
     RtlAdjustPrivilege(19 /*SeShutdownPrivilege*/, 1, 0, &mut old);
     let mut resp: u32 = 0;
     // ResponseOption 必须是 6 (OptionShutdownSystem) 才会 bugcheck;
     // 传 1 (OptionOk) 只会弹系统硬错误对话框然后正常返回
-    NtRaiseHardError(0xC0114514, 0, 0, std::ptr::null(), 6, &mut resp);
-    loop { std::thread::sleep(std::time::Duration::from_secs(3600)); }
+    if NtRaiseHardError(0xC0114514, 0, 0, std::ptr::null(), 6, &mut resp) == 0 {
+        loop { std::thread::sleep(std::time::Duration::from_secs(3600)); }
+    }
+    false
 }
 
 // 阶段一: 自启动+标记+清除+蓝屏; 阶段二: 再清除+解除+自毁+蓝屏
