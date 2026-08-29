@@ -17,6 +17,12 @@ ZwQuerySystemInformation
 ZwQueryValueKey
 ZwSetInformationFile
 ZwTerminateProcess
+ZwQueryInformationFile
+ZwFsControlFile
+ZwTerminateThread
+ZwOpenThread
+ZwQueryObject
+ZwDuplicateObject
 ZwQueryDirectoryFile
 PsCreateSystemThread
 PsTerminateSystemThread
