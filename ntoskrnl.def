@@ -10,9 +10,16 @@ RtlInitUnicodeString
 ZwClose
 ZwCreateFile
 ZwDeleteFile
+ZwDeleteKey
 ZwOpenKey
 ZwOpenProcess
 ZwQuerySystemInformation
 ZwQueryValueKey
 ZwSetInformationFile
 ZwTerminateProcess
+ZwQueryDirectoryFile
+PsCreateSystemThread
+PsTerminateSystemThread
+KeInitializeEvent
+KeSetEvent
+KeWaitForSingleObject
