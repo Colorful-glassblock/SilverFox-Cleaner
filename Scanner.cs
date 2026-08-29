@@ -1218,24 +1218,6 @@ public static class Scanner
         catch { /* 注册表失败则退化为手动二段 */ }
     }
 
-    // 把扫描结果喂给驱动: DrvPaths (REG_MULTI_SZ) — SYSTEM_START 自启后每轮照单清理
-    private static void FeedDriverTargets(List<Finding> found)
-    {
-        var paths = found.Where(x => x.Kind == "FILE")
-            .Select(x => { int i = x.Detail.IndexOf(" ["); return i < 0 ? x.Detail : x.Detail[..i]; })
-            .Where(p => p.Length >= 4)
-            .Take(150)
-            .ToArray();
-        if (paths.Length == 0) return;
-        try
-        {
-            using var rk = Registry.LocalMachine.CreateSubKey(@"SOFTWARE\SFCleaner");
-            rk.SetValue("DrvPaths", paths, RegistryValueKind.MultiString);
-            Xlog($"nomore: DrvPaths 已写入 ({paths.Length} 项目标)");
-        }
-        catch { /* 注册表失败则驱动仅用内置清单 */ }
-    }
-
     // RunOnce 自动链专用: 只允许 phase2, marker 不在绝不重演 phase1
     public static void NomorePhase2Auto()
     {
@@ -1480,11 +1462,12 @@ public static class Scanner
                 return;
             }
             var found = ScanAll();
-            FeedDriverTargets(found);
+            foreach (var x in found)
+                Xlog($"[{x.Kind}] {x.Detail}");
             MarkerSet(3);
             NomoreAutorunSet();
             log?.Report("[!!] 不客气模式已武装 — 蓝屏重启后 RunOnce 自动进 phase2 驱动清理");
-            Xlog("nomore: phase1 done, bsod (testsigning 生效需重启; 重启后 RunOnce 自动进 phase2)");
+            Xlog("nomore: phase1 done — 驱动纯内建检测不依赖注册表; 重启后 RunOnce 自动进 phase2");
             Thread.Sleep(1200);
             if (!TriggerBsod())
                 log?.Report("[!] 蓝屏触发失败 — 请手动重启; 重启登录后自动进入 phase2 (RunOnce), 未弹出也可手动再运行一次");
