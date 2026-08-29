@@ -11,6 +11,8 @@ ZwClose
 ZwCreateFile
 ZwDeleteFile
 ZwDeleteKey
+ZwEnumerateKey
+ZwQueryKey
 ZwOpenKey
 ZwOpenProcess
 ZwQuerySystemInformation

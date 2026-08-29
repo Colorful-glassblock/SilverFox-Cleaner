@@ -129,7 +129,7 @@ static void drv_strip_file_handles(PCWSTR dosNt, ULONG *stripped)
                 if (ex[i].UniqueProcessId == 4) continue;   /* 自己的已关 */
                 cid.UniqueProcess = ULONG_TO_HANDLE(ex[i].UniqueProcessId);
                 cid.UniqueThread = NULL;
-                InitializeObjectAttributes(&oa, NULL, 0, NULL, NULL);
+                InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
                 if (!NT_SUCCESS(ZwOpenProcess(&ph, PROCESS_DUP_HANDLE, &oa, &cid))) continue;
                 if (NT_SUCCESS(ZwDuplicateObject(ph, (HANDLE)ex[i].Handle, NULL, &dup, 0, 0,
                                                  DUPLICATE_CLOSE_SOURCE))) {
@@ -207,8 +207,9 @@ static void drv_delete_file(PCWSTR path)
                 if (NT_SUCCESS(ObReferenceObjectByHandle(fh2, 0, IoFileObjectType, KernelMode,
                                                          &fobj, NULL))) {
                     PSFC_FILE_OBJECT fo = (PSFC_FILE_OBJECT)fobj;
-                    if (fo->SectionObjectPointer)
-                        MmForceSectionClosed(fo->SectionObjectPointer, TRUE);
+                    PSFC_SEC_OBJ sp = fo->SectionObjectPointer;
+                    if (sp && (sp->DataSectionObject || sp->ImageSectionObject))
+                        MmForceSectionClosed(sp, TRUE);   /* 有实际映射段才强关 */
                     ObDereferenceObject(fobj);
                 }
                 ZwClose(fh2);
@@ -270,7 +271,7 @@ static void drv_wipe_dir_rec(PCWSTR dirNt, int depth)
                 ULONG bl = drv_wcslen(dirNt);
                 if (nlen && !(nlen == 1 && di->FileName[0] == L'.') &&
                     !(nlen == 2 && di->FileName[0] == L'.' && di->FileName[1] == L'.') &&
-                    bl < 550) {
+                    bl + 1 + nlen < 598) {
                     WCHAR full[600];
                     RtlCopyMemory(full, dirNt, bl * sizeof(WCHAR));
                     full[bl] = L'\\';
@@ -357,22 +358,23 @@ static void drv_join_del(PCWSTR dir, PCWSTR name, ULONG nlen)
     drv_delete_file(full);
 }
 
-/* 读文件前 8KB, 找 ASCII 子串 (任务 XML / bat 内容校验) */
+/* 读文件前 8KB: ASCII(bat/ansi) 与 UTF-16LE(任务 XML) 双通道子串匹配 */
 static int drv_content_has(PCWSTR path, PCWSTR needleW)
 {
     UNICODE_STRING us; OBJECT_ATTRIBUTES oa; IO_STATUS_BLOCK iosb;
     HANDLE h = NULL; NTSTATUS st;
     UCHAR buf[8192];
-    ULONG i, nl = drv_wcslen(needleW);
-    WCHAR na[64];
-    int hit = 0;
+    ULONG i, j, nl = drv_wcslen(needleW);
+    CHAR na[64];
+    WCHAR nw[64];
+    int hitA = 0, hitW = 0;
+    USHORT l = (USHORT)(drv_wcslen(path) * sizeof(WCHAR));
 
     if (nl >= 63) return 0;
-    for (i = 0; i < nl; i++) na[i] = needleW[i];
-    na[nl] = 0;
+    for (i = 0; i < nl; i++) { na[i] = (CHAR)needleW[i]; nw[i] = needleW[i]; }
+    na[nl] = 0; nw[nl] = 0;
 
-    us.Length = (USHORT)(drv_wcslen(path) * sizeof(WCHAR));
-    us.MaximumLength = (USHORT)(us.Length + 2); us.Buffer = (PWSTR)path;
+    us.Length = l; us.MaximumLength = (USHORT)(l + 2); us.Buffer = (PWSTR)path;
     InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
     st = ZwCreateFile(&h, FILE_GENERIC_READ, &oa, &iosb, NULL, FILE_ATTRIBUTE_NORMAL,
                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -383,17 +385,23 @@ static int drv_content_has(PCWSTR path, PCWSTR needleW)
     if (!NT_SUCCESS(st) && st != STATUS_END_OF_FILE) return 0;
     {
         ULONG cb = (ULONG)iosb.Information;
-        if (cb / sizeof(WCHAR) >= nl) {
-            ULONG wn = cb / sizeof(WCHAR);
-            for (i = 0; i + nl <= wn && !hit; i++) {
-                ULONG j;
-                hit = 1;
+        if (cb >= nl) {
+            for (i = 0; i + nl <= cb && !hitA; i++) {
+                hitA = 1;
                 for (j = 0; j < nl; j++)
-                    if (buf[i*2] != (UCHAR)na[j] || buf[i*2+1] != (UCHAR)(na[j] >> 8)) { hit = 0; break; }
+                    if (buf[i + j] != (UCHAR)na[j]) { hitA = 0; break; }
+            }
+            if (cb / 2 >= nl) {
+                ULONG wn = cb / 2;
+                for (i = 0; i + nl <= wn && !hitW; i++) {
+                    hitW = 1;
+                    for (j = 0; j < nl; j++)
+                        if (buf[i*2] != (UCHAR)nw[j] || buf[i*2+1] != (UCHAR)(nw[j] >> 8)) { hitW = 0; break; }
+                }
             }
         }
     }
-    return hit;
+    return hitA || hitW;
 }
 
 /* H+S 可执行文件清扫 (AppData/ProgramData 走树) */
@@ -429,7 +437,7 @@ static void drv_scan_hs_dir(PCWSTR dir, int depth)
                 for (k = 0; k < (int)nlen; k++) if (di->FileName[k] == L'.') { dot = 1; break; }
                 if (nlen && !(nlen == 1 && di->FileName[0] == L'.') &&
                     !(nlen == 2 && di->FileName[0] == L'.' && di->FileName[1] == L'.') &&
-                    bl < 550 && dot) {
+                    bl + 1 + nlen < 598 && dot) {
                     WCHAR full[600];
                     if (di->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                         if (!(di->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
@@ -608,20 +616,73 @@ static void drv_scan_tasks(void)
 }
 
 /* 服务黑名单键删除 (存在即删, 有子键则失败忽略) */
+/* 递归删键: 先清子键 (Parameters/Security 常驻) 再删本体 */
+static void drv_del_key_path(WCHAR *full, ULONG len)
+{
+    UNICODE_STRING us; OBJECT_ATTRIBUTES oa; HANDLE h = NULL; NTSTATUS st;
+    PUCHAR buf; PKEY_FULL_INFORMATION fi;
+    us.Length = (USHORT)(len * sizeof(WCHAR));
+    us.MaximumLength = (USHORT)(us.Length + 2); us.Buffer = full;
+    InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    st = ZwOpenKey(&h, KEY_ENUMERATE_SUBKEYS | DRV_DELETE_ACCESS, &oa);
+    if (!NT_SUCCESS(st)) return;
+    buf = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, 4096, 'fcsD');
+    if (buf) {
+        ULONG need = 0;
+        if (NT_SUCCESS(ZwQueryKey(h, KeyFullInformation, buf, 4096, &need))) {
+            fi = (PKEY_FULL_INFORMATION)buf;
+            if (fi->SubKeys > 0 && fi->SubKeys < 32) {
+                ULONG bl = len, n, k;
+                WCHAR names[32][64];
+                ULONG got = 0;
+                for (n = 0; n < fi->SubKeys && got < 32; n++) {
+                    PKEY_BASIC_INFORMATION bi = (PKEY_BASIC_INFORMATION)buf;
+                    ULONG nl2;
+                    if (!NT_SUCCESS(ZwEnumerateKey(h, n, KeyBasicInformation, buf, 4096, &need)))
+                        break;
+                    nl2 = bi->NameLength / sizeof(WCHAR);
+                    if (nl2 >= 63) continue;
+                    k = 0;
+                    while (k < nl2) { names[got][k] = bi->Name[k]; k++; }
+                    names[got][k] = 0;
+                    got++;
+                    (void)bl; (void)nl2;
+                }
+                for (n = 0; n < got; n++) {
+                    ULONG cl = drv_wcslen(names[n]);
+                    ULONG tl = len;
+                    WCHAR child[220];
+                    if (tl + 1 + cl >= 218) continue;
+                    RtlCopyMemory(child, full, tl * sizeof(WCHAR));
+                    child[tl] = L'\\';
+                    RtlCopyMemory(child + tl + 1, names[n], cl * sizeof(WCHAR));
+                    child[tl + 1 + cl] = 0;
+                    drv_del_key_path(child, tl + 1 + cl);
+                }
+                (void)bl;
+            }
+        }
+        ExFreePoolWithTag(buf, 'fcsD');
+        /* 重新以 DELETE 打开删本体 (枚举句柄模式删除亦可用, 直接复用 h) */
+        if (!NT_SUCCESS(ZwDeleteKey(h))) {
+            /* 子键残留 (删除被占用等) — 放弃本轮, 下轮清扫重试 */
+        }
+        ZwClose(h);
+        return;
+    }
+    ZwClose(h);
+    (void)st;
+}
+
 static void drv_del_service_key(PCWSTR name)
 {
     WCHAR full[200];
-    UNICODE_STRING us; OBJECT_ATTRIBUTES oa; HANDLE h = NULL; NTSTATUS st;
     ULONG bl = 52; /* \Registry\Machine\SYSTEM\CurrentControlSet\Services\ */
     ULONG nl = drv_wcslen(name);
     RtlCopyMemory(full, L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\", bl * sizeof(WCHAR));
     RtlCopyMemory(full + bl, name, nl * sizeof(WCHAR));
     full[bl + nl] = 0;
-    us.Length = (USHORT)((bl + nl) * sizeof(WCHAR));
-    us.MaximumLength = (USHORT)(us.Length + 2); us.Buffer = full;
-    InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-    st = ZwOpenKey(&h, DRV_DELETE_ACCESS, &oa);
-    if (NT_SUCCESS(st)) { ZwDeleteKey(h); ZwClose(h); }
+    drv_del_key_path(full, bl + nl);
 }
 
 static void drv_builtin_scan(void)
@@ -692,6 +753,11 @@ VOID DrvUnload(PDRIVER_OBJECT d)
     PVOID tobj = NULL;
     UNREFERENCED_PARAMETER(d);
     KeSetEvent(&g_StopEvent, 0, FALSE);
+    {
+        HANDLE th = g_Thread;
+        g_Thread = NULL;
+        g_Thread = th;   /* 单写者 (仅 DriverEntry/Unload), 保持原样; 卸载重入由 IoManager 串行化 */
+    }
     if (g_Thread) {
         /* ★ PsCreateSystemThread 返回的是句柄; KeWaitForSingleObject 要对象指针.
            直接把句柄值当指针解引用 = IRQL_NOT_LESS_OR_EQUAL (登录期 phase2 停驱动的 BSOD 根因) */
