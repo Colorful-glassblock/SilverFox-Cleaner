@@ -702,6 +702,91 @@ static void scan_bj(void)
     for (r = 0; r < nroots; r++) bj_scan_dir(roots[r], 0);
 }
 
+/* ---- %WINDIR% 随机名 PE/bat 检测 (银狐新变种浅层落盘) ----
+ * 随机名 + 未签名 双条件: 系统 PE 走 catalog 签名, 随机名但验签通过 → 放行 */
+static const char *WD_SKIP[] = {
+    "\\winsxs", "\\softwaredistribution", "\\driverstore", "\\installer",
+    "\\assembly", "\\microsoft.net", "\\servicing", "\\logfiles", "\\logs",
+    "\\spool", "\\catroot", "\\fonts", "\\media", "\\ime", "\\web",
+    "\\wallpaper", "\\oledb", "\\mui", "\\ehome", "\\pchealth", "\\resources",
+    "\\livekernelreports", "\\minidump", "\\prefetch", "\\appcompat",
+    "\\apppatch", "\\csc", "\\diagnostics", "\\panther", "\\performance",
+    "\\pla", "\\registration", "\\shellcomponents", "\\triage", "\\winstore",
+    "\\tokens", "\\csp", "\\containers", "\\config", NULL
+};
+
+static int wd_random_name(const char *fn) /* fn=原始文件名(含扩展名); 返回: 0否 1pe 2bat */
+{
+    const char *dot = strrchr(fn, '.');
+    size_t bl, i;
+    int dig = 0, up = 0, is_pe = 0, is_bat = 0;
+    char extl[8];
+    if (!dot) return 0;
+    strncpy(extl, dot, sizeof extl - 1); extl[sizeof extl - 1] = 0; str_lower(extl);
+    if (!strcmp(extl, ".exe") || !strcmp(extl, ".dll") || !strcmp(extl, ".sys")) is_pe = 1;
+    else if (!strcmp(extl, ".bat")) is_bat = 1;
+    else return 0;
+    bl = (size_t)(dot - fn);
+    if (bl < 6 || bl > 16) return 0;
+    for (i = 0; i < bl; i++) {
+        char c = fn[i];
+        if (c >= '0' && c <= '9') { dig++; continue; }
+        if (c >= 'A' && c <= 'Z') { up++; continue; }
+        if (c >= 'a' && c <= 'z') continue;
+        return 0; /* 含分隔符/非ASCII → 非随机名形态 */
+    }
+    if (is_bat) return 2; /* windir 下随机名 bat 本身即高置信 */
+    if (dig >= 2 || up || bl >= 8) return 1;
+    return 0;
+}
+
+static void wd_scan_dir(const char *dir, int depth)
+{
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    char pat[MAX_PATH], full[MAX_PATH];
+    int w;
+    if (depth > 4) return;
+    {
+        char low[MAX_PATH + 8];
+        strncpy(low, dir, sizeof low - 2); low[sizeof low - 2] = 0;
+        str_lower(low);
+        for (w = 0; WD_SKIP[w]; w++)
+            if (strstr(low, WD_SKIP[w])) return;
+    }
+    _snprintf(pat, sizeof pat - 1, "%s\\*", dir); pat[sizeof pat - 1] = 0;
+    h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        int rt;
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+        _snprintf(full, sizeof full - 1, "%s\\%s", dir, fd.cFileName);
+        full[sizeof full - 1] = 0;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) wd_scan_dir(full, depth + 1);
+            continue;
+        }
+        rt = wd_random_name(fd.cFileName);
+        if (!rt) continue;
+        if (rt == 1 && bj_is_signed(full)) continue; /* 随机名但签名有效 → 放行 */
+        {
+            char det[MAX_PATH + 40], act[MAX_PATH + 16];
+            _snprintf(det, sizeof det - 1, "%s [%s]", full, rt == 1 ? "随机名未签名PE" : "随机名bat");
+            _snprintf(act, sizeof act - 1, "quarantine %s", full);
+            addf("FILE", 1, det, act);
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+
+static void scan_windir(void)
+{
+    char wd[MAX_PATH];
+    DWORD n = GetEnvironmentVariableA("WINDIR", wd, sizeof wd);
+    if (!n || n >= sizeof wd - 4) strcpy(wd, "C:\\Windows");
+    wd_scan_dir(wd, 0);
+}
+
 /* 默认 hosts 内容 (Windows 出厂样式) */
 static const char *DEFAULT_HOSTS =
     "# Copyright (c) 1993-2009 Microsoft Corp.\r\n"
@@ -782,6 +867,7 @@ static void scan_all(void)
     scan_wu();
     scan_hosts();
     scan_bj();
+    scan_windir();
 }
 
 /* ---- 清除 ---- */
