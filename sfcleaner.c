@@ -1090,6 +1090,16 @@ static void msgbox(const char *text);
 #define DRV_SVC   "SFCleanerDrv"
 #define CERT_CN   "SFCleaner Test"
 
+static int secureboot_on(void)
+{
+    HKEY k; DWORD v = 0, sz = sizeof v, t = 0;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State",
+                      0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS) return 0;
+    LONG r = RegQueryValueExA(k, "UEFISecureBootEnabled", NULL, &t, (BYTE *)&v, &sz);
+    RegCloseKey(k);
+    return r == ERROR_SUCCESS && t == REG_DWORD && v == 1;
+}
+
 static void nomore_material_paths(char *drv, char *pfx, char *cer, size_t n)
 {
     char exe[MAX_PATH], *s;
@@ -1130,6 +1140,11 @@ static int nomore_phase1(void)
         return 0;
     }
 
+    if (secureboot_on()) {
+        xlog("nomore: [中止] Secure Boot 开启 — testsigning 会被安全启动策略拒绝");
+        xlog("nomore: VMware: 虚拟机设置->选项->高级->固件类型UEFI, 取消勾选'启用安全引导'后重启 VM");
+        return 0;
+    }
     xlog("nomore: testsigning on");
     if (!run_cmd("bcdedit /set testsigning on")) {
         xlog("nomore: [中止] bcdedit testsigning 失败 — 固件 Secure Boot 开着会被拒, 请在 VM 设置里关掉 Secure Boot 再试");
