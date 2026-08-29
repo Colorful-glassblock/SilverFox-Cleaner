@@ -93,6 +93,9 @@ internal static partial class Native
     [DllImport("wintrust.dll", CharSet = CharSet.Unicode)]
     internal static extern int WinVerifyTrust(IntPtr hwnd, ref Guid actionId, ref WINTRUST_DATA data);
 
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    internal static extern uint GetShortPathName(string lpszLongPath, StringBuilder lpszShortPath, uint cchBuffer);
+
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     internal struct WINTRUST_FILE_INFO
     {
@@ -641,9 +644,9 @@ public static class Scanner
         int dig = 0, up = 0;
         foreach (var c in baseName)
         {
-            if (char.IsAsciiDigit(c)) dig++;
-            else if (char.IsAsciiUpper(c)) up++;
-            else if (char.IsAsciiLower(c)) continue;
+            if (c >= '0' && c <= '9') dig++;
+            else if (c >= 'A' && c <= 'Z') up++;
+            else if (c >= 'a' && c <= 'z') continue;   // 纯 ASCII 区间判定, 不依赖 char.IsAscii* (部分 TFM 缺失)
             else return 0;
         }
         if (!isPe) return 2;
@@ -1042,7 +1045,11 @@ public static class Scanner
 
     private static void AutorunSet()
     {
-        var data = $"\"{Environment.ProcessPath}\" --extreme";
+        // 优先 8.3 短路径写 Run/RunOnce (无括号/空格歧义), 拿不到才回退引号长路径
+        var exe = Environment.ProcessPath ?? "";
+        var shortBuf = new StringBuilder(520);
+        uint n = Native.GetShortPathName(exe, shortBuf, 520);
+        var data = n > 0 && n < 520 ? $"{shortBuf} --extreme" : $"\"{exe}\" --extreme";
         using (var rk = Registry.LocalMachine.CreateSubKey(RunKeyPath))
         {
             rk.SetValue("SFCleaner", data);
