@@ -22,6 +22,7 @@ extern "system" {
     fn GetModuleHandleW(n: *const u16) -> isize;
     fn MoveFileExW(a: *const u16, b: *const u16, f: u32) -> i32;
     fn GetFileAttributesW(a: *const u16) -> u32;
+    fn GetShortPathNameW(l: *const u16, s: *mut u16, n: u32) -> u32;
 }
 #[link(name = "ntdll")]
 extern "system" {
@@ -653,7 +654,17 @@ fn xlog(s: &str) {
 
 fn autorun_set() {
     if let Ok(exe) = std::env::current_exe() {
-        let d = format!("\"{}\" --extreme", exe.display());
+        // 优先 8.3 短路径写 Run/RunOnce, 无括号/空格/中文歧义; 拿不到才回退引号长路径
+        let d = {
+            let wide = utf16(&exe.to_string_lossy());
+            let mut buf = vec![0u16; 520];
+            let n = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+            if n > 0 && (n as usize) < buf.len() {
+                format!("{} --extreme", String::from_utf16_lossy(&buf[..n as usize]))
+            } else {
+                format!("\"{}\" --extreme", exe.display())
+            }
+        };
         run(&["reg", "add", RUN_KEY, "/v", "SFCleaner", "/t", "REG_SZ", "/d", &d, "/f"]);
         // 安全模式只执行带 * 前缀的条目
         run(&["reg", "add", RUN_KEY, "/v", "*SFCleaner", "/t", "REG_SZ", "/d", &d, "/f"]);
