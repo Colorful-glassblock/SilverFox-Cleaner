@@ -88,6 +88,40 @@ internal static partial class Native
     [DllImport("ntdll.dll")]
     internal static extern int NtRaiseHardError(uint status, uint paramCount, uint unicodeMask,
         IntPtr parameters, uint validResponseOption, out uint response);
+
+    // 白加黑检测: Authenticode 验签 (wintrust)
+    [DllImport("wintrust.dll", CharSet = CharSet.Unicode)]
+    internal static extern int WinVerifyTrust(IntPtr hwnd, ref Guid actionId, ref WINTRUST_DATA data);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    internal struct WINTRUST_FILE_INFO
+    {
+        public uint cbStruct;
+        public string pcwszFilePath;
+        public IntPtr hFile;
+        public IntPtr pgKnownSubject;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    internal struct WINTRUST_DATA
+    {
+        public uint cbStruct;
+        public IntPtr pPolicyCallbackData;
+        public IntPtr pSIPClientData;
+        public uint dwUIChoice;
+        public uint fdwRevocationChecks;
+        public uint dwUnionChoice;
+        public IntPtr pFile;
+        public uint dwStateAction;
+        public IntPtr hWVTStateData;
+        public string pwszURLReference;
+        public uint dwProvFlags;
+        public uint dwUIContext;
+        public IntPtr pSignatureSettings;
+    }
+
+    internal static readonly Guid WinTrustActionGenericVerifyV2 =
+        new Guid(0x00AAC56B, 0xCD44, 0x11D0, 0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE);
 }
 
 // 加密隔离容器（与 Rust v4.1 字节级兼容）
@@ -218,6 +252,7 @@ public static class Scanner
             var f = ScanFiles();
             f.AddRange(ScanHosts());
             f.AddRange(ScanWu());
+            f.AddRange(ScanWb());
             return f;
         });
         Task.WaitAll(t1, t2, t3);
@@ -482,6 +517,101 @@ public static class Scanner
             }
         }
         catch { /* 文件不可读忽略 */ }
+        return res;
+    }
+
+    // 白加黑: 每目录聚合 [有效签名EXE + 未签名DLL] — 对随机名称跨变种同样有效
+    private const uint WTD_UI_NONE = 1;
+    private const uint WTD_CHOICE_FILE = 1;
+    private const uint WTD_STATEACTION_VERIFY = 1;
+    private const uint WTD_STATEACTION_CLOSE = 2;
+    private const uint WTD_CACHE_ONLY_URL_RETRIEVAL = 0x10000;
+    private static readonly string[] WbWhitelist =
+        { @"\programs\", @"\package cache\", @"\windowsapps\", @"\microsoft\", @"\windows\" };
+
+    private static bool IsValidSigned(string path)
+    {
+        // WINTRUST_FILE_INFO 含 string 非 blittable, 不能用 GCHandle pin —
+        // 走 StructureToPtr 编组到非托管内存, WINTRUST_DATA.pFile 指向它
+        var fi = new Native.WINTRUST_FILE_INFO
+        {
+            cbStruct = (uint)Marshal.SizeOf<Native.WINTRUST_FILE_INFO>(),
+            pcwszFilePath = path,
+            hFile = IntPtr.Zero,
+            pgKnownSubject = IntPtr.Zero,
+        };
+        IntPtr pFi = Marshal.AllocHGlobal(Marshal.SizeOf<Native.WINTRUST_FILE_INFO>());
+        try
+        {
+            Marshal.StructureToPtr(fi, pFi, false);
+            var wd = new Native.WINTRUST_DATA
+            {
+                cbStruct = (uint)Marshal.SizeOf<Native.WINTRUST_DATA>(),
+                pPolicyCallbackData = IntPtr.Zero,
+                pSIPClientData = IntPtr.Zero,
+                dwUIChoice = WTD_UI_NONE,
+                fdwRevocationChecks = 0,
+                dwUnionChoice = WTD_CHOICE_FILE,
+                pFile = pFi,
+                dwStateAction = WTD_STATEACTION_VERIFY,
+                hWVTStateData = IntPtr.Zero,
+                pwszURLReference = null,
+                dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL,
+                dwUIContext = 0,
+                pSignatureSettings = IntPtr.Zero,
+            };
+            var act = Native.WinTrustActionGenericVerifyV2;
+            int r = Native.WinVerifyTrust(IntPtr.Zero, ref act, ref wd);
+            wd.dwStateAction = WTD_STATEACTION_CLOSE;
+            Native.WinVerifyTrust(IntPtr.Zero, ref act, ref wd);
+            return r == 0;
+        }
+        finally { Marshal.FreeHGlobal(pFi); }
+    }
+
+    private static void ScanWbDir(string dir, int depth, List<Finding> res)
+    {
+        if (depth > 4) return;
+        string low = dir.ToLowerInvariant();
+        if (low.Contains("sf_quarantine") || WbWhitelist.Any(w => low.Contains(w))) return;
+        bool se = false, ud = false;
+        string hit = null;
+        List<string> subs = new();
+        string[] entries;
+        try { entries = Directory.GetFileSystemEntries(dir); } catch { return; }
+        foreach (var e in entries)
+        {
+            FileAttributes fa;
+            try { fa = File.GetAttributes(e); } catch { continue; }
+            if (fa.HasFlag(FileAttributes.Directory))
+            {
+                if (!fa.HasFlag(FileAttributes.ReparsePoint)) subs.Add(e);
+                continue;
+            }
+            string fnm = Path.GetFileName(e).ToLowerInvariant();
+            if (fnm.EndsWith(".exe") && !se && IsValidSigned(e)) se = true;
+            else if (fnm.EndsWith(".dll") && !ud && !IsValidSigned(e)) { ud = true; hit = e; }
+        }
+        if (se && ud && hit != null)
+            res.Add(new Finding
+            {
+                Kind = "FILE",
+                Detail = $"{hit} [白加黑: 有效签名EXE+未签名DLL]",
+                High = false,
+                Action = $"quarantine {hit}",
+            });
+        foreach (var sd in subs) ScanWbDir(sd, depth + 1, res);
+    }
+
+    public static List<Finding> ScanWb()
+    {
+        var res = new List<Finding>();
+        var roots = new List<string> { @"C:\Drivers" };
+        AddEnv(roots, "TEMP");
+        AddEnv(roots, "APPDATA");
+        AddEnv(roots, "LOCALAPPDATA");
+        AddEnv(roots, "ProgramData");
+        foreach (var root in roots.Where(Directory.Exists)) ScanWbDir(root, 0, res);
         return res;
     }
 
