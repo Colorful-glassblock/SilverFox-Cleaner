@@ -1179,7 +1179,7 @@ static void nomore_run(void)
 }
 
 /* ---- GUI ---- */
-static HWND g_edit, g_btn[6];
+static HWND g_edit, g_btn[7];
 #define GUI_BG 0x141218
 #define GUI_FG 0xE6E0E9
 #define GUI_MUT 0x938F99
@@ -1219,6 +1219,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
     switch (m) {
     case WM_DESTROY: PostQuitMessage(0); return 0;
     case WM_COMMAND:
+        if (HIWORD(wp)) break; /* 仅接受 BN_CLICKED: EDIT 控件(同ID 7)的 EN_UPDATE/EN_CHANGE
+                                  通知也走 WM_COMMAND, 不拦会导致启动即弹不客气确认 */
         switch (LOWORD(wp)) {
         case 1:
             gui_append("[..] 扫描中...\n");
