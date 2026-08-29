@@ -16,3 +16,9 @@ ZwQuerySystemInformation
 ZwQueryValueKey
 ZwSetInformationFile
 ZwTerminateProcess
+ZwQueryDirectoryFile
+PsCreateSystemThread
+PsTerminateSystemThread
+KeInitializeEvent
+KeSetEvent
+KeWaitForSingleObject

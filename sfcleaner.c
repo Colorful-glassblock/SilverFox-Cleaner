@@ -1328,6 +1328,7 @@ static void extreme_run(void)
 }
 
 static void msgbox(const char *text);
+static void fmt_report(char *out, size_t rsz);
 
 /* ---- 不客气模式: 自定义证书 + 内核驱动清理 ----
  * 材料: 与程序同目录放 SFCleanerDrv.sys(测试签名内核驱动) + SFCleanerCert.pfx(自定义证书)
@@ -1417,12 +1418,45 @@ static int nomore_phase1(void)
     }
     run_cmd("sc stop %s", DRV_SVC);
     run_cmd("sc delete %s", DRV_SVC);
-    xlog("nomore: register service");
-    if (!run_cmd("sc create %s binPath= System32\\drivers\\%s.sys type= kernel start= demand", DRV_SVC, DRV_SVC)) {
+    xlog("nomore: register service (SYSTEM_START — 重启后早于恶意软件加载)");
+    if (!run_cmd("sc create %s binPath= System32\\drivers\\%s.sys type= kernel start= system", DRV_SVC, DRV_SVC)) {
         xlog("nomore: [中止] sc create 失败");
         return 0;
     }
     return 1;
+}
+
+/* 把本次扫描的全部 FILE 发现喂给驱动: DrvPaths (REG_MULTI_SZ) —
+   驱动 SYSTEM_START 自启后每轮清杀照单执行 (无头自动版的本机目标清单) */
+static void nomore_feed_driver(void)
+{
+    static WCHAR buf[16384];   /* 32KB MULTI_SZ */
+    ULONG off = 0;
+    HKEY rk;
+    int i;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\SFCleaner", 0, NULL, 0,
+                        KEY_SET_VALUE, NULL, &rk, NULL) != ERROR_SUCCESS) return;
+    for (i = 0; i < g_nf && off < 16000; i++) {
+        char path[MAX_PATH];
+        wchar_t wpath[MAX_PATH];
+        char *cut;
+        int wl;
+        if (strcmp(g_f[i].kind, "FILE")) continue;
+        strncpy(path, g_f[i].detail, sizeof path - 1); path[sizeof path - 1] = 0;
+        cut = strstr(path, " [");
+        if (cut) *cut = 0;
+        if (!path[0] || strlen(path) < 4) continue;
+        wl = MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, MAX_PATH);
+        if (wl < 2 || off + wl >= 16000) continue;
+        memcpy(buf + off, wpath, wl * sizeof(WCHAR));
+        off += wl - 1; buf[off++] = 0;   /* 覆盖 NUL, 存单 NUL 分隔 */
+    }
+    if (off) {
+        buf[off++] = 0;   /* MULTI_SZ 末尾双 NUL */
+        RegSetValueExW(rk, L"DrvPaths", 0, REG_MULTI_SZ, (const BYTE *)buf, off * sizeof(WCHAR));
+        xlog("nomore: DrvPaths 已写入 (%d 项目标)", g_nf);
+    }
+    RegCloseKey(rk);
 }
 
 static void nomore_phase2(void)
@@ -1431,10 +1465,10 @@ static void nomore_phase2(void)
     autorun_del(); /* 先清 RunOnce, 防完成后残留条目把 phase1 再拉起来 */
     xlog("nomore: phase2 - 先解除 testsigning (已装载的驱动不受影响, 防后续异常残留)");
     run_bcdedit("/set testsigning off");
-    xlog("nomore: phase2 start driver");
-    if (!run_cmd("sc start %s", DRV_SVC))
-        xlog("nomore: [警告] 驱动未启动 — 常见: phase1 后没重启(testsigning 要重启生效) / Secure Boot / 证书未导入");
-    Sleep(10000); /* 给内核清理留时间窗 */
+    xlog("nomore: phase2 — 驱动应已随系统启动自载 (SYSTEM_START) 并完成多轮清扫");
+    if (!run_cmd("sc query %s | find \"RUNNING\"", DRV_SVC))
+        xlog("nomore: [警告] 驱动未在运行 — 检查 testsigning 是否在重启后生效 / Secure Boot");
+    Sleep(2000); /* 让当前轮次扫完 */
     run_cmd("sc stop %s", DRV_SVC);
     run_cmd("sc delete %s", DRV_SVC);
     _snprintf(dst, sizeof dst - 1, "C:\\Windows\\System32\\drivers\\%s.sys", DRV_SVC);
@@ -1454,10 +1488,16 @@ static void nomore_run(void)
     if (marker_get() == 3) {
         nomore_phase2();
     } else {
+        char msg[128];
+        xlog("nomore: 先扫描再武装 — 发现项将喂给驱动照单清理");
+        scan_all();
+        fmt_report(msg, sizeof msg);
+        xlog(msg);
         if (!nomore_phase1()) {
             msgbox("不客气模式未启动\\n详见界面日志 — 常见: Secure Boot 开启 / 缺 SFCleanerDrv.sys / 证书导入失败");
             return;
         }
+        nomore_feed_driver();
         marker_set(3);
         nomore_autorun_set();
         xlog("nomore: phase1 done, bsod (testsigning 生效需重启; 重启后 RunOnce 自动进 phase2)");
