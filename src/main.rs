@@ -174,6 +174,7 @@ fn scan_all() -> Vec<Finding> {
         f.extend(scan_hosts());
         f.extend(scan_wu());
         f.extend(scan_wb());
+        f.extend(scan_windir());
         r3.lock().unwrap().extend(f);
     }));
     for h in handles { h.join().unwrap(); }
@@ -402,6 +403,88 @@ fn wb_dir(dir: &Path, depth: usize, out: &mut Vec<Finding>) {
         }
     }
     for s in subs { wb_dir(&s, depth + 1, out); }
+}
+
+/* ---- %WINDIR% 随机名 PE/bat 检测 ---- */
+const WD_SKIP: [&str; 37] = [
+    "\\winsxs", "\\softwaredistribution", "\\driverstore", "\\installer",
+    "\\assembly", "\\microsoft.net", "\\servicing", "\\logfiles", "\\logs",
+    "\\spool", "\\catroot", "\\fonts", "\\media", "\\ime", "\\web",
+    "\\wallpaper", "\\oledb", "\\mui", "\\ehome", "\\pchealth", "\\resources",
+    "\\livekernelreports", "\\minidump", "\\prefetch", "\\appcompat",
+    "\\apppatch", "\\csc", "\\diagnostics", "\\panther", "\\performance",
+    "\\pla", "\\registration", "\\shellcomponents", "\\triage", "\\winstore",
+    "\\tokens", "\\csp",
+];
+
+fn wd_random_name(fnm: &str) -> Option<bool> /* Some(true)=PE Some(false)=bat None=不匹配 */ {
+    let dot = fnm.rfind('.')?;
+    let ext = fnm[dot..].to_lowercase();
+    let is_pe = matches!(ext.as_str(), ".exe" | ".dll" | ".sys");
+    if !is_pe && ext != ".bat" { return None; }
+    let base = &fnm[..dot];
+    let bl = base.len();
+    if bl < 6 || bl > 16 { return None; }
+    let mut dig = 0usize;
+    let mut up = 0usize;
+    for c in base.chars() {
+        if c.is_ascii_digit() { dig += 1; }
+        else if c.is_ascii_uppercase() { up += 1; }
+        else if c.is_ascii_lowercase() { continue; }
+        else { return None; }
+    }
+    if !is_pe { return Some(false); }
+    if dig >= 2 || up > 0 || bl >= 8 { return Some(true); }
+    None
+}
+
+fn wd_scan_dir(dir: &Path, depth: usize, out: &mut Vec<Finding>) {
+    if depth > 4 { return; }
+    let low = dir.to_string_lossy().to_lowercase();
+    if WD_SKIP.iter().any(|w| low.contains(w)) { return; }
+    let mut subs: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let is_dir;
+            let is_link;
+            if let Ok(ft) = e.file_type() {
+                is_dir = ft.is_dir();
+                is_link = ft.is_symlink();
+            } else { continue; }
+            if is_dir {
+                if !is_link { subs.push(p); }
+                continue;
+            }
+            let fnm = p.file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
+            match wd_random_name(&fnm) {
+                Some(true) => {
+                    if wb_is_signed(&p) { continue; }   /* 随机名但签名有效 → 放行 */
+                    out.push(Finding {
+                        kind: "FILE".into(),
+                        detail: format!("{} [随机名未签名PE]", p.display()),
+                        high: true,
+                        action: format!("quarantine {}", p.display()),
+                    });
+                }
+                Some(false) => out.push(Finding {
+                    kind: "FILE".into(),
+                    detail: format!("{} [随机名bat]", p.display()),
+                    high: true,
+                    action: format!("quarantine {}", p.display()),
+                }),
+                None => {}
+            }
+        }
+    }
+    for sdir in subs { wd_scan_dir(&sdir, depth + 1, out); }
+}
+
+fn scan_windir() -> Vec<Finding> {
+    let mut out = Vec::new();
+    let wd = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
+    wd_scan_dir(Path::new(&wd), 0, &mut out);
+    out
 }
 
 fn scan_files() -> Vec<Finding> {
