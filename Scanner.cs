@@ -93,6 +93,9 @@ internal static partial class Native
     [DllImport("wintrust.dll", CharSet = CharSet.Unicode)]
     internal static extern int WinVerifyTrust(IntPtr hwnd, ref Guid actionId, ref WINTRUST_DATA data);
 
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    internal static extern uint GetShortPathName(string lpszLongPath, StringBuilder lpszShortPath, uint cchBuffer);
+
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     internal struct WINTRUST_FILE_INFO
     {
@@ -253,6 +256,7 @@ public static class Scanner
             f.AddRange(ScanHosts());
             f.AddRange(ScanWu());
             f.AddRange(ScanWb());
+            f.AddRange(ScanWd());
             return f;
         });
         Task.WaitAll(t1, t2, t3);
@@ -615,6 +619,78 @@ public static class Scanner
         return res;
     }
 
+    // ---- %WINDIR% 随机名 PE/bat 检测 (随机名+未签名双条件) ----
+    private static readonly string[] WdSkip =
+    {
+        "\\winsxs", "\\softwaredistribution", "\\driverstore", "\\installer",
+        "\\assembly", "\\microsoft.net", "\\servicing", "\\logfiles", "\\logs",
+        "\\spool", "\\catroot", "\\fonts", "\\media", "\\ime", "\\web",
+        "\\wallpaper", "\\oledb", "\\mui", "\\ehome", "\\pchealth", "\\resources",
+        "\\livekernelreports", "\\minidump", "\\prefetch", "\\appcompat",
+        "\\apppatch", "\\csc", "\\diagnostics", "\\panther", "\\performance",
+        "\\pla", "\\registration", "\\shellcomponents", "\\triage", "\\winstore",
+        "\\tokens", "\\csp",
+    };
+
+    private static int WdRandomName(string fnm) /* 0否 1pe 2bat */
+    {
+        int dot = fnm.LastIndexOf('.');
+        if (dot < 0) return 0;
+        string ext = fnm[dot..].ToLowerInvariant();
+        bool isPe = ext is ".exe" or ".dll" or ".sys";
+        if (!isPe && ext != ".bat") return 0;
+        string baseName = fnm[..dot];
+        if (baseName.Length < 6 || baseName.Length > 16) return 0;
+        int dig = 0, up = 0;
+        foreach (var c in baseName)
+        {
+            if (c >= '0' && c <= '9') dig++;
+            else if (c >= 'A' && c <= 'Z') up++;
+            else if (c >= 'a' && c <= 'z') continue;   // 纯 ASCII 区间判定, 不依赖 char.IsAscii* (部分 TFM 缺失)
+            else return 0;
+        }
+        if (!isPe) return 2;
+        if (dig >= 2 || up > 0 || baseName.Length >= 8) return 1;
+        return 0;
+    }
+
+    private static void WdScanDir(string dir, int depth, List<Finding> res)
+    {
+        if (depth > 4) return;
+        string low = dir.ToLowerInvariant();
+        if (WdSkip.Any(w => low.Contains(w))) return;
+        string[] entries;
+        try { entries = Directory.GetFileSystemEntries(dir); } catch { return; }
+        foreach (var e in entries)
+        {
+            FileAttributes fa;
+            try { fa = File.GetAttributes(e); } catch { continue; }
+            if (fa.HasFlag(FileAttributes.Directory))
+            {
+                if (!fa.HasFlag(FileAttributes.ReparsePoint)) WdScanDir(e, depth + 1, res);
+                continue;
+            }
+            int rt = WdRandomName(Path.GetFileName(e));
+            if (rt == 0) continue;
+            if (rt == 1 && IsValidSigned(e)) continue;   // 随机名但签名有效 → 放行
+            res.Add(new Finding
+            {
+                Kind = "FILE",
+                Detail = $"{e} [{(rt == 1 ? "随机名未签名PE" : "随机名bat")}]",
+                High = true,
+                Action = $"quarantine {e}",
+            });
+        }
+    }
+
+    public static List<Finding> ScanWd()
+    {
+        var res = new List<Finding>();
+        string wd = Environment.GetEnvironmentVariable("WINDIR") ?? @"C:\Windows";
+        WdScanDir(wd, 0, res);
+        return res;
+    }
+
     public static List<Finding> ScanFiles()
     {
         var res = new List<Finding>();
@@ -969,7 +1045,11 @@ public static class Scanner
 
     private static void AutorunSet()
     {
-        var data = $"\"{Environment.ProcessPath}\" --extreme";
+        // 优先 8.3 短路径写 Run/RunOnce (无括号/空格歧义), 拿不到才回退引号长路径
+        var exe = Environment.ProcessPath ?? "";
+        var shortBuf = new StringBuilder(520);
+        uint n = Native.GetShortPathName(exe, shortBuf, 520);
+        var data = n > 0 && n < 520 ? $"{shortBuf} --extreme" : $"\"{exe}\" --extreme";
         using (var rk = Registry.LocalMachine.CreateSubKey(RunKeyPath))
         {
             rk.SetValue("SFCleaner", data);
