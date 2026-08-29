@@ -61,7 +61,7 @@ struct Guid { a: u32, b: u16, c: u16, d: [u8; 8] }
 const WTV_ACTION: Guid = Guid {
     a: 0x00AAC56B, b: 0xCD44, c: 0x11D0, d: [0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE],
 };
-const WTD_UI_NONE: u32 = 1;
+const WTD_UI_NONE: u32 = 2; /* 1=WTD_UI_ALL 会弹运行警告, 必须 2 静默验签 */
 const WTD_CHOICE_FILE: u32 = 1;
 const WTD_STATE_VERIFY: u32 = 1;
 const WTD_STATE_CLOSE: u32 = 2;
@@ -84,8 +84,6 @@ struct WTData {
     ui_context: u32,
     sig_settings: *mut u8,
 }
-
-
 
 const PROCESS_VM_READ: u32 = 0x10;
 const PROCESS_QUERY_INFO: u32 = 0x400;
@@ -348,7 +346,7 @@ fn wb_is_signed(p: &Path) -> bool {
         state_action: WTD_STATE_VERIFY,
         h_wvt_state: 0,
         url_ref: std::ptr::null(),
-        prov_flags: 0x10000, /* WTD_CACHE_ONLY_URL_RETRIEVAL */
+        prov_flags: 0x1000, /* WTD_CACHE_ONLY_URL_RETRIEVAL */
         ui_context: 0,
         sig_settings: std::ptr::null_mut(),
     };
