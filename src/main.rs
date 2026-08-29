@@ -55,6 +55,12 @@ extern "system" {
 #[link(name = "wintrust")]
 extern "system" {
     fn WinVerifyTrust(hwnd: isize, action: *const Guid, data: *mut WTData) -> i32;
+    fn CryptCATAdminAcquireContext(h: *mut isize, g: *const Guid, f: u32) -> i32;
+    fn CryptCATAdminCalcHashFromFileHandle(fh: isize, cb: *mut u32, buf: *mut u8, f: u32) -> i32;
+    fn CryptCATAdminEnumCatalogFromHash(hca: isize, hash: *const u8, cb: u32, f: u32, prev: *mut isize) -> isize;
+    fn CryptCATCatalogInfoFromContext(hc: isize, ci: *mut CatalogInfo, f: u32) -> i32;
+    fn CryptCATAdminReleaseCatalogContext(hca: isize, hc: isize, f: u32) -> i32;
+    fn CryptCATAdminReleaseContext(hca: isize, f: u32) -> i32;
 }
 
 #[repr(C)]
@@ -64,6 +70,7 @@ const WTV_ACTION: Guid = Guid {
 };
 const WTD_UI_NONE: u32 = 2; /* 1=WTD_UI_ALL 会弹运行警告, 必须 2 静默验签 */
 const WTD_CHOICE_FILE: u32 = 1;
+const WTD_CHOICE_CATALOG: u32 = 2;
 const WTD_STATE_VERIFY: u32 = 1;
 const WTD_STATE_CLOSE: u32 = 2;
 
@@ -84,6 +91,21 @@ struct WTData {
     prov_flags: u32,
     ui_context: u32,
     sig_settings: *mut u8,
+}
+
+#[repr(C)]
+struct CatalogInfo { cb: u32, file: [u16; 260] }   /* sizeof = 4 + 260*2 = 524 */
+#[repr(C)]
+struct WTCatInfo {                                 /* mingw 扩展版 WINTRUST_CATALOG_INFO, x64 = 64B */
+    cb: u32,
+    ver: u32,
+    cat_path: *const u16,
+    tag: *const u16,
+    path: *const u16,
+    h_member_file: isize,
+    hash_ptr: *const u8,
+    hash_len: u32,
+    pc_ctx: *const u8,
 }
 
 const PROCESS_VM_READ: u32 = 0x10;
@@ -174,9 +196,13 @@ fn scan_all() -> Vec<Finding> {
         let mut f = scan_files();
         f.extend(scan_hosts());
         f.extend(scan_wu());
-        f.extend(scan_wb());
-        f.extend(scan_windir());
         r3.lock().unwrap().extend(f);
+    }));
+    let r4 = Arc::clone(&results);
+    handles.push(thread::spawn(move || {
+        let mut f = scan_wb();
+        f.extend(scan_windir());
+        r4.lock().unwrap().extend(f);
     }));
     for h in handles { h.join().unwrap(); }
     let mut out = results.lock().unwrap().clone();
@@ -355,7 +381,75 @@ fn wb_is_signed(p: &Path) -> bool {
     let r = unsafe { WinVerifyTrust(0, &WTV_ACTION, &mut wd) };
     wd.state_action = WTD_STATE_CLOSE;
     unsafe { WinVerifyTrust(0, &WTV_ACTION, &mut wd) };
-    r == 0
+    r == 0 || wb_catalog_signed(p)
+}
+
+/* catalog 回退: 系统 PE 无内嵌签名, 由 catalog 覆盖 —
+   算哈希 -> 取第一个含此哈希的 catalog -> WTD_CHOICE_CATALOG 复验 */
+fn wb_catalog_signed(p: &Path) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    let f = match fs::File::open(p) { Ok(f) => f, Err(_) => return false };
+    let fh = f.as_raw_handle() as isize;
+    unsafe {
+        let mut hca: isize = 0;
+        if CryptCATAdminAcquireContext(&mut hca, &WTV_ACTION, 0) == 0 {
+            let mut hash = [0u8; 100];
+            let mut cb: u32 = hash.len() as u32;
+            if CryptCATAdminCalcHashFromFileHandle(fh, &mut cb, hash.as_mut_ptr(), 0) == 0
+                && cb > 0 && (cb as usize) <= hash.len()
+            {
+                let mut wtag: Vec<u16> = Vec::with_capacity(cb as usize * 2 + 1);
+                for b in &hash[..cb as usize] {
+                    wtag.extend(format!("{:02X}", b).encode_utf16());
+                }
+                wtag.push(0);
+                let wpath = utf16(&p.to_string_lossy());
+                let hc = CryptCATAdminEnumCatalogFromHash(hca, hash.as_ptr(), cb, 0, std::ptr::null_mut());
+                if hc != 0 {
+                    let mut ci = CatalogInfo { cb: 524, file: [0u16; 260] };
+                    if CryptCATCatalogInfoFromContext(hc, &mut ci, 0) != 0 {
+                        let mut wci = WTCatInfo {
+                            cb: 64,
+                            ver: 0,
+                            cat_path: ci.file.as_ptr(),
+                            tag: wtag.as_ptr(),
+                            path: wpath.as_ptr(),
+                            h_member_file: 0,
+                            hash_ptr: hash.as_ptr(),
+                            hash_len: cb,
+                            pc_ctx: std::ptr::null(),
+                        };
+                        let mut wd = WTData {
+                            cb: std::mem::size_of::<WTData>() as u32,
+                            policy: std::ptr::null_mut(),
+                            sip: std::ptr::null_mut(),
+                            ui_choice: WTD_UI_NONE,
+                            revoke_checks: 0,
+                            union_choice: WTD_CHOICE_CATALOG,
+                            pfile: &mut wci as *mut WTCatInfo as *mut u8,
+                            state_action: WTD_STATE_VERIFY,
+                            h_wvt_state: 0,
+                            url_ref: std::ptr::null(),
+                            prov_flags: 0x1000,
+                            ui_context: 0,
+                            sig_settings: std::ptr::null_mut(),
+                        };
+                        let r = WinVerifyTrust(0, &WTV_ACTION, &mut wd);
+                        wd.state_action = WTD_STATE_CLOSE;
+                        WinVerifyTrust(0, &WTV_ACTION, &mut wd);
+                        if r == 0 {
+                            CryptCATAdminReleaseCatalogContext(hca, hc, 0);
+                            CryptCATAdminReleaseContext(hca, 0);
+                            return true;
+                        }
+                    }
+                    CryptCATAdminReleaseCatalogContext(hca, hc, 0);
+                }
+            }
+            CryptCATAdminReleaseContext(hca, 0);
+        }
+    }
+    false
 }
 
 fn scan_wb() -> Vec<Finding> {
@@ -375,9 +469,9 @@ fn wb_dir(dir: &Path, depth: usize, out: &mut Vec<Finding>) {
     if low.contains("sf_quarantine") { return; }
     const WL: [&str; 5] = ["\\programs\\", "\\package cache\\", "\\windowsapps\\", "\\microsoft\\", "\\windows\\"];
     if WL.iter().any(|w| low.contains(w)) { return; }
-    let mut se = false;
-    let mut ud = false;
-    let mut hit: Option<PathBuf> = None;
+    /* 枚举先行: 无 exe 或无 dll 的目录 (绝大多数) 0 次验签; 配对才查, 找到即停 */
+    let mut exes: Vec<PathBuf> = Vec::new();
+    let mut dlls: Vec<PathBuf> = Vec::new();
     let mut subs: Vec<PathBuf> = Vec::new();
     if let Ok(rd) = fs::read_dir(dir) {
         for e in rd.flatten() {
@@ -389,18 +483,24 @@ fn wb_dir(dir: &Path, depth: usize, out: &mut Vec<Finding>) {
             }
             let p = e.path();
             let fnm = p.file_name().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
-            if fnm.ends_with(".exe") && !se && wb_is_signed(&p) { se = true; }
-            else if fnm.ends_with(".dll") && !ud && !wb_is_signed(&p) { ud = true; hit = Some(p); }
+            if fnm.ends_with(".exe") {
+                if exes.len() < 24 { exes.push(p); }
+            } else if fnm.ends_with(".dll") {
+                if dlls.len() < 64 { dlls.push(p); }
+            }
         }
     }
-    if se && ud {
-        if let Some(h) = hit {
-            out.push(Finding {
-                kind: "FILE".into(),
-                detail: format!("{} [白加黑: 有效签名EXE+未签名DLL]", h.display()),
-                high: false,
-                action: format!("quarantine {}", h.display()),
-            });
+    if !exes.is_empty() && !dlls.is_empty() {
+        let se = exes.iter().any(|e| wb_is_signed(e));
+        if se {
+            if let Some(h) = dlls.iter().find(|d| !wb_is_signed(d)) {
+                out.push(Finding {
+                    kind: "FILE".into(),
+                    detail: format!("{} [白加黑: 有效签名EXE+未签名DLL]", h.display()),
+                    high: false,
+                    action: format!("quarantine {}", h.display()),
+                });
+            }
         }
     }
     for s in subs { wb_dir(&s, depth + 1, out); }
