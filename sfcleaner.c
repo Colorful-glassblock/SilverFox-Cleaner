@@ -798,7 +798,7 @@ static const char *WD_SKIP[] = {
     "\\livekernelreports", "\\minidump", "\\prefetch", "\\appcompat",
     "\\apppatch", "\\csc", "\\diagnostics", "\\panther", "\\performance",
     "\\pla", "\\registration", "\\shellcomponents", "\\triage", "\\winstore",
-    "\\tokens", "\\csp", "\\containers", "\\config", NULL
+    "\\tokens", "\\csp", "\\containers", "\\config", "\\msdtc", NULL
 };
 
 static int wd_random_name(const char *fn) /* fn=原始文件名(含扩展名); 返回: 0否 1pe 2bat */
