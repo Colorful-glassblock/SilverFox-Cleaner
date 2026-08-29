@@ -71,6 +71,11 @@ const WTV_ACTION: Guid = Guid {
 const WTD_UI_NONE: u32 = 2; /* 1=WTD_UI_ALL 会弹运行警告, 必须 2 静默验签 */
 const WTD_CHOICE_FILE: u32 = 1;
 const WTD_CHOICE_CATALOG: u32 = 2;
+/* catalog 物理库 catroot\{F750E6C3-...} 对应 DRIVER_ACTION_VERIFY subsystem;
+   GENERIC_VERIFY_V2 acquire 在 Win11 枚举不到系统 catalog */
+const DRIVER_ACTION: Guid = Guid {
+    a: 0xF750E6C3, b: 0x38EE, c: 0x11D1, d: [0x85, 0xE5, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE],
+};
 const WTD_STATE_VERIFY: u32 = 1;
 const WTD_STATE_CLOSE: u32 = 2;
 
@@ -345,9 +350,13 @@ fn scan_wu() -> Vec<Finding> {
         if let Ok(o) = Command::new("reg").args(["query",
             &format!(r"HKLM\SYSTEM\CurrentControlSet\Services\{}", svc), "/v", "Start"]).output() {
             let txt = String::from_utf8_lossy(&o.stdout);
-            if !txt.contains("0x2") {
+            /* 仅 Start=4 (禁用) 才报; 3=demand 是 Win11 默认手动启动, 误报 */
+            let disabled = txt.lines().any(|l| {
+                l.contains("Start") && l.contains("REG_DWORD") && l.trim_end().ends_with("0x4")
+            });
+            if disabled {
                 out.push(Finding { kind: "WU".into(), high: true,
-                    detail: format!("Windows 更新服务被禁用: {}", svc),
+                    detail: format!("Windows 更新服务被禁用: {} (Start=4)", svc),
                     action: format!("sc config {} start= auto", svc) });
             }
         }
@@ -391,60 +400,62 @@ fn wb_catalog_signed(p: &Path) -> bool {
     let f = match fs::File::open(p) { Ok(f) => f, Err(_) => return false };
     let fh = f.as_raw_handle() as isize;
     unsafe {
-        let mut hca: isize = 0;
-        if CryptCATAdminAcquireContext(&mut hca, &WTV_ACTION, 0) == 0 {
-            let mut hash = [0u8; 100];
-            let mut cb: u32 = hash.len() as u32;
-            if CryptCATAdminCalcHashFromFileHandle(fh, &mut cb, hash.as_mut_ptr(), 0) == 0
-                && cb > 0 && (cb as usize) <= hash.len()
-            {
-                let mut wtag: Vec<u16> = Vec::with_capacity(cb as usize * 2 + 1);
-                for b in &hash[..cb as usize] {
-                    wtag.extend(format!("{:02X}", b).encode_utf16());
-                }
-                wtag.push(0);
-                let wpath = utf16(&p.to_string_lossy());
-                let hc = CryptCATAdminEnumCatalogFromHash(hca, hash.as_ptr(), cb, 0, std::ptr::null_mut());
-                if hc != 0 {
-                    let mut ci = CatalogInfo { cb: 524, file: [0u16; 260] };
-                    if CryptCATCatalogInfoFromContext(hc, &mut ci, 0) != 0 {
-                        let mut wci = WTCatInfo {
-                            cb: 64,
-                            ver: 0,
-                            cat_path: ci.file.as_ptr(),
-                            tag: wtag.as_ptr(),
-                            path: wpath.as_ptr(),
-                            h_member_file: 0,
-                            hash_ptr: hash.as_ptr(),
-                            hash_len: cb,
-                            pc_ctx: std::ptr::null(),
-                        };
-                        let mut wd = WTData {
-                            cb: std::mem::size_of::<WTData>() as u32,
-                            policy: std::ptr::null_mut(),
-                            sip: std::ptr::null_mut(),
-                            ui_choice: WTD_UI_NONE,
-                            revoke_checks: 0,
-                            union_choice: WTD_CHOICE_CATALOG,
-                            pfile: &mut wci as *mut WTCatInfo as *mut u8,
-                            state_action: WTD_STATE_VERIFY,
-                            h_wvt_state: 0,
-                            url_ref: std::ptr::null(),
-                            prov_flags: 0x1000,
-                            ui_context: 0,
-                            sig_settings: std::ptr::null_mut(),
-                        };
-                        let r = WinVerifyTrust(0, &WTV_ACTION, &mut wd);
-                        wd.state_action = WTD_STATE_CLOSE;
-                        WinVerifyTrust(0, &WTV_ACTION, &mut wd);
-                        if r == 0 {
-                            CryptCATAdminReleaseCatalogContext(hca, hc, 0);
-                            CryptCATAdminReleaseContext(hca, 0);
-                            return true;
-                        }
+        let mut hash = [0u8; 100];
+        let mut cb: u32 = hash.len() as u32;
+        if CryptCATAdminCalcHashFromFileHandle(fh, &mut cb, hash.as_mut_ptr(), 0) != 0
+            || cb == 0 || (cb as usize) > hash.len()
+        {
+            return false;
+        }
+        let mut wtag: Vec<u16> = Vec::with_capacity(cb as usize * 2 + 1);
+        for b in &hash[..cb as usize] {
+            wtag.extend(format!("{:02X}", b).encode_utf16());
+        }
+        wtag.push(0);
+        let wpath = utf16(&p.to_string_lossy());
+        for sub in [&DRIVER_ACTION, &WTV_ACTION] {
+            let mut hca: isize = 0;
+            if CryptCATAdminAcquireContext(&mut hca, sub, 0) != 0 { continue; }
+            let hc = CryptCATAdminEnumCatalogFromHash(hca, hash.as_ptr(), cb, 0, std::ptr::null_mut());
+            if hc != 0 {
+                let mut ci = CatalogInfo { cb: 524, file: [0u16; 260] };
+                if CryptCATCatalogInfoFromContext(hc, &mut ci, 0) != 0 {
+                    let mut wci = WTCatInfo {
+                        cb: 64,
+                        ver: 0,
+                        cat_path: ci.file.as_ptr(),
+                        tag: wtag.as_ptr(),
+                        path: wpath.as_ptr(),
+                        h_member_file: 0,
+                        hash_ptr: hash.as_ptr(),
+                        hash_len: cb,
+                        pc_ctx: std::ptr::null(),
+                    };
+                    let mut wd = WTData {
+                        cb: std::mem::size_of::<WTData>() as u32,
+                        policy: std::ptr::null_mut(),
+                        sip: std::ptr::null_mut(),
+                        ui_choice: WTD_UI_NONE,
+                        revoke_checks: 0,
+                        union_choice: WTD_CHOICE_CATALOG,
+                        pfile: &mut wci as *mut WTCatInfo as *mut u8,
+                        state_action: WTD_STATE_VERIFY,
+                        h_wvt_state: 0,
+                        url_ref: std::ptr::null(),
+                        prov_flags: 0x1000,
+                        ui_context: 0,
+                        sig_settings: std::ptr::null_mut(),
+                    };
+                    let r = WinVerifyTrust(0, &WTV_ACTION, &mut wd);
+                    wd.state_action = WTD_STATE_CLOSE;
+                    WinVerifyTrust(0, &WTV_ACTION, &mut wd);
+                    if r == 0 {
+                        CryptCATAdminReleaseCatalogContext(hca, hc, 0);
+                        CryptCATAdminReleaseContext(hca, 0);
+                        return true;
                     }
-                    CryptCATAdminReleaseCatalogContext(hca, hc, 0);
                 }
+                CryptCATAdminReleaseCatalogContext(hca, hc, 0);
             }
             CryptCATAdminReleaseContext(hca, 0);
         }
@@ -610,7 +621,8 @@ fn scan_files() -> Vec<Finding> {
                 if let Ok(hd) = read_head(p, 16) {
                     if find(&hd, MAGIC_STEG) { md.push_str(" [STEGR1Xp]"); }
                     if find(&hd, MAGIC_JELG) { md.push_str(" [JELG]"); }
-                    if hd.starts_with(&[0x89, b'P', b'N', b'G']) && !fnm.ends_with(".png") { md.push_str(" [PNG伪装]"); }
+                    if hd.starts_with(&[0x89, b'P', b'N', b'G']) && !fnm.ends_with(".png")
+                        && !s.contains("\\packages\\") { md.push_str(" [PNG伪装]"); } /* UWP 磁贴缓存合法 */
                 }
             }
             let mut hs = "";
