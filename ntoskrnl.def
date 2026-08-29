@@ -17,6 +17,17 @@ ZwQuerySystemInformation
 ZwQueryValueKey
 ZwSetInformationFile
 ZwTerminateProcess
+MmForceSectionClosed
+IoFileObjectType
+ObDereferenceObject
+ObReferenceObjectByHandle
+ZwReadFile
+ZwQueryInformationFile
+ZwFsControlFile
+ZwTerminateThread
+ZwOpenThread
+ZwQueryObject
+ZwDuplicateObject
 ZwQueryDirectoryFile
 PsCreateSystemThread
 PsTerminateSystemThread

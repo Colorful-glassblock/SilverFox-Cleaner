@@ -155,8 +155,41 @@ typedef SFC_PROC_INFO SYSTEM_PROCESS_INFORMATION, *PSYSTEM_PROCESS_INFORMATION;
 
 /* ---- 状态码 ---- */
 #define STATUS_SUCCESS             ((NTSTATUS)0x00000000L)
+#ifndef STATUS_TIMEOUT
 #define STATUS_TIMEOUT             ((NTSTATUS)0x00000102L)
+#endif
+#ifndef STATUS_NO_MORE_FILES
 #define STATUS_NO_MORE_FILES       ((NTSTATUS)0x80000006L)
+#endif
+#ifndef STATUS_INFO_LENGTH_MISMATCH
+#define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
+#endif
+#define SystemHandleInformation    16
+#define ObjectNameInformation      1
+#define FileStandardInformation    5
+#define DUPLICATE_CLOSE_SOURCE     0x00000001
+#define DUPLICATE_SAME_ACCESS      0x00000002
+#ifndef THREAD_TERMINATE
+#define THREAD_TERMINATE           0x0001L
+#endif
+#ifndef FSCTL_SET_ZERO_DATA
+#define FSCTL_SET_ZERO_DATA        0x000980C8L   /* CTL_CODE(0x09, 50, BUFFERED, WRITE_DATA) */
+#endif
+typedef struct _SFC_HANDLE_INFO {          /* SystemHandleInformation(16), 12B 逐条 */
+    ULONG NumberOfHandles;                 /* 头部 */
+    UCHAR Raw[1];
+} SFC_HANDLE_INFO, *PSFC_HANDLE_INFO;
+typedef struct _SFC_ZERO_DATA_INFO {
+    LARGE_INTEGER FileOffset;
+    LARGE_INTEGER BeyondFinalZero;
+} SFC_ZERO_DATA_INFO, *PSFC_ZERO_DATA_INFO;
+typedef struct _SFC_STANDARD_INFO {
+    LARGE_INTEGER AllocationSize;
+    LARGE_INTEGER EndOfFile;
+    ULONG         NumberOfLinks;
+    BOOLEAN       DeletePending;
+    BOOLEAN       Directory;
+} SFC_STANDARD_INFO, *PSFC_STANDARD_INFO;
 #ifndef FILE_GENERIC_READ
 #define FILE_GENERIC_READ       0x80000000L /* GENERIC_READ */
 #endif
@@ -219,6 +252,48 @@ NTSYSAPI NTSTATUS NTAPI ZwOpenProcess(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, 
 NTSYSAPI NTSTATUS NTAPI ZwTerminateProcess(HANDLE, NTSTATUS);
 NTSYSAPI NTSTATUS NTAPI ZwDeleteFile(POBJECT_ATTRIBUTES);
 NTSYSAPI NTSTATUS NTAPI ZwDeleteKey(HANDLE);
+NTSYSAPI NTSTATUS NTAPI ZwReadFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK,
+                    PVOID, ULONG, PLARGE_INTEGER, PULONG);
+NTSYSAPI NTSTATUS NTAPI ZwDuplicateObject(HANDLE, HANDLE, HANDLE, PHANDLE, ACCESS_MASK, ULONG, ULONG);
+NTSYSAPI NTSTATUS NTAPI ZwQueryObject(HANDLE, ULONG, PVOID, ULONG, PULONG);
+NTSYSAPI NTSTATUS NTAPI ZwOpenThread(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID);
+NTSYSAPI NTSTATUS NTAPI ZwTerminateThread(HANDLE, NTSTATUS);
+NTSYSAPI NTSTATUS NTAPI ZwFsControlFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK,
+                                        ULONG, PVOID, ULONG, PVOID, ULONG);
+NTSYSAPI NTSTATUS NTAPI ZwQueryInformationFile(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+NTSYSAPI NTSTATUS NTAPI ZwDuplicateObjectEx(HANDLE, HANDLE, HANDLE, PHANDLE, ACCESS_MASK, ULONG, ULONG);
+#define SystemExtendedHandleInformation 64
+#ifndef PROCESS_DUP_HANDLE
+#define PROCESS_DUP_HANDLE              0x0040L
+#endif
+typedef struct _SFC_SEC_OBJ { PVOID Data; PVOID SharedCacheMap; PVOID ImageSectionObject; } SFC_SEC_OBJ, *PSFC_SEC_OBJ;
+typedef struct _SFC_FILE_OBJECT {   /* FILE_OBJECT 头部视图 (x64, SectionObjectPointer@40 稳定) */
+    SHORT  Type;
+    SHORT  Size;
+    PVOID  DeviceObject;
+    PVOID  Vpb;
+    PVOID  FsContext;
+    PVOID  FsContext2;
+    PSFC_SEC_OBJ SectionObjectPointer;
+} SFC_FILE_OBJECT, *PSFC_FILE_OBJECT;
+
+typedef int KPROCESSOR_MODE;
+NTSYSAPI NTSTATUS NTAPI ObReferenceObjectByHandle(HANDLE, ACCESS_MASK, PVOID, KPROCESSOR_MODE, PVOID*, PVOID);
+NTSYSAPI VOID    NTAPI ObDereferenceObject(PVOID);
+extern PVOID IoFileObjectType;      /* 内核导出: 文件对象类型 */
+NTSYSAPI BOOLEAN NTAPI MmForceSectionClosed(PSFC_SEC_OBJ, BOOLEAN);
+
+typedef struct _SFC_HANDLE_EX {         /* SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX, x64 = 40B */
+    ULONG_PTR Object;
+    ULONG_PTR UniqueProcessId;
+    ULONG_PTR Handle;
+    ACCESS_MASK GrantedAccess;
+    USHORT    CreatorBackTraceIndex;
+    USHORT    SystemHandleCount;
+    USHORT    KernelHandleCount;
+    USHORT    Flags;
+    ULONG     Reserved;
+} SFC_HANDLE_EX, *PSFC_HANDLE_EX;
 NTSYSAPI NTSTATUS NTAPI ZwCreateFile(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK,
                                      PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
 NTSYSAPI NTSTATUS NTAPI ZwSetInformationFile(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG,
@@ -243,7 +318,9 @@ NTSYSAPI NTSTATUS NTAPI PsCreateSystemThread(PHANDLE, ULONG, POBJECT_ATTRIBUTES,
                                              PCLIENT_ID, PKSTART_ROUTINE, PVOID);
 NTSYSAPI NTSTATUS NTAPI PsTerminateSystemThread(NTSTATUS);
 
+#ifndef THREAD_ALL_ACCESS
 #define THREAD_ALL_ACCESS       0x001F03FFL
+#endif
 #define NotificationEvent       0
 #define Executive               0
 #define KernelMode              0
