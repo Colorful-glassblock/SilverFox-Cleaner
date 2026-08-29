@@ -737,7 +737,7 @@ fn xlog(s: &str) {
 
 fn autorun_set() {
     if let Ok(exe) = std::env::current_exe() {
-        // 优先 8.3 短路径写 Run/RunOnce, 无括号/空格/中文歧义; 拿不到才回退引号长路径
+        // 优先 8.3 短路径写 Run/RunOnce (无括号/空格歧义), 拿不到才回退引号长路径
         let d = {
             let wide = utf16(&exe.to_string_lossy());
             let mut buf = vec![0u16; 520];
@@ -785,7 +785,28 @@ fn autorun_del() {
     run(&["reg", "delete", RUN_KEY, "/v", "SFCleaner", "/f"]);
     run(&["reg", "delete", RUN_KEY, "/v", "*SFCleaner", "/f"]);
     run(&["reg", "delete", r"HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+        "/v", "SFCleaner", "/f"]);
+    run(&["reg", "delete", r"HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce",
         "/v", "*SFCleaner", "/f"]);
+}
+
+/* 不客气 phase2 自启动: RunOnce 一次性 (普通登录 + 安全模式), 短路径消歧义 */
+fn nomore_autorun_set() {
+    if let Ok(exe) = std::env::current_exe() {
+        let d = {
+            let wide = utf16(&exe.to_string_lossy());
+            let mut buf = vec![0u16; 520];
+            let n = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+            if n > 0 && (n as usize) < buf.len() {
+                format!("{} --nomore2", String::from_utf16_lossy(&buf[..n as usize]))
+            } else {
+                format!("\"{}\" --nomore2", exe.display())
+            }
+        };
+        let ro = r"HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce";
+        run(&["reg", "add", ro, "/v", "SFCleaner", "/t", "REG_SZ", "/d", &d, "/f"]);
+        run(&["reg", "add", ro, "/v", "*SFCleaner", "/t", "REG_SZ", "/d", &d, "/f"]);
+    }
 }
 
 fn marker_set(v: &str) {
@@ -896,6 +917,7 @@ fn nomore_phase1() -> bool {
 }
 
 fn nomore_phase2() {
+    autorun_del(); // 先清 RunOnce, 防完成后残留条目把 phase1 再拉起来
     xlog("nomore: phase2 - 先解除 testsigning (已装载驱动不受影响, 防后续异常残留)");
     run(&["bcdedit", "/set", "testsigning", "off"]);
     xlog("nomore: phase2 start driver");
@@ -929,10 +951,11 @@ fn nomore_run() {
             return;
         }
         marker_set("3");
-        xlog("nomore: phase1 done, bsod (testsigning 生效需重启)");
+        nomore_autorun_set();
+        xlog("nomore: phase1 done, bsod (testsigning 生效需重启; 重启后 RunOnce 自动进 phase2)");
         if !unsafe { trigger_bsod() } {
             unsafe {
-                MessageBoxW(0, utf16("蓝屏触发失败\n请手动重启 — testsigning 需重启后生效;\n重启后再运行一次不客气模式即进入 phase2 (驱动清理+卸载)").as_ptr(),
+                MessageBoxW(0, utf16("蓝屏触发失败\n请手动重启 — testsigning 需重启后生效;\n重启登录后将自动进入 phase2 (RunOnce);\n若未自动弹出也可手动再运行一次本程序").as_ptr(),
                             utf16("SFCleaner 不客气模式").as_ptr(), 0);
             }
         }
@@ -1168,6 +1191,13 @@ fn main() {
         }
         Some("--extreme") => extreme_run(),
         Some("--nomore") => nomore_run(),
+        Some("--nomore2") => {
+            // RunOnce 自动链专用: 只允许 phase2, marker 不在绝不重演 phase1
+            enable_privs();
+            if marker_get() == 3 {
+                nomore_phase2();
+            }
+        }
         Some("--extreme-abort") => {
             safeboot_clear();
             autorun_del();
