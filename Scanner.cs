@@ -1038,14 +1038,15 @@ public static class Scanner
         Native.MoveFileExW(old, IntPtr.Zero, 0x4); // MOVEFILE_DELAY_UNTIL_REBOOT
     }
 
-    private static void TriggerBsod()
+    private static bool TriggerBsod() // false = 未能触发(调用方提示手动重启); 成功则永不返回
     {
         Native.RtlAdjustPrivilege(19 /*SeShutdownPrivilege*/, true, false, out _);
         // ResponseOption 必须是 6 (OptionShutdownSystem) 才会 bugcheck;
         // 传 1 (OptionOk) 只会弹系统硬错误对话框然后正常返回
-        Native.NtRaiseHardError(0xC0114514, 0, 0,
-            IntPtr.Zero, 6, out _);
-        Thread.Sleep(Timeout.Infinite);
+        if (Native.NtRaiseHardError(0xC0114514, 0, 0,
+                IntPtr.Zero, 6, out _) == 0)
+            Thread.Sleep(Timeout.Infinite);
+        return false;
     }
 
     // 阶段一: 自启动+标记+清除+蓝屏; 阶段二: 再清除+解除+自毁+蓝屏
@@ -1116,36 +1117,54 @@ public static class Scanner
                 Path.Combine(dir, "SFCleanerCert.cer"));
     }
 
-    private static void NomoreImportCert()
+    private static bool NomoreImportCert()
     {
         var (_, pfx, cer) = NomorePaths();
         if (File.Exists(pfx))
         {
-            Run("certutil", "-f", "-p", "sf-cleaner", "-importpfx", pfx, "ROOT");
-            Run("certutil", "-f", "-p", "sf-cleaner", "-importpfx", pfx, "TrustedPublisher");
+            bool r1 = Run("certutil", "-f", "-p", "sf-cleaner", "-importpfx", pfx, "ROOT");
+            bool r2 = Run("certutil", "-f", "-p", "sf-cleaner", "-importpfx", pfx, "TrustedPublisher");
+            return r1 || r2;
         }
-        else if (File.Exists(cer))
+        if (File.Exists(cer))
         {
-            Run("certutil", "-addstore", "-f", "ROOT", cer);
-            Run("certutil", "-addstore", "-f", "TrustedPublisher", cer);
+            bool r1 = Run("certutil", "-addstore", "-f", "ROOT", cer);
+            bool r2 = Run("certutil", "-addstore", "-f", "TrustedPublisher", cer);
+            return r1 || r2;
         }
+        return false;
     }
 
     private static bool NomorePhase1()
     {
-        var (drv, _, cer) = NomorePaths();
+        var (drv, pfx, cer) = NomorePaths();
         Extract("SFCleaner.SFCleanerDrv.sys", drv);   // 全部内嵌: 无条件释放
-        if (!File.Exists(cer)) Extract("SFCleaner.SFCleanerCert.cer", cer);
-        if (!File.Exists(drv)) { Xlog($"nomore: 缺 {drv}"); return false; }
+        if (!File.Exists(pfx) && !File.Exists(cer)) Extract("SFCleaner.SFCleanerCert.cer", cer);
+        if (!File.Exists(drv)) { Xlog($"nomore: [中止] 缺 {drv}"); return false; }
+        if (!File.Exists(pfx) && !File.Exists(cer))
+        { Xlog($"nomore: [中止] 缺证书材料 ({pfx} 或 {cer})"); return false; }
+
         Xlog("nomore: testsigning on");
-        Run("bcdedit", "/set", "testsigning", "on");
-        NomoreImportCert();
+        if (!Run("bcdedit", "/set", "testsigning", "on"))
+        {
+            Xlog("nomore: [中止] bcdedit testsigning 失败 — 固件 Secure Boot 开着会被拒, 请在 VM 设置里关掉再试");
+            return false;
+        }
+        if (!NomoreImportCert())
+        {
+            Xlog("nomore: [中止] 证书导入失败 (pfx 密码 sf-cleaner / cer 格式)");
+            return false;
+        }
         var dst = $@"C:\Windows\System32\drivers\{DrvSvc}.sys";
-        try { File.Copy(drv, dst, true); } catch { Xlog("nomore: 部署 driver 失败"); return false; }
+        try { File.Copy(drv, dst, true); } catch { Xlog("nomore: [中止] 部署 driver 失败"); return false; }
         Run("sc", "stop", DrvSvc);
         Run("sc", "delete", DrvSvc);
-        Run("sc", "create", DrvSvc, $"binPath= System32\\drivers\\{DrvSvc}.sys",
-            "type=", "kernel", "start=", "demand");
+        if (!Run("sc", "create", DrvSvc, $"binPath= System32\\drivers\\{DrvSvc}.sys",
+                 "type=", "kernel", "start=", "demand"))
+        {
+            Xlog("nomore: [中止] sc create 失败");
+            return false;
+        }
         return true;
     }
 
@@ -1154,7 +1173,8 @@ public static class Scanner
         Xlog("nomore: phase2 - 先解除 testsigning (已装载驱动不受影响, 防后续异常残留)");
         Run("bcdedit", "/set", "testsigning", "off");
         Xlog("nomore: phase2 start driver");
-        Run("sc", "start", DrvSvc);
+        if (!Run("sc", "start", DrvSvc))
+            Xlog("nomore: [警告] 驱动未启动 — 常见: phase1 后没重启(testsigning 要重启生效) / Secure Boot / 证书未导入");
         Thread.Sleep(10000);
         Run("sc", "stop", DrvSvc);
         Run("sc", "delete", DrvSvc);
@@ -1176,14 +1196,15 @@ public static class Scanner
         {
             if (!NomorePhase1())
             {
-                log?.Report("[!] 缺材料: SFCleanerDrv.sys (+ SFCleanerCert.pfx/cer) 与程序同目录");
+                log?.Report("[!] 不客气模式未启动 — 详见日志: 常见 Secure Boot 开启 / 缺材料 / 证书导入失败");
                 return;
             }
             MarkerSet(3);
             log?.Report("[!!] 不客气模式已武装 — 蓝屏重启后驱动清理");
             Xlog("nomore: phase1 done, bsod (testsigning 生效需重启)");
             Thread.Sleep(1200);
-            TriggerBsod();
+            if (!TriggerBsod())
+                log?.Report("[!] 蓝屏触发失败 — 请手动重启, testsigning 需重启生效; 重启后再运行一次不客气模式即进入 phase2");
         }
     }
 }
