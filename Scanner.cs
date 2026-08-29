@@ -804,7 +804,7 @@ public static class Scanner
         {
             using var st = typeof(Scanner).Assembly.GetManifestResourceStream("SFCleaner.SFCleanerDrv.sys");
             if (st == null) { s_selfDrvLen = -2; return; }
-            s_selfDrvSha = SHA512.HashData(st);
+            s_selfDrvSha = System.Security.Cryptography.SHA512.HashData(st);
             s_selfDrvLen = st.Length;
         }
         catch { s_selfDrvLen = -2; }
@@ -837,7 +837,7 @@ public static class Scanner
                 {
                     var fi = new FileInfo(e);
                     if (fi.Length == s_selfDrvLen
-                        && SHA512.HashData(File.ReadAllBytes(e)).AsSpan().SequenceEqual(s_selfDrvSha))
+                        && System.Security.Cryptography.SHA512.HashData(File.ReadAllBytes(e)).AsSpan().SequenceEqual(s_selfDrvSha))
                         continue;
                 }
                 catch { /* 读取失败照常走检测 */ }
