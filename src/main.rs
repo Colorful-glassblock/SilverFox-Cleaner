@@ -51,6 +51,41 @@ extern "system" {
     fn GetStockObject(i: i32) -> isize;
     fn CreateSolidBrush(c: u32) -> isize;
 }
+#[link(name = "wintrust")]
+extern "system" {
+    fn WinVerifyTrust(hwnd: isize, action: *const Guid, data: *mut WTData) -> i32;
+}
+
+#[repr(C)]
+struct Guid { a: u32, b: u16, c: u16, d: [u8; 8] }
+const WTV_ACTION: Guid = Guid {
+    a: 0x00AAC56B, b: 0xCD44, c: 0x11D0, d: [0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE],
+};
+const WTD_UI_NONE: u32 = 1;
+const WTD_CHOICE_FILE: u32 = 1;
+const WTD_STATE_VERIFY: u32 = 1;
+const WTD_STATE_CLOSE: u32 = 2;
+
+#[repr(C)]
+struct WTFileInfo { cb: u32, path: *const u16, hfile: isize, known_subject: *const u8 }
+#[repr(C)]
+struct WTData {
+    cb: u32,
+    policy: *mut u8,
+    sip: *mut u8,
+    ui_choice: u32,
+    revoke_checks: u32,
+    union_choice: u32,
+    pfile: *mut u8,
+    state_action: u32,
+    h_wvt_state: isize,
+    url_ref: *const u16,
+    prov_flags: u32,
+    ui_context: u32,
+    sig_settings: *mut u8,
+}
+
+
 
 const PROCESS_VM_READ: u32 = 0x10;
 const PROCESS_QUERY_INFO: u32 = 0x400;
@@ -140,6 +175,7 @@ fn scan_all() -> Vec<Finding> {
         let mut f = scan_files();
         f.extend(scan_hosts());
         f.extend(scan_wu());
+        f.extend(scan_wb());
         r3.lock().unwrap().extend(f);
     }));
     for h in handles { h.join().unwrap(); }
@@ -291,6 +327,83 @@ fn scan_wu() -> Vec<Finding> {
         }
     }
     out
+}
+
+fn wb_is_signed(p: &Path) -> bool {
+    let wpath = utf16(&p.to_string_lossy());
+    let mut fi = WTFileInfo {
+        cb: std::mem::size_of::<WTFileInfo>() as u32,
+        path: wpath.as_ptr(),
+        hfile: 0,
+        known_subject: std::ptr::null(),
+    };
+    let mut wd = WTData {
+        cb: std::mem::size_of::<WTData>() as u32,
+        policy: std::ptr::null_mut(),
+        sip: std::ptr::null_mut(),
+        ui_choice: WTD_UI_NONE,
+        revoke_checks: 0,
+        union_choice: WTD_CHOICE_FILE,
+        pfile: &mut fi as *mut WTFileInfo as *mut u8,
+        state_action: WTD_STATE_VERIFY,
+        h_wvt_state: 0,
+        url_ref: std::ptr::null(),
+        prov_flags: 0x10000, /* WTD_CACHE_ONLY_URL_RETRIEVAL */
+        ui_context: 0,
+        sig_settings: std::ptr::null_mut(),
+    };
+    let r = unsafe { WinVerifyTrust(0, &WTV_ACTION, &mut wd) };
+    wd.state_action = WTD_STATE_CLOSE;
+    unsafe { WinVerifyTrust(0, &WTV_ACTION, &mut wd) };
+    r == 0
+}
+
+fn scan_wb() -> Vec<Finding> {
+    let mut out = Vec::new();
+    let roots: Vec<PathBuf> = [
+        Some(r"C:\Drivers".to_string()), std::env::var("TEMP").ok(),
+        std::env::var("APPDATA").ok(), std::env::var("LOCALAPPDATA").ok(),
+        std::env::var("ProgramData").ok(),
+    ].into_iter().flatten().map(PathBuf::from).collect();
+    for r in &roots { wb_dir(r, 0, &mut out); }
+    out
+}
+
+fn wb_dir(dir: &Path, depth: usize, out: &mut Vec<Finding>) {
+    if depth > 4 { return; }
+    let low = dir.to_string_lossy().to_lowercase();
+    if low.contains("sf_quarantine") { return; }
+    const WL: [&str; 5] = ["\\programs\\", "\\package cache\\", "\\windowsapps\\", "\\microsoft\\", "\\windows\\"];
+    if WL.iter().any(|w| low.contains(w)) { return; }
+    let mut se = false;
+    let mut ud = false;
+    let mut hit: Option<PathBuf> = None;
+    let mut subs: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if let Ok(ft) = e.file_type() {
+                if ft.is_dir() {
+                    if !ft.is_symlink() { subs.push(e.path()); }
+                    continue;
+                }
+            }
+            let p = e.path();
+            let fnm = p.file_name().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
+            if fnm.ends_with(".exe") && !se && wb_is_signed(&p) { se = true; }
+            else if fnm.ends_with(".dll") && !ud && !wb_is_signed(&p) { ud = true; hit = Some(p); }
+        }
+    }
+    if se && ud {
+        if let Some(h) = hit {
+            out.push(Finding {
+                kind: "FILE".into(),
+                detail: format!("{} [白加黑: 有效签名EXE+未签名DLL]", h.display()),
+                high: false,
+                action: format!("quarantine {}", h.display()),
+            });
+        }
+    }
+    for s in subs { wb_dir(&s, depth + 1, out); }
 }
 
 fn scan_files() -> Vec<Finding> {
