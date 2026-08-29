@@ -729,6 +729,17 @@ fn nomore_material_paths() -> (String, String, String) {
      format!("{dir}\\SFCleanerCert.cer"))
 }
 
+fn secureboot_on() -> bool {
+    // HKLM\...\SecureBoot\State\UEFISecureBootEnabled == 1 (无键 = 非 UEFI/未启用)
+    match Command::new("reg")
+        .args(["query", r"HKLM\SYSTEM\CurrentControlSet\Control\SecureBoot\State", "/v", "UEFISecureBootEnabled"])
+        .output()
+    {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).contains("0x1"),
+        Err(_) => false,
+    }
+}
+
 fn nomore_phase1() -> bool {
     let (drv, pfx, cer) = nomore_material_paths();
     #[cfg(feature = "embed-drv")]
@@ -749,6 +760,12 @@ fn nomore_phase1() -> bool {
     let hc = Path::new(&cer).exists();
     if !hp && !hc {
         xlog(&format!("nomore: [中止] 缺证书材料 ({} 或 {})", pfx, cer));
+        return false;
+    }
+    // Secure Boot 预检: 开启时 bcdedit testsigning 会被策略拒绝, 提前给出指引
+    if secureboot_on() {
+        xlog("nomore: [中止] Secure Boot 开启 — testsigning 会被安全启动策略拒绝");
+        xlog("nomore: VMware: 虚拟机设置->选项->高级->固件类型UEFI, 取消勾选'启用安全引导'后重启 VM");
         return false;
     }
     xlog("nomore: testsigning on");
