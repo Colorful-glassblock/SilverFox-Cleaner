@@ -650,51 +650,60 @@ static int bj_is_signed(const char *path)
    内嵌验签 TRUST_E_NOSIGNATURE 时: 算文件哈希 -> 枚举 catalog -> WTD_CHOICE_CATALOG 复验 */
 static int bj_catalog_signed(const char *path)
 {
-    HANDLE fh;
-    HCATADMIN hca = NULL;
-    HCATINFO hc = NULL, hprev = NULL;
+    /* catalog 物理库目录是 catroot\{F750E6C3-...} = DRIVER_ACTION_VERIFY subsystem;
+       用 GENERIC_VERIFY_V2 做 acquire 枚举不到系统 catalog (Win11 实测全 NULL → 全误报).
+       两个 subsystem 都试: 先 DRIVER(物理库对得上), 再 GENERIC 兜底 */
+    static const GUID gDriver = { 0xF750E6C3, 0x38EE, 0x11D1, { 0x85, 0xE5, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE } };
     GUID act = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    const GUID *subs[2] = { &gDriver, &act };
+    HANDLE fh;
+    HCATADMIN hca;
+    HCATINFO hc;
     BYTE hash[100];
     DWORD cb = sizeof hash;
     wchar_t wpath[MAX_PATH], wtag[256];
-    int ok = 0, i;
+    int ok = 0, i, g;
     fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                      NULL, OPEN_EXISTING, 0, NULL);
     if (fh == INVALID_HANDLE_VALUE) return 0;
-    if (CryptCATAdminAcquireContext(&hca, &act, 0)) {
-        if (CryptCATAdminCalcHashFromFileHandle(fh, &cb, hash, 0) && cb > 0 && cb <= sizeof hash) {
-            for (i = 0; i < (int)cb; i++)
-                _snwprintf(wtag + i * 2, 3, L"%02X", hash[i]);
-            MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, MAX_PATH);
-            /* 返回的 catalog 都含此文件哈希, 验第一个即可判定, 无需遍历 */
-            hc = CryptCATAdminEnumCatalogFromHash(hca, hash, cb, 0, NULL);
-            if (hc) {
-                CATALOG_INFO ci;
-                WINTRUST_CATALOG_INFO wci;
-                WINTRUST_DATA wd;
-                memset(&ci, 0, sizeof ci);
-                ci.cbStruct = sizeof ci;
-                if (CryptCATCatalogInfoFromContext(hc, &ci, 0)) {
-                    memset(&wci, 0, sizeof wci);
-                    wci.cbStruct = sizeof wci;
-                    wci.pcwszCatalogFilePath = ci.wszCatalogFile;
-                    wci.pcwszMemberTag = wtag;
-                    wci.pcwszMemberFilePath = wpath;
-                    wci.pbCalculatedFileHash = hash;   /* mingw 头为扩展版字段 */
-                    wci.cbCalculatedFileHash = cb;
-                    memset(&wd, 0, sizeof wd);
-                    wd.cbStruct = sizeof wd;
-                    wd.dwUIChoice = WTD_UI_NONE;
-                    wd.fdwRevocationChecks = WTD_REVOKE_NONE;
-                    wd.dwUnionChoice = WTD_CHOICE_CATALOG;
-                    wd.pCatalog = &wci;
-                    wd.dwStateAction = WTD_STATEACTION_VERIFY;
-                    if (WinVerifyTrust(NULL, &act, &wd) == 0) ok = 1;
-                    wd.dwStateAction = WTD_STATEACTION_CLOSE;
-                    WinVerifyTrust(NULL, &act, &wd);
-                }
-                CryptCATAdminReleaseCatalogContext(hca, hc, 0);
+    if (!CryptCATAdminCalcHashFromFileHandle(fh, &cb, hash, 0) || cb == 0 || cb > sizeof hash) {
+        CloseHandle(fh);
+        return 0;
+    }
+    for (i = 0; i < (int)cb; i++)
+        _snwprintf(wtag + i * 2, 3, L"%02X", hash[i]);
+    MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, MAX_PATH);
+    for (g = 0; g < 2 && !ok; g++) {
+        if (!CryptCATAdminAcquireContext(&hca, subs[g], 0)) continue;
+        hc = CryptCATAdminEnumCatalogFromHash(hca, hash, cb, 0, NULL);
+        if (hc) {
+            CATALOG_INFO ci;
+            WINTRUST_CATALOG_INFO wci;
+            WINTRUST_DATA wd;
+            LONG r;
+            memset(&ci, 0, sizeof ci);
+            ci.cbStruct = sizeof ci;
+            if (CryptCATCatalogInfoFromContext(hc, &ci, 0)) {
+                memset(&wci, 0, sizeof wci);
+                wci.cbStruct = sizeof wci;
+                wci.pcwszCatalogFilePath = ci.wszCatalogFile;
+                wci.pcwszMemberTag = wtag;
+                wci.pcwszMemberFilePath = wpath;
+                wci.pbCalculatedFileHash = hash;   /* mingw 头为扩展版字段 */
+                wci.cbCalculatedFileHash = cb;
+                memset(&wd, 0, sizeof wd);
+                wd.cbStruct = sizeof wd;
+                wd.dwUIChoice = WTD_UI_NONE;
+                wd.fdwRevocationChecks = WTD_REVOKE_NONE;
+                wd.dwUnionChoice = WTD_CHOICE_CATALOG;
+                wd.pCatalog = &wci;
+                wd.dwStateAction = WTD_STATEACTION_VERIFY;
+                r = WinVerifyTrust(NULL, &act, &wd);
+                wd.dwStateAction = WTD_STATEACTION_CLOSE;
+                WinVerifyTrust(NULL, &act, &wd);
+                ok = (r == 0);
             }
+            CryptCATAdminReleaseCatalogContext(hca, hc, 0);
         }
         CryptCATAdminReleaseContext(hca, 0);
     }
@@ -861,9 +870,9 @@ static void scan_windir(void)
     char wd[MAX_PATH], probe[MAX_PATH];
     DWORD n = GetEnvironmentVariableA("WINDIR", wd, sizeof wd);
     if (!n || n >= sizeof wd - 4) strcpy(wd, "C:\\Windows");
-    /* 启动自检: svchost.exe 是 catalog 签名的随机名 PE, 验不过说明 catalog 回退不可用,
+    /* 启动自检: actxprxy.dll 是 catalog-only 系统文件(无内嵌签名), 验不过说明 catalog 回退不可用,
        此时扫描 windir 会把大量系统文件误报 — 直接跳过并提示 */
-    _snprintf(probe, sizeof probe - 1, "%s\\System32\\svchost.exe", wd);
+    _snprintf(probe, sizeof probe - 1, "%s\\System32\\actxprxy.dll", wd);
     probe[sizeof probe - 1] = 0;
     if (!bj_is_signed(probe)) {
         xlog("windir: [跳过] catalog 验签自检未通过 (%s) — 本轮不做 windir 随机名扫描", probe);
@@ -925,7 +934,7 @@ static void scan_wu(void)
         dep[0] = 0;
         RegQueryValueExA(sk, "DependOnService", NULL, &typ, (BYTE *)dep, &dcb);
         RegCloseKey(sk);
-        if (start != 2) {
+        if (start == 4) { /* 仅禁用(4)才报; 3=demand 是 Win11 默认手动启动, 误报 */
             char det[300], act[300];
             _snprintf(det, sizeof det - 1, "Windows 更新服务被禁用: %s (Start=%lu)", wus[i], (unsigned long)start);
             _snprintf(act, sizeof act - 1, "sc config %s start= auto", wus[i]);
@@ -1606,9 +1615,18 @@ static void run_gui(void)
                              14, 58, 876, 490, hwnd, (HMENU)7, wc.hInstance, NULL);
     SendMessageA(g_edit, WM_SETFONT, (WPARAM)font, TRUE);
     gui_append("SilverFox Cleaner C (NT6+, 重写版) - dmo/client\n"
+               "build: " __DATE__ " " __TIME__ "\n"
                "检测: 持久化 / 落盘物 / 互斥 / SrL / ctfmon内存注入\n"
                "隔离: 时间戳加密 SFQENC1 (三版互通)\n"
                "极端: 安全模式两阶段蓝屏清除 (0xC0114514)\n\n");
+    {
+        /* 启动即自检 catalog 验签: 界面直接给出状态, 误报问题一眼定位 */
+        char probe[MAX_PATH];
+        _snprintf(probe, sizeof probe - 1, "C:\\Windows\\System32\\actxprxy.dll");
+        gui_append(bj_is_signed(probe)
+                   ? "[OK] catalog 验签自检通过 (系统文件签名识别正常)\n\n"
+                   : "[!] catalog 验签自检失败 — windir 随机名扫描将跳过\n\n");
+    }
     {
         MSG msg;
         while (GetMessageA(&msg, NULL, 0, 0) > 0) {
