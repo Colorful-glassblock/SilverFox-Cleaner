@@ -1091,7 +1091,8 @@ static void autorun_set(void)
     char data[MAX_PATH + 64], exe[MAX_PATH], shortp[MAX_PATH];
     HKEY rk;
     GetModuleFileNameA(NULL, exe, sizeof exe);
-    /* 优先 8.3 短路径写 Run/RunOnce: 无括号/空格/非ASCII, winlogon 解析无歧义; 拿不到才回退引号长路径 */
+    /* 优先 8.3 短路径写 Run/RunOnce: 短路径无括号/空格/非ASCII,
+       winlogon 各解析阶段不会再有歧义; 拿不到 (系统禁 8.3) 才回退引号长路径 */
     if (GetShortPathNameA(exe, shortp, sizeof shortp))
         _snprintf(data, sizeof data - 1, "%s --extreme", shortp);
     else
@@ -1118,7 +1119,44 @@ static void autorun_del(void)
         RegCloseKey(rk);
     }
     if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, RUNONCE_KEY, 0, KEY_SET_VALUE, &rk) == ERROR_SUCCESS) {
+        RegDeleteValueA(rk, "SFCleaner");
         RegDeleteValueA(rk, "*SFCleaner");
+        RegCloseKey(rk);
+    }
+}
+
+/* bcdedit 必须经 64 位路径调用: 32 位进程里 PATH 解析会被重定向到 SysWOW64,
+   那里没有 bcdedit.exe → 命令静默失败 (x86 版曾因此 testsigning 从未生效).
+   Sysnative 别名仅 32 位进程可见, 恰好只在 x86 构建里需要 */
+static int run_bcdedit(const char *fmt, ...)
+{
+    char args[512];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf(args, sizeof args - 1, fmt, ap);
+    va_end(ap);
+    args[sizeof args - 1] = 0;
+#ifdef _WIN64
+    return run_cmd("bcdedit %s", args);
+#else
+    return run_cmd("%WINDIR%\\Sysnative\\bcdedit.exe %s", args);
+#endif
+}
+
+/* 不客气 phase2 自启动: RunOnce 一次性 (普通登录 + 安全模式两种值), 短路径消歧义 */
+static void nomore_autorun_set(void)
+{
+    char data[MAX_PATH + 64], exe[MAX_PATH], shortp[MAX_PATH];
+    HKEY rk;
+    GetModuleFileNameA(NULL, exe, sizeof exe);
+    if (GetShortPathNameA(exe, shortp, sizeof shortp))
+        _snprintf(data, sizeof data - 1, "%s --nomore2", shortp);
+    else
+        _snprintf(data, sizeof data - 1, "\"%s\" --nomore2", exe);
+    if (RegCreateKeyExA(HKEY_LOCAL_MACHINE, RUNONCE_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &rk, NULL)
+        == ERROR_SUCCESS) {
+        RegSetValueExA(rk, "SFCleaner", 0, REG_SZ, (const BYTE *)data, (DWORD)strlen(data) + 1);
+        RegSetValueExA(rk, "*SFCleaner", 0, REG_SZ, (const BYTE *)data, (DWORD)strlen(data) + 1);
         RegCloseKey(rk);
     }
 }
@@ -1126,13 +1164,13 @@ static void autorun_del(void)
 static void safeboot_set(void)
 {
     xlog("safeboot: set minimal");
-    run_cmd("bcdedit /set {current} safeboot minimal");
+    run_bcdedit("/set {current} safeboot minimal");
 }
 
 static void safeboot_clear(void)
 {
     xlog("safeboot: clear");
-    run_cmd("bcdedit /deletevalue {current} safeboot");
+    run_bcdedit("/deletevalue {current} safeboot");
 }
 
 static void schedule_self_delete(void)
@@ -1236,7 +1274,7 @@ static int nomore_phase1(void)
         return 0;
     }
     xlog("nomore: testsigning on");
-    if (!run_cmd("bcdedit /set testsigning on")) {
+    if (!run_bcdedit("/set testsigning on")) {
         xlog("nomore: [中止] bcdedit testsigning 失败 — 固件 Secure Boot 开着会被拒, 请在 VM 设置里关掉 Secure Boot 再试");
         return 0;
     }
@@ -1272,8 +1310,9 @@ static int nomore_phase1(void)
 static void nomore_phase2(void)
 {
     char dst[MAX_PATH];
+    autorun_del(); /* 先清 RunOnce, 防完成后残留条目把 phase1 再拉起来 */
     xlog("nomore: phase2 - 先解除 testsigning (已装载的驱动不受影响, 防后续异常残留)");
-    run_cmd("bcdedit /set testsigning off");
+    run_bcdedit("/set testsigning off");
     xlog("nomore: phase2 start driver");
     if (!run_cmd("sc start %s", DRV_SVC))
         xlog("nomore: [警告] 驱动未启动 — 常见: phase1 后没重启(testsigning 要重启生效) / Secure Boot / 证书未导入");
@@ -1302,9 +1341,10 @@ static void nomore_run(void)
             return;
         }
         marker_set(3);
-        xlog("nomore: phase1 done, bsod (testsigning 生效需重启)");
+        nomore_autorun_set();
+        xlog("nomore: phase1 done, bsod (testsigning 生效需重启; 重启后 RunOnce 自动进 phase2)");
         if (!trigger_bsod())
-            msgbox("蓝屏触发失败\n请手动重启 — testsigning 需重启后生效;\n重启后再运行一次不客气模式即进入 phase2 (驱动清理+卸载)");
+            msgbox("蓝屏触发失败\n请手动重启 — testsigning 需重启后生效;\n重启登录后将自动进入 phase2 (RunOnce);\n若未自动弹出也可手动再运行一次本程序");
     }
 }
 
@@ -1498,6 +1538,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nShow)
             extreme_run();
         } else if (!strcmp(c2, "--nomore")) {
             nomore_run();
+        } else if (!strcmp(c2, "--nomore2")) {
+            /* RunOnce 自动链专用: 只允许执行 phase2, marker 不在绝不重演 phase1 */
+            enable_privs();
+            if (marker_get() == 3) nomore_phase2();
         } else if (!strcmp(c2, "--extreme-abort")) {
             enable_privs();
             safeboot_clear();
