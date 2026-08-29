@@ -97,7 +97,7 @@ internal static partial class Native
     internal struct WINTRUST_FILE_INFO
     {
         public uint cbStruct;
-        public string pcwszFilePath;
+        public string? pcwszFilePath;
         public IntPtr hFile;
         public IntPtr pgKnownSubject;
     }
@@ -114,7 +114,7 @@ internal static partial class Native
         public IntPtr pFile;
         public uint dwStateAction;
         public IntPtr hWVTStateData;
-        public string pwszURLReference;
+        public string? pwszURLReference;
         public uint dwProvFlags;
         public uint dwUIContext;
         public IntPtr pSignatureSettings;
@@ -575,7 +575,7 @@ public static class Scanner
         string low = dir.ToLowerInvariant();
         if (low.Contains("sf_quarantine") || WbWhitelist.Any(w => low.Contains(w))) return;
         bool se = false, ud = false;
-        string hit = null;
+        string? hit = null;
         List<string> subs = new();
         string[] entries;
         try { entries = Directory.GetFileSystemEntries(dir); } catch { return; }
