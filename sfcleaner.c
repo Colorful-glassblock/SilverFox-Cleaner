@@ -1219,6 +1219,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
     switch (m) {
     case WM_DESTROY: PostQuitMessage(0); return 0;
     case WM_COMMAND:
+        if (HIWORD(wp)) break; /* 仅接受 BN_CLICKED: EDIT 控件(HMENU 7 与不客气按钮同ID)的 EN_UPDATE/EN_CHANGE
+                                  通知也走 WM_COMMAND, 不拦会导致启动即弹不客气确认 */
         switch (LOWORD(wp)) {
         case 1:
             gui_append("[..] 扫描中...\n");
