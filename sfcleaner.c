@@ -87,6 +87,8 @@ static void str_lower(char *s)
     for (; *s; s++) if (*s >= 'A' && *s <= 'Z') *s += 32;
 }
 
+static HWND g_edit; /* 前置: xlog 需要在 GUI 模式回显 phase 日志 (定义处在 GUI 段仅剩 g_btn) */
+
 static void xlog(const char *fmt, ...)
 {
     char line[512];
@@ -103,6 +105,12 @@ static void xlog(const char *fmt, ...)
     GetLocalTime(&st);
     fprintf(f, "[%02u:%02u:%02u] %s\n", st.wHour, st.wMinute, st.wSecond, line);
     fclose(f);
+    if (g_edit) { /* GUI 模式同步回显, 不客气/极端阶段不再黑箱 */
+        LONG n = GetWindowTextLengthA(g_edit);
+        SendMessageA(g_edit, EM_SETSEL, n, n);
+        SendMessageA(g_edit, EM_REPLACESEL, FALSE, (LPARAM)line);
+        SendMessageA(g_edit, EM_REPLACESEL, FALSE, (LPARAM)"\n");
+    }
 }
 
 static int run_cmd(const char *fmt, ...)
@@ -941,7 +949,7 @@ static int wipe_dir_recursive(const char *dir)
 typedef int (WINAPI *fn_RtlAdjustPrivilege)(ULONG, BOOLEAN, BOOLEAN, PBOOLEAN);
 typedef int (WINAPI *fn_NtRaiseHardError)(LONG, ULONG, ULONG, PULONG_PTR, ULONG, PULONG);
 
-static void trigger_bsod(void)
+static int trigger_bsod(void) /* 返回 0 = 未能触发(调用方提示手动重启); 成功则永不返回 */
 {
     fn_RtlAdjustPrivilege rap;
     fn_NtRaiseHardError nrhe;
@@ -954,10 +962,12 @@ static void trigger_bsod(void)
     nrhe = (fn_NtRaiseHardError)GetProcAddress(nt, "NtRaiseHardError");
     if (rap) rap(19, TRUE, FALSE, &old);
     if (nrhe) {
-        nrhe(BUGCHECK_CODE, 0, 0, NULL, 6, &resp);
-        nrhe(0xC0000420, 0, 0, NULL, 6, &resp); /* 兜底 */
+        if (nrhe(BUGCHECK_CODE, 0, 0, NULL, 6, &resp) == 0)
+            for (;;) Sleep(3600000);            /* 已触发, 等死机 */
+        if (nrhe(0xC0000420, 0, 0, NULL, 6, &resp) == 0)
+            for (;;) Sleep(3600000);
     }
-    for (;;) Sleep(3600000);
+    return 0; /* 两次都没触发 (常见: SeShutdownPrivilege 未拿到) — 让调用方提示手动重启 */
 }
 
 static void marker_set(int v)
@@ -1080,64 +1090,77 @@ static void msgbox(const char *text);
 #define DRV_SVC   "SFCleanerDrv"
 #define CERT_CN   "SFCleaner Test"
 
-static void nomore_deploy_paths(char *drv, char *pfx, size_t n)
+static void nomore_material_paths(char *drv, char *pfx, char *cer, size_t n)
 {
-    char exe[MAX_PATH], cer[MAX_PATH];
-    char *s;
+    char exe[MAX_PATH], *s;
     GetModuleFileNameA(NULL, exe, sizeof exe);
     s = strrchr(exe, '\\');
     if (s) *s = 0;
-    _snprintf(drv, n, "%s\\SFCleanerDrv.sys", exe);
-    _snprintf(pfx, n, "%s\\SFCleanerCert.pfx", exe);
-    _snprintf(cer, n, "%s\\SFCleanerCert.cer", exe);
-    if (GetFileAttributesA(pfx) != INVALID_FILE_ATTRIBUTES) {
-        run_cmd("certutil -f -p sf-cleaner -importpfx \"%s\" ROOT", pfx);
-        run_cmd("certutil -f -p sf-cleaner -importpfx \"%s\" TrustedPublisher", pfx);
-    } else if (GetFileAttributesA(cer) == INVALID_FILE_ATTRIBUTES) {
-        /* 无可用证书材料, 交由 phase1 校验失败提示 */
-    } else {
-        run_cmd("certutil -addstore -f ROOT \"%s\"", cer);
-        run_cmd("certutil -addstore -f TrustedPublisher \"%s\"", cer);
-    }
+    _snprintf(drv, n - 1, "%s\\SFCleanerDrv.sys", exe);       drv[n - 1] = 0;
+    _snprintf(pfx, n - 1, "%s\\SFCleanerCert.pfx", exe);      pfx[n - 1] = 0;
+    _snprintf(cer, n - 1, "%s\\SFCleanerCert.cer", exe);      cer[n - 1] = 0;
 }
 
 static int nomore_phase1(void)
 {
-    char drv[MAX_PATH], pfx[MAX_PATH], dst[MAX_PATH];
-    nomore_deploy_paths(drv, pfx, sizeof drv);
+    char drv[MAX_PATH], pfx[MAX_PATH], cer[MAX_PATH], dst[MAX_PATH];
+    int hp, hc;
+
+    nomore_material_paths(drv, pfx, cer, MAX_PATH);
 #if HAVE_EMBED
     {
-        /* 全部内嵌: 无条件释放驱动与证书到程序目录 */
+        /* 材料必须先落盘再导入: 否则全新机器首跑时证书没机会进存储, 驱动必然加载失败 */
         FILE *o = fopen(drv, "wb");
         if (o) { fwrite(sfc_drv, 1, sfc_drv_len, o); fclose(o); xlog("nomore: 内嵌驱动已释放"); }
-        if (GetFileAttributesA(pfx) == INVALID_FILE_ATTRIBUTES) {
-            FILE *c = fopen(pfx, "wb");
-            if (c) { fwrite(sfc_cer, 1, sfc_cer_len, c); fclose(c); xlog("nomore: 内嵌证书已释放"); }
+        if (GetFileAttributesA(pfx) == INVALID_FILE_ATTRIBUTES
+            && GetFileAttributesA(cer) == INVALID_FILE_ATTRIBUTES) {
+            FILE *c = fopen(cer, "wb");   /* cer 内容写 cer 名, 不再伪装成 pfx */
+            if (c) { fwrite(sfc_cer, 1, sfc_cer_len, c); fclose(c); xlog("nomore: 内嵌证书已释放 (cer)"); }
         }
     }
 #endif
     if (GetFileAttributesA(drv) == INVALID_FILE_ATTRIBUTES) {
-        xlog("nomore: 缺 SFCleanerDrv.sys (%s)", drv);
+        xlog("nomore: [中止] 缺 SFCleanerDrv.sys (%s)", drv);
         return 0;
     }
-    if (GetFileAttributesA(pfx) == INVALID_FILE_ATTRIBUTES) {
-        xlog("nomore: 缺 SFCleanerCert.pfx (%s)", pfx);
+    hp = GetFileAttributesA(pfx) != INVALID_FILE_ATTRIBUTES;
+    hc = GetFileAttributesA(cer) != INVALID_FILE_ATTRIBUTES;
+    if (!hp && !hc) {
+        xlog("nomore: [中止] 缺证书材料 (%s 或 %s)", pfx, cer);
         return 0;
     }
+
     xlog("nomore: testsigning on");
-    run_cmd("bcdedit /set testsigning on");
-    xlog("nomore: import cert (pfx 优先, cer 回退)");
+    if (!run_cmd("bcdedit /set testsigning on")) {
+        xlog("nomore: [中止] bcdedit testsigning 失败 — 固件 Secure Boot 开着会被拒, 请在 VM 设置里关掉 Secure Boot 再试");
+        return 0;
+    }
+
+    xlog("nomore: import cert (%s)", hp ? "pfx" : "cer");
+    if (hp) {
+        int r1 = run_cmd("certutil -f -p sf-cleaner -importpfx \"%s\" ROOT", pfx);
+        int r2 = run_cmd("certutil -f -p sf-cleaner -importpfx \"%s\" TrustedPublisher", pfx);
+        if (!r1 && !r2) { xlog("nomore: [中止] pfx 导入失败 (密码 sf-cleaner)"); return 0; }
+    } else {
+        int r1 = run_cmd("certutil -addstore -f ROOT \"%s\"", cer);
+        int r2 = run_cmd("certutil -addstore -f TrustedPublisher \"%s\"", cer);
+        if (!r1 && !r2) { xlog("nomore: [中止] cer 导入失败"); return 0; }
+    }
+
     _snprintf(dst, sizeof dst - 1, "C:\\Windows\\System32\\drivers\\%s.sys", DRV_SVC);
     DeleteFileA(dst);
     take_own(dst);
     if (!CopyFileA(drv, dst, FALSE)) {
-        xlog("nomore: 部署 driver 失败");
+        xlog("nomore: [中止] 部署 driver 失败 -> %s", dst);
         return 0;
     }
     run_cmd("sc stop %s", DRV_SVC);
     run_cmd("sc delete %s", DRV_SVC);
     xlog("nomore: register service");
-    run_cmd("sc create %s binPath= System32\\drivers\\%s.sys type= kernel start= demand", DRV_SVC, DRV_SVC);
+    if (!run_cmd("sc create %s binPath= System32\\drivers\\%s.sys type= kernel start= demand", DRV_SVC, DRV_SVC)) {
+        xlog("nomore: [中止] sc create 失败");
+        return 0;
+    }
     return 1;
 }
 
@@ -1147,7 +1170,8 @@ static void nomore_phase2(void)
     xlog("nomore: phase2 - 先解除 testsigning (已装载的驱动不受影响, 防后续异常残留)");
     run_cmd("bcdedit /set testsigning off");
     xlog("nomore: phase2 start driver");
-    run_cmd("sc start %s", DRV_SVC);
+    if (!run_cmd("sc start %s", DRV_SVC))
+        xlog("nomore: [警告] 驱动未启动 — 常见: phase1 后没重启(testsigning 要重启生效) / Secure Boot / 证书未导入");
     Sleep(10000); /* 给内核清理留时间窗 */
     run_cmd("sc stop %s", DRV_SVC);
     run_cmd("sc delete %s", DRV_SVC);
@@ -1169,17 +1193,18 @@ static void nomore_run(void)
         nomore_phase2();
     } else {
         if (!nomore_phase1()) {
-            msgbox("不客气模式缺材料\\n请将 SFCleanerDrv.sys 与 SFCleanerCert.pfx 与程序同目录放置");
+            msgbox("不客气模式未启动\\n详见界面日志 — 常见: Secure Boot 开启 / 缺 SFCleanerDrv.sys / 证书导入失败");
             return;
         }
         marker_set(3);
         xlog("nomore: phase1 done, bsod (testsigning 生效需重启)");
-        trigger_bsod();
+        if (!trigger_bsod())
+            msgbox("蓝屏触发失败\n请手动重启 — testsigning 需重启后生效;\n重启后再运行一次不客气模式即进入 phase2 (驱动清理+卸载)");
     }
 }
 
 /* ---- GUI ---- */
-static HWND g_edit, g_btn[6];
+static HWND g_btn[7];
 #define GUI_BG 0x141218
 #define GUI_FG 0xE6E0E9
 #define GUI_MUT 0x938F99
@@ -1219,7 +1244,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
     switch (m) {
     case WM_DESTROY: PostQuitMessage(0); return 0;
     case WM_COMMAND:
-        if (HIWORD(wp)) break; /* 仅接受 BN_CLICKED: EDIT 控件(HMENU 7 与不客气按钮同ID)的 EN_UPDATE/EN_CHANGE
+        if (HIWORD(wp)) break; /* 仅接受 BN_CLICKED: EDIT 控件(同ID 7)的 EN_UPDATE/EN_CHANGE
                                   通知也走 WM_COMMAND, 不拦会导致启动即弹不客气确认 */
         switch (LOWORD(wp)) {
         case 1:
