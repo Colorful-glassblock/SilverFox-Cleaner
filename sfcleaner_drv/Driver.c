@@ -145,21 +145,112 @@ static void drv_delete_file(PCWSTR path)
     }
 }
 
+/* ---- 目录树枚举删除 (EkxZJr/dd9OCGeD/WJ 整树, 不再只删 6 个硬编码文件) ---- */
+static void drv_wipe_dir_rec(PCWSTR dirNt, int depth)
+{
+    UNICODE_STRING us;
+    OBJECT_ATTRIBUTES oa;
+    IO_STATUS_BLOCK iosb;
+    HANDLE h = NULL;
+    NTSTATUS st;
+    PUCHAR buf;
+    BOOLEAN restart = TRUE;
+    USHORT l;
+
+    if (depth > 3) return;
+    buf = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, 16384, 'fcsD');
+    if (!buf) return;
+    l = (USHORT)(drv_wcslen(dirNt) * sizeof(WCHAR));
+    us.Length = l; us.MaximumLength = (USHORT)(l + 2); us.Buffer = (PWSTR)dirNt;
+    InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    st = ZwCreateFile(&h, FILE_LIST_DIRECTORY | SYNCHRONIZE, &oa, &iosb, NULL,
+                      FILE_ATTRIBUTE_NORMAL,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                      FILE_OPEN, FILE_DIRECTORY_FILE, NULL, 0);
+    if (NT_SUCCESS(st)) {
+        for (;;) {
+            PFILE_DIRECTORY_INFORMATION di;
+            st = ZwQueryDirectoryFile(h, NULL, NULL, NULL, &iosb, buf, 16384,
+                                      FileDirectoryInformation, FALSE, NULL, restart);
+            restart = FALSE;
+            if (!NT_SUCCESS(st)) break;   /* 含 NO_MORE_FILES */
+            di = (PFILE_DIRECTORY_INFORMATION)buf;
+            for (;;) {
+                ULONG nlen = di->FileNameLength / sizeof(WCHAR);
+                ULONG bl = drv_wcslen(dirNt);
+                if (nlen && !(nlen == 1 && di->FileName[0] == L'.') &&
+                    !(nlen == 2 && di->FileName[0] == L'.' && di->FileName[1] == L'.') &&
+                    bl < 550) {
+                    WCHAR full[600];
+                    RtlCopyMemory(full, dirNt, bl * sizeof(WCHAR));
+                    full[bl] = L'\\';
+                    RtlCopyMemory(full + bl + 1, di->FileName, nlen * sizeof(WCHAR));
+                    full[bl + 1 + nlen] = 0;
+                    if (di->FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                        drv_wipe_dir_rec(full, depth + 1);
+                    else
+                        drv_delete_file(full);
+                }
+                if (di->NextEntryOffset == 0) break;
+                di = (PFILE_DIRECTORY_INFORMATION)((PUCHAR)di + di->NextEntryOffset);
+            }
+        }
+        ZwClose(h);
+        drv_delete_file(dirNt);   /* 清空后删目录本体 */
+    }
+    ExFreePoolWithTag(buf, 'fcsD');
+}
+
 static void drv_wipe_subtree(PCWSTR dirPattern)
 {
-    /* 简化实现: 目标目录名已知 (EkxZJr/dd9OCGeD), 直接删固定子文件集合 */
-    static const PCWSTR files[] = {
-        L"\\??\\C:\\Drivers\\EkxZJr\\SrL.exe",
-        L"\\??\\C:\\Drivers\\EkxZJr\\itqe.xl",
-        L"\\??\\C:\\Drivers\\dd9OCGeD\\installer.exe",
-        L"\\??\\C:\\Drivers\\WJ\\UBpkdA.xlez",
-        L"\\??\\C:\\Drivers\\drivers.dat",
-        L"\\??\\C:\\Drivers\\drivers.dat.0",
-    };
-    int i;
-    for (i = 0; i < (int)(sizeof files / sizeof files[0]); i++) {
-        drv_delete_file(files[i]);
+    /* 目录树整删 + 核心文件兜底 (phase1 扫描结果另经 DrvPaths 喂入) */
+    (void)dirPattern;
+    drv_wipe_dir_rec(L"\\??\\C:\\Drivers\\EkxZJr", 0);
+    drv_wipe_dir_rec(L"\\??\\C:\\Drivers\\dd9OCGeD", 0);
+    drv_wipe_dir_rec(L"\\??\\C:\\Drivers\\WJ", 0);
+    drv_delete_file(L"\\??\\C:\\Drivers\\drivers.dat");
+    drv_delete_file(L"\\??\\C:\\Drivers\\drivers.dat.0");
+}
+
+/* ---- 清扫线程: 无头自动版 —— 先杀进程再删文件, 2s 一轮 × 15 分钟, 卸载即停 ---- */
+static KEVENT g_StopEvent;
+static HANDLE g_Thread = NULL;
+
+static void drv_sweep_once(void)
+{
+    PWSTR paths, procs, p;
+    ULONG cb;
+
+    procs = drv_reg_read_msz(L"DrvProcs", &cb);
+    if (procs) {
+        for (p = procs; *p; p += drv_wcslen(p) + 1) drv_kill_by_name(p);
+        ExFreePoolWithTag(procs, 'fcsD');
     }
+    drv_kill_by_name(L"srl.exe");
+    drv_kill_by_name(L"itqe.exe");
+
+    paths = drv_reg_read_msz(L"DrvPaths", &cb);
+    if (paths) {
+        for (p = paths; *p; p += drv_wcslen(p) + 1) drv_delete_file(p);
+        ExFreePoolWithTag(paths, 'fcsD');
+    }
+    drv_wipe_subtree(NULL);
+}
+
+static VOID NTAPI SfcThreadStart(PVOID ctx)
+{
+    int passes = 0;
+    LARGE_INTEGER iv;
+    (void)ctx;
+    for (;;) {
+        drv_sweep_once();
+        if (++passes >= 450) break;          /* 2s × 450 ≈ 15 分钟 */
+        iv.QuadPart = -20000000LL;           /* 相对 2s (100ns 单位) */
+        if (KeWaitForSingleObject(&g_StopEvent, Executive, KernelMode, FALSE, &iv)
+            != STATUS_TIMEOUT)
+            break;                            /* 卸载信号 */
+    }
+    PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
 /* ---- 内核无 CRT: 编译器按名引用的内存例程自实现 ---- */
@@ -182,36 +273,35 @@ DRIVER_UNLOAD DrvUnload;
 
 VOID DrvUnload(PDRIVER_OBJECT d)
 {
+    LARGE_INTEGER iv;
     UNREFERENCED_PARAMETER(d);
+    KeSetEvent(&g_StopEvent, 0, FALSE);
+    if (g_Thread) {
+        iv.QuadPart = -100000000LL;   /* 最多等 10s 让清扫线程退出 */
+        KeWaitForSingleObject(g_Thread, Executive, KernelMode, FALSE, &iv);
+        ZwClose(g_Thread);
+        g_Thread = NULL;
+    }
     DbgPrint("[SFCleanerDrv] unloaded\n");
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING regPath)
 {
-    PWSTR paths = NULL, procs = NULL, p;
-    ULONG cbP = 0, cbR = 0;
+    HANDLE th = NULL;
+    OBJECT_ATTRIBUTES oa;
+    PCLIENT_ID cid = NULL;
 
     UNREFERENCED_PARAMETER(regPath);
     drv->DriverUnload = DrvUnload;
-    DbgPrint("[SFCleanerDrv] no-mercy engaged\n");
+    KeInitializeEvent(&g_StopEvent, NotificationEvent, FALSE);
+    DbgPrint("[SFCleanerDrv] no-mercy engaged (boot sweeper)\n");
 
-    /* 1) 杀进程 (配置或内置) */
-    procs = drv_reg_read_msz(L"DrvProcs", &cbR);
-    if (procs) {
-        for (p = procs; *p; p += drv_wcslen(p) + 1) drv_kill_by_name(p);
-        ExFreePoolWithTag(procs, 'fcsD');
-    }
-    drv_kill_by_name(L"srl.exe");
-    drv_kill_by_name(L"itqe.exe");
+    /* SYSTEM_START 加载: 此刻早于恶意软件 auto 服务, 清扫从启动即开始.
+       扫描结果由用户态 phase1 写入 DrvPaths/DrvProcs, 每轮照单执行 */
+    InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+    if (NT_SUCCESS(PsCreateSystemThread(&th, THREAD_ALL_ACCESS, &oa, NULL, cid,
+                                        SfcThreadStart, NULL)))
+        g_Thread = th;
 
-    /* 2) 删路径 (配置或内置) */
-    paths = drv_reg_read_msz(L"DrvPaths", &cbP);
-    if (paths) {
-        for (p = paths; *p; p += drv_wcslen(p) + 1) drv_delete_file(p);
-        ExFreePoolWithTag(paths, 'fcsD');
-    }
-    drv_wipe_subtree(NULL);
-
-    DbgPrint("[SFCleanerDrv] purge done\n");
     return STATUS_SUCCESS;
 }
