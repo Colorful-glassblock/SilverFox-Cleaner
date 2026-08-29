@@ -17,6 +17,7 @@
 #include <stdarg.h>
 #include <wintrust.h>
 #include <softpub.h>
+#include <mscat.h>
 
 /* ---- 常量 ---- */
 #define QUAR_ROOT   "C:\\ProgramData\\sf_quarantine"
@@ -53,15 +54,22 @@ static Finding g_f[MAXF];
 static int g_nf;
 
 /* ---- 小工具 ---- */
+static CRITICAL_SECTION g_fcs;
+static int g_fcs_init = 0;
+
 static void addf(const char *kind, int high, const char *detail, const char *action)
 {
     if (g_nf >= MAXF) return;
+    if (!g_fcs_init) { InitializeCriticalSection(&g_fcs); g_fcs_init = 1; }
+    EnterCriticalSection(&g_fcs);
+    if (g_nf >= MAXF) { LeaveCriticalSection(&g_fcs); return; }
     Finding *f = &g_f[g_nf++];
     memset(f, 0, sizeof *f);
     strncpy(f->kind, kind, sizeof f->kind - 1);
     strncpy(f->detail, detail, sizeof f->detail - 1);
     strncpy(f->action, action, sizeof f->action - 1);
     f->high = high;
+    LeaveCriticalSection(&g_fcs);
 }
 
 static int mem_find_bytes(const unsigned char *h, size_t hl, const unsigned char *n, size_t nl)
@@ -610,6 +618,8 @@ static void scan_files(void)
 }
 
 /* ---- 白加黑检测: 同目录 [有效签名EXE + 未签名DLL] (跨变种结构特征) ---- */
+static int bj_catalog_signed(const char *path);
+
 static int bj_is_signed(const char *path)
 {
     WINTRUST_FILE_INFO fi;
@@ -631,7 +641,63 @@ static int bj_is_signed(const char *path)
     res = WinVerifyTrust(NULL, &action, &wd);
     wd.dwStateAction = WTD_STATEACTION_CLOSE;
     WinVerifyTrust(NULL, &action, &wd);
-    return res == 0;
+    return res == 0 || bj_catalog_signed(path);
+}
+
+/* catalog 回退: 系统自带 PE 无内嵌签名, 由 catalog 数据库覆盖.
+   内嵌验签 TRUST_E_NOSIGNATURE 时: 算文件哈希 -> 枚举 catalog -> WTD_CHOICE_CATALOG 复验 */
+static int bj_catalog_signed(const char *path)
+{
+    HANDLE fh;
+    HCATADMIN hca = NULL;
+    HCATINFO hc = NULL, hprev = NULL;
+    GUID act = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    BYTE hash[100];
+    DWORD cb = sizeof hash;
+    wchar_t wpath[MAX_PATH], wtag[256];
+    int ok = 0, i;
+    fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                     NULL, OPEN_EXISTING, 0, NULL);
+    if (fh == INVALID_HANDLE_VALUE) return 0;
+    if (CryptCATAdminAcquireContext(&hca, &act, 0)) {
+        if (CryptCATAdminCalcHashFromFileHandle(fh, &cb, hash, 0) && cb > 0 && cb <= sizeof hash) {
+            for (i = 0; i < (int)cb; i++)
+                _snwprintf(wtag + i * 2, 3, L"%02X", hash[i]);
+            MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, MAX_PATH);
+            /* 返回的 catalog 都含此文件哈希, 验第一个即可判定, 无需遍历 */
+            hc = CryptCATAdminEnumCatalogFromHash(hca, hash, cb, 0, NULL);
+            if (hc) {
+                CATALOG_INFO ci;
+                WINTRUST_CATALOG_INFO wci;
+                WINTRUST_DATA wd;
+                memset(&ci, 0, sizeof ci);
+                ci.cbStruct = sizeof ci;
+                if (CryptCATCatalogInfoFromContext(hc, &ci, 0)) {
+                    memset(&wci, 0, sizeof wci);
+                    wci.cbStruct = sizeof wci;
+                    wci.pcwszCatalogFilePath = ci.wszCatalogFile;
+                    wci.pcwszMemberTag = wtag;
+                    wci.pcwszMemberFilePath = wpath;
+                    wci.pbCalculatedFileHash = hash;   /* mingw 头为扩展版字段 */
+                    wci.cbCalculatedFileHash = cb;
+                    memset(&wd, 0, sizeof wd);
+                    wd.cbStruct = sizeof wd;
+                    wd.dwUIChoice = WTD_UI_NONE;
+                    wd.fdwRevocationChecks = WTD_REVOKE_NONE;
+                    wd.dwUnionChoice = WTD_CHOICE_CATALOG;
+                    wd.pCatalog = &wci;
+                    wd.dwStateAction = WTD_STATEACTION_VERIFY;
+                    if (WinVerifyTrust(NULL, &act, &wd) == 0) ok = 1;
+                    wd.dwStateAction = WTD_STATEACTION_CLOSE;
+                    WinVerifyTrust(NULL, &act, &wd);
+                }
+                CryptCATAdminReleaseCatalogContext(hca, hc, 0);
+            }
+        }
+        CryptCATAdminReleaseContext(hca, 0);
+    }
+    CloseHandle(fh);
+    return ok;
 }
 
 static void bj_scan_dir(const char *dir, int depth)
@@ -639,11 +705,13 @@ static void bj_scan_dir(const char *dir, int depth)
     WIN32_FIND_DATAA fd;
     HANDLE h;
     char pat[MAX_PATH], full[MAX_PATH];
-    int se = 0, ud = 0;
-    int has_dll = 0;
-    static char hitbuf[MAX_PATH];
+    /* 枚举先行: 先收集 exe/dll 清单再决定是否验签 —
+       无 exe 或无 dll 的目录 (绝大多数) 0 次验签; 配对才查, 找到即停 */
+    char exes[24][MAX_PATH];
+    char dlls[64][MAX_PATH];
+    int nex = 0, ndl = 0, se = 0, ud = 0, w, i;
+    char hitbuf[MAX_PATH];
     static const char *wls[5] = {"\\programs\\", "\\package cache\\", "\\windowsapps\\", "\\microsoft\\", "\\windows\\"};
-    int w;
     if (depth > 4) return;
     {
         static char lowq[1024]; /* 先 lower 再判, 隔离区目录本身要跳过 */
@@ -671,22 +739,29 @@ static void bj_scan_dir(const char *dir, int depth)
         str_lower(low);
         fl = strlen(low);
         if (fl > 4 && !_stricmp(low + fl - 4, ".exe")) {
-            if (!se && bj_is_signed(full)) se = 1;   /* 找到即停, 避免大目录重复验签 */
+            if (nex < 24) { strncpy(exes[nex], full, MAX_PATH - 1); exes[nex][MAX_PATH - 1] = 0; nex++; }
         } else if (fl > 4 && !_stricmp(low + fl - 4, ".dll")) {
-            if (!ud && !bj_is_signed(full)) {
-                strncpy(hitbuf, full, sizeof hitbuf - 1);
-                hitbuf[sizeof hitbuf - 1] = 0;
-                has_dll = 1;
-                ud = 1;
-            }
+            if (ndl < 64) { strncpy(dlls[ndl], full, MAX_PATH - 1); dlls[ndl][MAX_PATH - 1] = 0; ndl++; }
         }
     } while (FindNextFileA(h, &fd));
     FindClose(h);
-    if (se && ud && has_dll) {
-        char det[MAX_PATH + 64], act[MAX_PATH + 16];
-        _snprintf(det, sizeof det - 1, "%s [白加黑: 有效签名EXE+未签名DLL]", hitbuf);
-        _snprintf(act, sizeof act - 1, "quarantine %s", hitbuf);
-        addf("FILE", 0, det, act);
+    if (nex && ndl) {                    /* 配对门槛: 单边目录 0 次验签 */
+        for (i = 0; i < nex && !se; i++)
+            if (bj_is_signed(exes[i])) se = 1;
+        if (se) {
+            for (i = 0; i < ndl && !ud; i++)
+                if (!bj_is_signed(dlls[i])) {
+                    strncpy(hitbuf, dlls[i], sizeof hitbuf - 1);
+                    hitbuf[sizeof hitbuf - 1] = 0;
+                    ud = 1;
+                }
+        }
+        if (se && ud) {
+            char det[MAX_PATH + 64], act[MAX_PATH + 16];
+            _snprintf(det, sizeof det - 1, "%s [白加黑: 有效签名EXE+未签名DLL]", hitbuf);
+            _snprintf(act, sizeof act - 1, "quarantine %s", hitbuf);
+            addf("FILE", 0, det, act);
+        }
     }
 }
 
@@ -855,19 +930,43 @@ static void scan_wu(void)
     }
 }
 
+static DWORD WINAPI scan_group(LPVOID p)
+{
+    switch ((int)(size_t)p) {
+    case 0: scan_tasks(); scan_services(); break;
+    case 1: scan_procs(); scan_ctfmon(); break;
+    case 2: scan_files(); break;
+    case 3: scan_bj(); break;
+    case 4: scan_windir(); break;
+    case 5: scan_wu(); scan_hosts(); break;
+    }
+    return 0;
+}
+
 static void scan_all(void)
 {
+    HANDLE th[6];
+    int i;
     enable_privs();
     g_nf = 0;
-    scan_tasks();
-    scan_services();
-    scan_procs();
-    scan_ctfmon();
-    scan_files();
-    scan_wu();
-    scan_hosts();
-    scan_bj();
-    scan_windir();
+    if (!g_fcs_init) { InitializeCriticalSection(&g_fcs); g_fcs_init = 1; }
+    for (i = 0; i < 6; i++) {
+        th[i] = CreateThread(NULL, 0, scan_group, (LPVOID)(size_t)i, 0, NULL);
+        if (!th[i]) scan_group((LPVOID)(size_t)i); /* 建线程失败退化串行 */
+    }
+    for (i = 0; i < 6; i++) {
+        if (!th[i]) continue;
+        /* UI 线程等待期间继续泵消息: 界面不冻结, xlog 回显照常送达 */
+        while (MsgWaitForMultipleObjects(1, &th[i], FALSE, INFINITE, QS_ALLINPUT)
+               == WAIT_OBJECT_0 + 1) {
+            MSG m;
+            while (PeekMessageA(&m, NULL, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&m);
+                DispatchMessageA(&m);
+            }
+        }
+        CloseHandle(th[i]);
+    }
 }
 
 /* ---- 清除 ---- */
