@@ -521,11 +521,11 @@ public static class Scanner
     }
 
     // 白加黑: 每目录聚合 [有效签名EXE + 未签名DLL] — 对随机名称跨变种同样有效
-    private const uint WTD_UI_NONE = 1;
+    private const uint WTD_UI_NONE = 2;   // 1=WTD_UI_ALL 会弹"要运行此文件吗", 必须 2
     private const uint WTD_CHOICE_FILE = 1;
     private const uint WTD_STATEACTION_VERIFY = 1;
     private const uint WTD_STATEACTION_CLOSE = 2;
-    private const uint WTD_CACHE_ONLY_URL_RETRIEVAL = 0x10000;
+    private const uint WTD_CACHE_ONLY_URL_RETRIEVAL = 0x1000;
     private static readonly string[] WbWhitelist =
         { @"\programs\", @"\package cache\", @"\windowsapps\", @"\microsoft\", @"\windows\" };
 
