@@ -1218,6 +1218,24 @@ public static class Scanner
         catch { /* 注册表失败则退化为手动二段 */ }
     }
 
+    // 把扫描结果喂给驱动: DrvPaths (REG_MULTI_SZ) — SYSTEM_START 自启后每轮照单清理
+    private static void FeedDriverTargets(List<Finding> found)
+    {
+        var paths = found.Where(x => x.Kind == "FILE")
+            .Select(x => { int i = x.Detail.IndexOf(" ["); return i < 0 ? x.Detail : x.Detail[..i]; })
+            .Where(p => p.Length >= 4)
+            .Take(150)
+            .ToArray();
+        if (paths.Length == 0) return;
+        try
+        {
+            using var rk = Registry.LocalMachine.CreateSubKey(@"SOFTWARE\SFCleaner");
+            rk.SetValue("DrvPaths", paths, RegistryValueKind.MultiString);
+            Xlog($"nomore: DrvPaths 已写入 ({paths.Length} 项目标)");
+        }
+        catch { /* 注册表失败则驱动仅用内置清单 */ }
+    }
+
     // RunOnce 自动链专用: 只允许 phase2, marker 不在绝不重演 phase1
     public static void NomorePhase2Auto()
     {
@@ -1421,7 +1439,7 @@ public static class Scanner
         Run("sc", "stop", DrvSvc);
         Run("sc", "delete", DrvSvc);
         if (!Run("sc", "create", DrvSvc, $"binPath= System32\\drivers\\{DrvSvc}.sys",
-                 "type=", "kernel", "start=", "demand"))
+                 "type=", "kernel", "start=", "system"))
         {
             Xlog("nomore: [中止] sc create 失败");
             return false;
@@ -1434,10 +1452,10 @@ public static class Scanner
         AutorunDel(); // 先清 RunOnce, 防完成后残留条目把 phase1 再拉起来
         Xlog("nomore: phase2 - 先解除 testsigning (已装载驱动不受影响, 防后续异常残留)");
         Run("bcdedit", "/set", "testsigning", "off");
-        Xlog("nomore: phase2 start driver");
-        if (!Run("sc", "start", DrvSvc))
-            Xlog("nomore: [警告] 驱动未启动 — 常见: phase1 后没重启(testsigning 要重启生效) / Secure Boot / 证书未导入");
-        Thread.Sleep(10000);
+        Xlog("nomore: phase2 — 驱动应已随系统启动自载 (SYSTEM_START) 并完成多轮清扫");
+        if (!Run("cmd", "/c", $@"sc query {DrvSvc} | find ""RUNNING"""))
+            Xlog("nomore: [警告] 驱动未在运行 — 检查 testsigning 重启后是否生效 / Secure Boot");
+        Thread.Sleep(2000);
         Run("sc", "stop", DrvSvc);
         Run("sc", "delete", DrvSvc);
         try { File.Delete($@"C:\Windows\System32\drivers\{DrvSvc}.sys"); } catch { }
@@ -1461,6 +1479,8 @@ public static class Scanner
                 log?.Report("[!] 不客气模式未启动 — 详见日志: 常见 Secure Boot 开启 / 缺材料 / 证书导入失败");
                 return;
             }
+            var found = ScanAll();
+            FeedDriverTargets(found);
             MarkerSet(3);
             NomoreAutorunSet();
             log?.Report("[!!] 不客气模式已武装 — 蓝屏重启后 RunOnce 自动进 phase2 驱动清理");
