@@ -93,9 +93,6 @@ internal static partial class Native
     [DllImport("wintrust.dll", CharSet = CharSet.Unicode)]
     internal static extern int WinVerifyTrust(IntPtr hwnd, ref Guid actionId, ref WINTRUST_DATA data);
 
-    [DllImport("wintrust.dll", CharSet = CharSet.Unicode)]
-    internal static extern int WinVerifyTrust(IntPtr hwnd, ref Guid actionId, ref WINTRUST_CATALOG_INFO data);
-
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     internal static extern uint GetShortPathName(string lpszLongPath, StringBuilder lpszShortPath, uint cchBuffer);
 
@@ -533,7 +530,7 @@ public static class Scanner
                 using var sk = Registry.LocalMachine.OpenSubKey(
                     $@"SYSTEM\CurrentControlSet\Services\{svc}");
                 var start = Convert.ToInt32(sk?.GetValue("Start", 2));
-                if (start != 2)
+                if (start == 4) /* 仅禁用(4)才报; 3=demand 是 Win11 默认手动启动 */
                 {
                     res.Add(new Finding
                     {
@@ -626,11 +623,13 @@ public static class Scanner
     {
         const uint WTD_CHOICE_CATALOG = 2;
         if (!File.Exists(path)) return false;
+        // catalog 物理库 catroot\{F750E6C3-...} 对应 DRIVER_ACTION_VERIFY subsystem;
+        // GENERIC_VERIFY_V2 acquire 在 Win11 枚举不到系统 catalog → 双 GUID 都试
         IntPtr hCatAdmin = IntPtr.Zero;
+        var action = Native.WinTrustActionGenericVerifyV2;
+        var driverAction = new Guid("F750E6C3-38EE-11D1-85E5-00C04FC295EE");
         try
         {
-            var action = Native.WinTrustActionGenericVerifyV2;
-            if (!Native.CryptCATAdminAcquireContext(out hCatAdmin, ref action, 0)) return false;
             using var fs = File.OpenRead(path);
             var hash = new byte[100];
             uint cb = (uint)hash.Length;
@@ -638,34 +637,67 @@ public static class Scanner
                 || cb == 0 || cb > hash.Length) return false;
             var tag = new StringBuilder((int)cb * 2 + 1);
             for (int i = 0; i < cb; i++) tag.AppendFormat("{0:X2}", hash[i]);
-            IntPtr hCat = Native.CryptCATAdminEnumCatalogFromHash(hCatAdmin, hash, cb, 0, IntPtr.Zero);
-            if (hCat == IntPtr.Zero) return false;
-            try
+            foreach (var sub in new[] { driverAction, action })
             {
-                var ci = new Native.CATALOG_INFO { cbStruct = (uint)Marshal.SizeOf<Native.CATALOG_INFO>() };
-                if (!Native.CryptCATCatalogInfoFromContext(hCat, ref ci, 0)) return false;
-                var hashPtr = Marshal.AllocHGlobal(hash.Length);
-                try
+                var subGuid = sub;   // foreach 变量不能作 ref 实参 (CS1657)
+                if (!Native.CryptCATAdminAcquireContext(out hCatAdmin, ref subGuid, 0)) continue;
+                IntPtr hCat = Native.CryptCATAdminEnumCatalogFromHash(hCatAdmin, hash, cb, 0, IntPtr.Zero);
+                if (hCat != IntPtr.Zero)
                 {
-                    Marshal.Copy(hash, 0, hashPtr, hash.Length);
-                    var wci = new Native.WINTRUST_CATALOG_INFO
+                    try
                     {
-                        cbStruct = (uint)Marshal.SizeOf<Native.WINTRUST_CATALOG_INFO>(),
-                        dwCatalogVersion = 0,
-                        pcwszCatalogFilePath = ci.wszCatalogFile,
-                        pcwszMemberTag = tag.ToString(),
-                        pcwszMemberFilePath = path,
-                        hMemberFile = IntPtr.Zero,
-                        pbCalculatedFileHash = hashPtr,
-                        cbCalculatedFileHash = cb,
-                        pcCatalogContext = IntPtr.Zero,
-                    };
-                    int r = Native.WinVerifyTrust(IntPtr.Zero, ref action, ref wci);
-                    return r == 0;
+                        var ci = new Native.CATALOG_INFO { cbStruct = (uint)Marshal.SizeOf<Native.CATALOG_INFO>() };
+                        if (Native.CryptCATCatalogInfoFromContext(hCat, ref ci, 0))
+                        {
+                            // WinVerifyTrust 第三参必须是 WINTRUST_DATA: union choice 指向 catalog info
+                            var hashPtr = Marshal.AllocHGlobal(hash.Length);
+                            var wciPtr = Marshal.AllocHGlobal(Marshal.SizeOf<Native.WINTRUST_CATALOG_INFO>());
+                            try
+                            {
+                                Marshal.Copy(hash, 0, hashPtr, hash.Length);
+                                var wci = new Native.WINTRUST_CATALOG_INFO
+                                {
+                                    cbStruct = (uint)Marshal.SizeOf<Native.WINTRUST_CATALOG_INFO>(),
+                                    dwCatalogVersion = 0,
+                                    pcwszCatalogFilePath = ci.wszCatalogFile,
+                                    pcwszMemberTag = tag.ToString(),
+                                    pcwszMemberFilePath = path,
+                                    hMemberFile = IntPtr.Zero,
+                                    pbCalculatedFileHash = hashPtr,
+                                    cbCalculatedFileHash = cb,
+                                    pcCatalogContext = IntPtr.Zero,
+                                };
+                                Marshal.StructureToPtr(wci, wciPtr, false);
+                                var wd = new Native.WINTRUST_DATA
+                                {
+                                    cbStruct = (uint)Marshal.SizeOf<Native.WINTRUST_DATA>(),
+                                    pPolicyCallbackData = IntPtr.Zero,
+                                    pSIPClientData = IntPtr.Zero,
+                                    dwUIChoice = WTD_UI_NONE,
+                                    fdwRevocationChecks = 0,
+                                    dwUnionChoice = WTD_CHOICE_CATALOG,
+                                    pFile = wciPtr,
+                                    dwStateAction = WTD_STATEACTION_VERIFY,
+                                    hWVTStateData = IntPtr.Zero,
+                                    pwszURLReference = null,
+                                    dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL,
+                                    dwUIContext = 0,
+                                    pSignatureSettings = IntPtr.Zero,
+                                };
+                                int r = Native.WinVerifyTrust(IntPtr.Zero, ref action, ref wd);
+                                wd.dwStateAction = WTD_STATEACTION_CLOSE;
+                                Native.WinVerifyTrust(IntPtr.Zero, ref action, ref wd);
+                                if (r == 0) return true;
+                            }
+                            finally { Marshal.FreeHGlobal(hashPtr); Marshal.FreeHGlobal(wciPtr); }
+                        }
+                    }
+                    finally { Native.CryptCATAdminReleaseCatalogContext(hCatAdmin, hCat, 0); }
                 }
-                finally { Marshal.FreeHGlobal(hashPtr); }
+                Native.CryptCATAdminReleaseContext(hCatAdmin, 0);
+                hCatAdmin = IntPtr.Zero;
             }
-            finally { Native.CryptCATAdminReleaseCatalogContext(hCatAdmin, hCat, 0); }
+            return false;
         }
         catch { return false; }
         finally { if (hCatAdmin != IntPtr.Zero) Native.CryptCATAdminReleaseContext(hCatAdmin, 0); }
@@ -736,7 +768,7 @@ public static class Scanner
         "\\livekernelreports", "\\minidump", "\\prefetch", "\\appcompat",
         "\\apppatch", "\\csc", "\\diagnostics", "\\panther", "\\performance",
         "\\pla", "\\registration", "\\shellcomponents", "\\triage", "\\winstore",
-        "\\tokens", "\\csp",
+        "\\tokens", "\\csp", "\\msdtc",
     };
 
     private static int WdRandomName(string fnm) /* 0否 1pe 2bat */
