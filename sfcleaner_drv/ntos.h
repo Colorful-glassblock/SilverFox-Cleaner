@@ -1,7 +1,78 @@
 /* ntos.h — SFCleanerDrv 最小内核头 (x64)
  * 替代 WDK 的 ntddk.h, 仅声明本驱动所需类型/常量/原型, 使纯 MSVC (无 WDK) 可编译 */
 #pragma once
-#include <windows.h>
+#include <stddef.h>
+
+/* ---- 基础类型自补 (原由 windows.h 提供) ---- */
+typedef int            LONG;
+typedef unsigned long  ULONG;
+typedef unsigned short USHORT;
+typedef unsigned char  UCHAR;
+typedef UCHAR          *PUCHAR;
+#ifndef TRUE
+#define TRUE  1
+#endif
+#ifndef FALSE
+#define FALSE 0
+#define UNREFERENCED_PARAMETER(p) (p)
+#endif
+typedef short          SHORT;
+typedef unsigned long long ULONG_PTR;
+typedef unsigned long long ULONGLONG;
+typedef long long      LONGLONG;
+typedef void           *PVOID;
+typedef void           *HANDLE;
+typedef ULONG          *PULONG;
+typedef wchar_t        WCHAR;
+typedef WCHAR          *PWSTR;
+typedef const WCHAR    *PCWSTR;
+typedef int            BOOLEAN;
+typedef void           VOID;
+typedef HANDLE         *PHANDLE;
+typedef const char     *PCSTR;
+typedef char           *PCHAR;
+typedef char           CHAR;
+#ifndef FILE_WRITE_DATA
+#define FILE_WRITE_DATA          0x0002
+#endif
+#ifndef FILE_ATTRIBUTE_DIRECTORY
+#define FILE_ATTRIBUTE_DIRECTORY 0x00000010
+#endif
+#ifdef _MSC_VER
+#define __cdecl __cdecl
+#else
+#define __cdecl
+#endif
+typedef size_t         SIZE_T;
+
+#ifdef _MSC_VER
+#define NTAPI   __stdcall
+#ifndef NTSYSAPI
+#define NTSYSAPI __declspec(dllimport)
+#endif
+#else
+#define NTAPI                 /* 宿主语法检查环境无 __stdcall */
+#ifndef NTSYSAPI
+#define NTSYSAPI extern
+#endif
+#endif
+
+typedef union _LARGE_INTEGER {
+    struct { ULONG LowPart; LONG HighPart; } u;
+    LONGLONG QuadPart;
+} LARGE_INTEGER, *PLARGE_INTEGER;
+typedef int            LONG;
+typedef unsigned long  ULONG;
+typedef unsigned short USHORT;
+typedef unsigned char  UCHAR;
+typedef void           *PVOID;
+typedef void           *HANDLE;
+typedef unsigned long long ULONG_PTR;
+typedef ULONG          *PULONG;
+typedef wchar_t        WCHAR;
+typedef WCHAR          *PWSTR;
+typedef const WCHAR    *PCWSTR;
+typedef int            BOOLEAN;
 
 #ifdef __cplusplus
 extern "C" {
@@ -117,6 +188,26 @@ typedef struct _FILE_DISPOSITION_INFORMATION {
     BOOLEAN DeleteFile;
 } FILE_DISPOSITION_INFORMATION, *PFILE_DISPOSITION_INFORMATION;
 
+#define KeyFullInformation        0
+#define KeyBasicInformation       5
+#define KEY_ENUMERATE_SUBKEYS     0x0008
+typedef struct _KEY_FULL_INFORMATION {
+    LARGE_INTEGER LastWriteTime;
+    ULONG         TitleIndex;
+    ULONG         ClassOffset;
+    ULONG         ClassLength;
+    ULONG         MaxClassLength;
+    ULONG         SubKeys;
+    ULONG         MaxNameLen;
+    ULONG         MaxValueNameLen;
+    ULONG         MaxValueDataLen;
+} KEY_FULL_INFORMATION, *PKEY_FULL_INFORMATION;
+typedef struct _KEY_BASIC_INFORMATION {
+    LARGE_INTEGER LastWriteTime;
+    ULONG         TitleIndex;
+    ULONG         NameLength;
+    WCHAR         Name[1];
+} KEY_BASIC_INFORMATION, *PKEY_BASIC_INFORMATION;
 #define KeyValuePartialInformation 7
 #ifndef REG_MULTI_SZ
 #define REG_MULTI_SZ 7
@@ -232,10 +323,6 @@ typedef DRIVER_UNLOAD *PDRIVER_UNLOAD;
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath);
 
 /* ---- 内核导出原型 (x64, 与 ntoskrnl.def 对应) ---- */
-#ifndef NTSYSAPI
-#define NTSYSAPI __declspec(dllimport)
-#endif
-#define NTAPI    __stdcall
 
 NTSYSAPI VOID  NTAPI RtlInitUnicodeString(PUNICODE_STRING, PCWSTR);
 NTSYSAPI BOOLEAN NTAPI RtlEqualUnicodeString(PCUNICODE_STRING, PCUNICODE_STRING, BOOLEAN);
@@ -252,6 +339,8 @@ NTSYSAPI NTSTATUS NTAPI ZwOpenProcess(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, 
 NTSYSAPI NTSTATUS NTAPI ZwTerminateProcess(HANDLE, NTSTATUS);
 NTSYSAPI NTSTATUS NTAPI ZwDeleteFile(POBJECT_ATTRIBUTES);
 NTSYSAPI NTSTATUS NTAPI ZwDeleteKey(HANDLE);
+NTSYSAPI NTSTATUS NTAPI ZwQueryKey(HANDLE, ULONG, PVOID, ULONG, PULONG);
+NTSYSAPI NTSTATUS NTAPI ZwEnumerateKey(HANDLE, ULONG, ULONG, PVOID, ULONG, PULONG);
 NTSYSAPI NTSTATUS NTAPI ZwReadFile(HANDLE, HANDLE, PVOID, PVOID, PIO_STATUS_BLOCK,
                     PVOID, ULONG, PLARGE_INTEGER, PULONG);
 NTSYSAPI NTSTATUS NTAPI ZwDuplicateObject(HANDLE, HANDLE, HANDLE, PHANDLE, ACCESS_MASK, ULONG, ULONG);
@@ -266,7 +355,7 @@ NTSYSAPI NTSTATUS NTAPI ZwDuplicateObjectEx(HANDLE, HANDLE, HANDLE, PHANDLE, ACC
 #ifndef PROCESS_DUP_HANDLE
 #define PROCESS_DUP_HANDLE              0x0040L
 #endif
-typedef struct _SFC_SEC_OBJ { PVOID Data; PVOID SharedCacheMap; PVOID ImageSectionObject; } SFC_SEC_OBJ, *PSFC_SEC_OBJ;
+typedef struct _SFC_SEC_OBJ { PVOID DataSectionObject; PVOID SharedCacheMap; PVOID ImageSectionObject; } SFC_SEC_OBJ, *PSFC_SEC_OBJ;
 typedef struct _SFC_FILE_OBJECT {   /* FILE_OBJECT 头部视图 (x64, SectionObjectPointer@40 稳定) */
     SHORT  Type;
     SHORT  Size;
