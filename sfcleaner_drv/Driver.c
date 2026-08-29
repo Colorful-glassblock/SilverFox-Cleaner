@@ -4,12 +4,15 @@
  *   cl.exe /c /GS- /Gs- /kernel Driver.c
  *   link.exe /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /DRIVER ntoskrnl.lib bufferoverflowfastfailk.lib Driver.obj
  * 签名: 测试证书 SignTool sign /v /fd sha256 /a SFCleanerDrv.sys → 或 inf2cat+makecert 链
- * 行为: 读取 HKLM\SOFTWARE\SFCleaner\DrvTargets
- *        - DrvPaths (MULTI_SZ): 逐个强删 (忽略锁定句柄, 驱逐+删除)
- *        - DrvProcs (MULTI_SZ): 按进程名枚举并 ZwTerminateProcess
- *        无配置时按内置银狐特征清理:
- *        - 路径: C:\Drivers\* (EkxZJr / dd9OCGeD / itqe.* / *.xlez / drivers.dat*)
- *        - 进程: srl.exe
+ * 行为 (完全自足, 不读任何注册表配置):
+ *        内建检测器每 2s 一轮 × 15 分钟 (SYSTEM_START 加载, 早于恶意软件):
+ *        - 进程: 终止 srl.exe / itqe.exe
+ *        - 路径: C:\Drivers 整树 (EkxZJr / dd9OCGeD / WJ / drivers.dat*)
+ *        - H+S 属性可执行: C:\Users\*\AppData + C:\ProgramData 走树
+ *        - 随机名 bat: C:\Windows 根, 内容校验后删
+ *        - 计划任务: System32\Tasks 内容引用恶意路径 → 删
+ *        - 服务黑名单键: vafdska / MiniFilterDrv / vmservice / ... → ZwDeleteKey
+ *        删除梯: 直接删 → delete-pending+FSCTL 清零 → SUPERSEDE → 全系统拔柄 → 强拆映射段
  * 注意: 仅限授权研究环境; 与用户态 SFCleaner 的 --nomore 配套
  * ==========================================================================*/
 #include "ntos.h"
@@ -34,44 +37,6 @@ static inline ULONG strnlen_w(const WCHAR *s, ULONG max)
 static void drv_reg_close(HANDLE h)
 {
     if (h) ZwClose(h);
-}
-
-/* 读 MULTI_SZ: 返回 PAGED 池缓冲, 调用方 ExFreePoolWithTag */
-static PWSTR drv_reg_read_msz(PCWSTR valueName, ULONG *cbOut)
-{
-    UNICODE_STRING path;
-    OBJECT_ATTRIBUTES oa;
-    HANDLE hKey = NULL;
-    PKEY_VALUE_PARTIAL_INFORMATION pi = NULL;
-    PWSTR out = NULL;
-    ULONG len = 0, need = 256;
-    NTSTATUS st;
-
-    RtlInitUnicodeString(&path, REG_KEY_PATH);
-    InitializeObjectAttributes(&oa, &path, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-    st = ZwOpenKey(&hKey, KEY_READ, &oa);
-    if (!NT_SUCCESS(st)) return NULL;
-
-    st = STATUS_BUFFER_TOO_SMALL;
-    while (st == STATUS_BUFFER_TOO_SMALL || st == STATUS_BUFFER_OVERFLOW) {
-        if (pi) ExFreePoolWithTag(pi, 'fcsD');
-        pi = (PKEY_VALUE_PARTIAL_INFORMATION)ExAllocatePoolWithTag(PagedPool, need, 'fcsD');
-        if (!pi) break;
-        RtlInitUnicodeString(&path, (PWSTR)valueName);
-        st = ZwQueryValueKey(hKey, &path, KeyValuePartialInformation, pi, need, &need);
-        if (NT_SUCCESS(st) && pi->Type == REG_MULTI_SZ && pi->DataLength > 4) {
-            out = (PWSTR)ExAllocatePoolWithTag(PagedPool, pi->DataLength, 'fcsD');
-            if (out) {
-                RtlCopyMemory(out, pi->Data, pi->DataLength);
-                *cbOut = pi->DataLength;
-            }
-            break;
-        }
-        if (st != STATUS_BUFFER_TOO_SMALL && st != STATUS_BUFFER_OVERFLOW) break;
-    }
-    if (pi) ExFreePoolWithTag(pi, 'fcsD');
-    drv_reg_close(hKey);
-    return out;
 }
 
 /* 按名找 PID → ZwOpenProcess → ZwTerminateProcess */
@@ -574,7 +539,7 @@ static void drv_scan_windir_bats(void)
                     drv_tail_eqi(di->FileName, nlen, L".bat") &&
                     drv_is_random_wc(di->FileName, nlen - 4, 6, 16)) {
                     WCHAR full[600];
-                    ULONG bl = 10; /* \??\C:\Windows */
+                    ULONG bl = 14; /* \??\C:\Windows */
                     RtlCopyMemory(full, L"\\??\\C:\\Windows", bl * sizeof(WCHAR));
                     full[bl] = L'\\';
                     RtlCopyMemory(full + bl + 1, di->FileName, nlen * sizeof(WCHAR));
@@ -647,7 +612,7 @@ static void drv_del_service_key(PCWSTR name)
 {
     WCHAR full[200];
     UNICODE_STRING us; OBJECT_ATTRIBUTES oa; HANDLE h = NULL; NTSTATUS st;
-    ULONG bl = 49; /* \Registry\Machine\SYSTEM\CurrentControlSet\Services\ */
+    ULONG bl = 52; /* \Registry\Machine\SYSTEM\CurrentControlSet\Services\ */
     ULONG nl = drv_wcslen(name);
     RtlCopyMemory(full, L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\", bl * sizeof(WCHAR));
     RtlCopyMemory(full + bl, name, nl * sizeof(WCHAR));
@@ -677,24 +642,12 @@ static HANDLE g_Thread = NULL;
 
 static void drv_sweep_once(void)
 {
-    PWSTR paths, procs, p;
-    ULONG cb;
-
-    procs = drv_reg_read_msz(L"DrvProcs", &cb);
-    if (procs) {
-        for (p = procs; *p; p += drv_wcslen(p) + 1) drv_kill_by_name(p);
-        ExFreePoolWithTag(procs, 'fcsD');
-    }
+    /* 纯内建: 不读任何注册表配置 (DrvPaths 通道已移除 — 恶意软件可反向利用
+       该通道指鹿为马让驱动删系统文件), 目标全部由内建检测器现场判定 */
     drv_kill_by_name(L"srl.exe");
     drv_kill_by_name(L"itqe.exe");
-
-    paths = drv_reg_read_msz(L"DrvPaths", &cb);
-    if (paths) {
-        for (p = paths; *p; p += drv_wcslen(p) + 1) drv_delete_file(p);
-        ExFreePoolWithTag(paths, 'fcsD');
-    }
     drv_wipe_subtree(NULL);
-    drv_builtin_scan();   /* 内建检测: 不依赖注册表喂单, 防 DrvPaths 被篡改 */
+    drv_builtin_scan();
 }
 
 static VOID NTAPI SfcThreadStart(PVOID ctx)
@@ -702,6 +655,8 @@ static VOID NTAPI SfcThreadStart(PVOID ctx)
     int passes = 0;
     LARGE_INTEGER iv;
     (void)ctx;
+    iv.QuadPart = -50000000LL;               /* 首轮前 5s: 等 smss 阶段完全就绪 */
+    KeWaitForSingleObject(&g_StopEvent, Executive, KernelMode, FALSE, &iv);
     for (;;) {
         drv_sweep_once();
         if (++passes >= 450) break;          /* 2s × 450 ≈ 15 分钟 */
@@ -734,11 +689,17 @@ DRIVER_UNLOAD DrvUnload;
 VOID DrvUnload(PDRIVER_OBJECT d)
 {
     LARGE_INTEGER iv;
+    PVOID tobj = NULL;
     UNREFERENCED_PARAMETER(d);
     KeSetEvent(&g_StopEvent, 0, FALSE);
     if (g_Thread) {
-        iv.QuadPart = -100000000LL;   /* 最多等 10s 让清扫线程退出 */
-        KeWaitForSingleObject(g_Thread, Executive, KernelMode, FALSE, &iv);
+        /* ★ PsCreateSystemThread 返回的是句柄; KeWaitForSingleObject 要对象指针.
+           直接把句柄值当指针解引用 = IRQL_NOT_LESS_OR_EQUAL (登录期 phase2 停驱动的 BSOD 根因) */
+        if (NT_SUCCESS(ObReferenceObjectByHandle(g_Thread, SYNCHRONIZE, NULL, KernelMode, &tobj, NULL))) {
+            iv.QuadPart = -100000000LL;   /* 最多等 10s 让清扫线程退出 */
+            KeWaitForSingleObject(tobj, Executive, KernelMode, FALSE, &iv);
+            ObDereferenceObject(tobj);
+        }
         ZwClose(g_Thread);
         g_Thread = NULL;
     }
