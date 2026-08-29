@@ -518,7 +518,7 @@ fn wb_dir(dir: &Path, depth: usize, out: &mut Vec<Finding>) {
 }
 
 /* ---- %WINDIR% 随机名 PE/bat 检测 ---- */
-const WD_SKIP: [&str; 37] = [
+const WD_SKIP: [&str; 38] = [
     "\\winsxs", "\\softwaredistribution", "\\driverstore", "\\installer",
     "\\assembly", "\\microsoft.net", "\\servicing", "\\logfiles", "\\logs",
     "\\spool", "\\catroot", "\\fonts", "\\media", "\\ime", "\\web",
@@ -526,7 +526,7 @@ const WD_SKIP: [&str; 37] = [
     "\\livekernelreports", "\\minidump", "\\prefetch", "\\appcompat",
     "\\apppatch", "\\csc", "\\diagnostics", "\\panther", "\\performance",
     "\\pla", "\\registration", "\\shellcomponents", "\\triage", "\\winstore",
-    "\\tokens", "\\csp",
+    "\\tokens", "\\csp", "\\msdtc",
 ];
 
 fn wd_random_name(fnm: &str) -> Option<bool> /* Some(true)=PE Some(false)=bat None=不匹配 */ {
