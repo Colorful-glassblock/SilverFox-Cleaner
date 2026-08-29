@@ -174,9 +174,13 @@ fn scan_all() -> Vec<Finding> {
         let mut f = scan_files();
         f.extend(scan_hosts());
         f.extend(scan_wu());
-        f.extend(scan_wb());
-        f.extend(scan_windir());
         r3.lock().unwrap().extend(f);
+    }));
+    let r4 = Arc::clone(&results);
+    handles.push(thread::spawn(move || {
+        let mut f = scan_wb();
+        f.extend(scan_windir());
+        r4.lock().unwrap().extend(f);
     }));
     for h in handles { h.join().unwrap(); }
     let mut out = results.lock().unwrap().clone();
@@ -375,9 +379,9 @@ fn wb_dir(dir: &Path, depth: usize, out: &mut Vec<Finding>) {
     if low.contains("sf_quarantine") { return; }
     const WL: [&str; 5] = ["\\programs\\", "\\package cache\\", "\\windowsapps\\", "\\microsoft\\", "\\windows\\"];
     if WL.iter().any(|w| low.contains(w)) { return; }
-    let mut se = false;
-    let mut ud = false;
-    let mut hit: Option<PathBuf> = None;
+    /* 枚举先行: 无 exe 或无 dll 的目录 (绝大多数) 0 次验签; 配对才查, 找到即停 */
+    let mut exes: Vec<PathBuf> = Vec::new();
+    let mut dlls: Vec<PathBuf> = Vec::new();
     let mut subs: Vec<PathBuf> = Vec::new();
     if let Ok(rd) = fs::read_dir(dir) {
         for e in rd.flatten() {
@@ -389,18 +393,24 @@ fn wb_dir(dir: &Path, depth: usize, out: &mut Vec<Finding>) {
             }
             let p = e.path();
             let fnm = p.file_name().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
-            if fnm.ends_with(".exe") && !se && wb_is_signed(&p) { se = true; }
-            else if fnm.ends_with(".dll") && !ud && !wb_is_signed(&p) { ud = true; hit = Some(p); }
+            if fnm.ends_with(".exe") {
+                if exes.len() < 24 { exes.push(p); }
+            } else if fnm.ends_with(".dll") {
+                if dlls.len() < 64 { dlls.push(p); }
+            }
         }
     }
-    if se && ud {
-        if let Some(h) = hit {
-            out.push(Finding {
-                kind: "FILE".into(),
-                detail: format!("{} [白加黑: 有效签名EXE+未签名DLL]", h.display()),
-                high: false,
-                action: format!("quarantine {}", h.display()),
-            });
+    if !exes.is_empty() && !dlls.is_empty() {
+        let se = exes.iter().any(|e| wb_is_signed(e));
+        if se {
+            if let Some(h) = dlls.iter().find(|d| !wb_is_signed(d)) {
+                out.push(Finding {
+                    kind: "FILE".into(),
+                    detail: format!("{} [白加黑: 有效签名EXE+未签名DLL]", h.display()),
+                    high: false,
+                    action: format!("quarantine {}", h.display()),
+                });
+            }
         }
     }
     for s in subs { wb_dir(&s, depth + 1, out); }
