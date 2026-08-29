@@ -255,12 +255,16 @@ public static class Scanner
             var f = ScanFiles();
             f.AddRange(ScanHosts());
             f.AddRange(ScanWu());
-            f.AddRange(ScanWb());
+            return f;
+        });
+        var t4 = Task.Run(() =>
+        {
+            var f = ScanWb();
             f.AddRange(ScanWd());
             return f;
         });
-        Task.WaitAll(t1, t2, t3);
-        var all = t1.Result.Concat(t2.Result).Concat(t3.Result).ToList();
+        Task.WaitAll(t1, t2, t3, t4);
+        var all = t1.Result.Concat(t2.Result).Concat(t3.Result).Concat(t4.Result).ToList();
         all.Sort((a, b) => b.High.CompareTo(a.High));
         return all;
     }
@@ -578,9 +582,10 @@ public static class Scanner
         if (depth > 4) return;
         string low = dir.ToLowerInvariant();
         if (low.Contains("sf_quarantine") || WbWhitelist.Any(w => low.Contains(w))) return;
-        bool se = false, ud = false;
-        string? hit = null;
-        List<string> subs = new();
+        /* 枚举先行: 无 exe 或无 dll 的目录 (绝大多数) 0 次验签; 配对才查, 找到即停 */
+        var exes = new List<string>(24);
+        var dlls = new List<string>(64);
+        var subs = new List<string>();
         string[] entries;
         try { entries = Directory.GetFileSystemEntries(dir); } catch { return; }
         foreach (var e in entries)
@@ -593,17 +598,25 @@ public static class Scanner
                 continue;
             }
             string fnm = Path.GetFileName(e).ToLowerInvariant();
-            if (fnm.EndsWith(".exe") && !se && IsValidSigned(e)) se = true;
-            else if (fnm.EndsWith(".dll") && !ud && !IsValidSigned(e)) { ud = true; hit = e; }
+            if (fnm.EndsWith(".exe")) { if (exes.Count < 24) exes.Add(e); }
+            else if (fnm.EndsWith(".dll")) { if (dlls.Count < 64) dlls.Add(e); }
         }
-        if (se && ud && hit != null)
-            res.Add(new Finding
+        if (exes.Count > 0 && dlls.Count > 0)
+        {
+            bool se = exes.Any(IsValidSigned);
+            if (se)
             {
-                Kind = "FILE",
-                Detail = $"{hit} [白加黑: 有效签名EXE+未签名DLL]",
-                High = false,
-                Action = $"quarantine {hit}",
-            });
+                string? hit = dlls.FirstOrDefault(d => !IsValidSigned(d));
+                if (hit != null)
+                    res.Add(new Finding
+                    {
+                        Kind = "FILE",
+                        Detail = $"{hit} [白加黑: 有效签名EXE+未签名DLL]",
+                        High = false,
+                        Action = $"quarantine {hit}",
+                    });
+            }
+        }
         foreach (var sd in subs) ScanWbDir(sd, depth + 1, res);
     }
 
@@ -1062,6 +1075,29 @@ public static class Scanner
     }
 
     // 安全模式启动 (safeboot minimal; 安全模式下 UAC 禁用 → 阶段二可改回)
+    // 不客气 phase2 自启动: RunOnce 一次性 (普通登录 + 安全模式), 短路径消歧义
+    private static void NomoreAutorunSet()
+    {
+        var exe = Environment.ProcessPath ?? "";
+        var shortBuf = new StringBuilder(520);
+        uint n = Native.GetShortPathName(exe, shortBuf, 520);
+        var data = n > 0 && n < 520 ? $"{shortBuf} --nomore2" : $"\"{exe}\" --nomore2";
+        try
+        {
+            using var ro = Registry.LocalMachine.CreateSubKey(RunOnceKeyPath);
+            ro.SetValue("SFCleaner", data);
+            ro.SetValue("*SFCleaner", data);
+        }
+        catch { /* 注册表失败则退化为手动二段 */ }
+    }
+
+    // RunOnce 自动链专用: 只允许 phase2, marker 不在绝不重演 phase1
+    public static void NomorePhase2Auto()
+    {
+        EnablePrivileges();
+        if (MarkerGet() == 3) NomorePhase2();
+    }
+
     private static void SafebootSet() => Run("bcdedit", "/set", "{current}", "safeboot", "minimal");
     private static void SafebootClear() => Run("bcdedit", "/deletevalue", "{current}", "safeboot");
 
@@ -1077,6 +1113,7 @@ public static class Scanner
         try
         {
             using var ro = Registry.LocalMachine.OpenSubKey(RunOnceKeyPath, writable: true);
+            ro?.DeleteValue("SFCleaner", throwOnMissingValue: false);
             ro?.DeleteValue("*SFCleaner", throwOnMissingValue: false);
         }
         catch { /* 已不存在 */ }
@@ -1267,6 +1304,7 @@ public static class Scanner
 
     private static void NomorePhase2()
     {
+        AutorunDel(); // 先清 RunOnce, 防完成后残留条目把 phase1 再拉起来
         Xlog("nomore: phase2 - 先解除 testsigning (已装载驱动不受影响, 防后续异常残留)");
         Run("bcdedit", "/set", "testsigning", "off");
         Xlog("nomore: phase2 start driver");
@@ -1297,11 +1335,12 @@ public static class Scanner
                 return;
             }
             MarkerSet(3);
-            log?.Report("[!!] 不客气模式已武装 — 蓝屏重启后驱动清理");
-            Xlog("nomore: phase1 done, bsod (testsigning 生效需重启)");
+            NomoreAutorunSet();
+            log?.Report("[!!] 不客气模式已武装 — 蓝屏重启后 RunOnce 自动进 phase2 驱动清理");
+            Xlog("nomore: phase1 done, bsod (testsigning 生效需重启; 重启后 RunOnce 自动进 phase2)");
             Thread.Sleep(1200);
             if (!TriggerBsod())
-                log?.Report("[!] 蓝屏触发失败 — 请手动重启, testsigning 需重启生效; 重启后再运行一次不客气模式即进入 phase2");
+                log?.Report("[!] 蓝屏触发失败 — 请手动重启; 重启登录后自动进入 phase2 (RunOnce), 未弹出也可手动再运行一次");
         }
     }
 }
