@@ -15,6 +15,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <wintrust.h>
+#include <softpub.h>
 
 /* ---- 常量 ---- */
 #define QUAR_ROOT   "C:\\ProgramData\\sf_quarantine"
@@ -599,6 +601,99 @@ static void scan_files(void)
     }
 }
 
+/* ---- 白加黑检测: 同目录 [有效签名EXE + 未签名DLL] (跨变种结构特征) ---- */
+static int bj_is_signed(const char *path)
+{
+    WINTRUST_FILE_INFO fi;
+    WINTRUST_DATA wd;
+    GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    wchar_t wpath[MAX_PATH];
+    LONG res;
+    memset(&fi, 0, sizeof fi);
+    memset(&wd, 0, sizeof wd);
+    MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, MAX_PATH);
+    fi.cbStruct = sizeof fi;
+    fi.pcwszFilePath = wpath;
+    wd.cbStruct = sizeof wd;
+    wd.dwUIChoice = WTD_UI_NONE;
+    wd.fdwRevocationChecks = WTD_REVOKE_NONE;
+    wd.dwUnionChoice = WTD_CHOICE_FILE;
+    wd.pFile = &fi;
+    wd.dwStateAction = WTD_STATEACTION_VERIFY;
+    res = WinVerifyTrust(NULL, &action, &wd);
+    wd.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(NULL, &action, &wd);
+    return res == 0;
+}
+
+static void bj_scan_dir(const char *dir, int depth)
+{
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    char pat[MAX_PATH], full[MAX_PATH];
+    int se = 0, ud = 0;
+    int has_dll = 0;
+    static char hitbuf[MAX_PATH];
+    static const char *wls[5] = {"\\programs\\", "\\package cache\\", "\\windowsapps\\", "\\microsoft\\", "\\windows\\"};
+    int w;
+    if (depth > 4) return;
+    {
+        static char lowq[1024]; /* 先 lower 再判, 隔离区目录本身要跳过 */
+        unsigned int m = (unsigned int)(strlen(dir) < sizeof lowq - 1 ? strlen(dir) : sizeof lowq - 2);
+        memcpy(lowq, dir, m); lowq[m] = 0;
+        str_lower(lowq);
+        if (strstr(lowq, "sf_quarantine")) return;
+        for (w = 0; w < 5; w++)   /* 正规软件目录白名单: 显著降低 QQ/微信等未签名DLL误报 */
+            if (strstr(lowq, wls[w])) return;
+    }
+    _snprintf(pat, sizeof pat - 1, "%s\\*", dir); pat[sizeof pat - 1] = 0;
+    h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        size_t fl;
+        char low[64];
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+        _snprintf(full, sizeof full - 1, "%s\\%s", dir, fd.cFileName);
+        full[sizeof full - 1] = 0;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) bj_scan_dir(full, depth + 1);
+            continue;
+        }
+        strncpy(low, fd.cFileName, 63); low[63] = 0;
+        str_lower(low);
+        fl = strlen(low);
+        if (fl > 4 && !_stricmp(low + fl - 4, ".exe")) {
+            if (!se && bj_is_signed(full)) se = 1;   /* 找到即停, 避免大目录重复验签 */
+        } else if (fl > 4 && !_stricmp(low + fl - 4, ".dll")) {
+            if (!ud && !bj_is_signed(full)) {
+                strncpy(hitbuf, full, sizeof hitbuf - 1);
+                hitbuf[sizeof hitbuf - 1] = 0;
+                has_dll = 1;
+                ud = 1;
+            }
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    if (se && ud && has_dll) {
+        char det[MAX_PATH + 64], act[MAX_PATH + 16];
+        _snprintf(det, sizeof det - 1, "%s [白加黑: 有效签名EXE+未签名DLL]", hitbuf);
+        _snprintf(act, sizeof act - 1, "quarantine %s", hitbuf);
+        addf("FILE", 0, det, act);
+    }
+}
+
+static void scan_bj(void)
+{
+    char roots[8][MAX_PATH]; int nroots = 0, r;
+    static const char *envs[] = {"TEMP", "APPDATA", "LOCALAPPDATA", "ProgramData"};
+    strcpy(roots[nroots++], "C:\\Drivers");
+    for (r = 0; r < 4; r++) {
+        char *v = getenv(envs[r]);
+        if (v && *v && nroots < 8) strncpy(roots[nroots++], v, MAX_PATH - 1);
+    }
+    for (r = 0; r < nroots; r++) bj_scan_dir(roots[r], 0);
+}
+
 /* 默认 hosts 内容 (Windows 出厂样式) */
 static const char *DEFAULT_HOSTS =
     "# Copyright (c) 1993-2009 Microsoft Corp.\r\n"
@@ -678,6 +773,7 @@ static void scan_all(void)
     scan_files();
     scan_wu();
     scan_hosts();
+    scan_bj();
 }
 
 /* ---- 清除 ---- */

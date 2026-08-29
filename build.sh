@@ -12,12 +12,12 @@ FLAGS="-O2 -s -Wall -Wno-pointer-sign \
 echo "[1/2] x86  (UCRT, subsystem 6.1, requireAdministrator manifest)"
 i686-w64-mingw32-windres -o /tmp/mf32.o sfcleaner.rc
 i686-w64-mingw32-gcc $FLAGS -march=i686 -Wl,--major-subsystem-version,6 -Wl,--minor-subsystem-version,1 \
-  -o "$OUT/SFCleaner_x86.exe" sfcleaner.c /tmp/mf32.o
+  -o "$OUT/SFCleaner_x86.exe" sfcleaner.c /tmp/mf32.o -lwintrust
 
 echo "[2/2] x64"
 x86_64-w64-mingw32-windres -o /tmp/mf64.o sfcleaner.rc
 x86_64-w64-mingw32-gcc $FLAGS -Wl,--major-subsystem-version,6 -Wl,--minor-subsystem-version,1 \
-  -o "$OUT/SFCleaner_x64.exe" sfcleaner.c /tmp/mf64.o
+  -o "$OUT/SFCleaner_x64.exe" sfcleaner.c /tmp/mf64.o -lwintrust
 
 echo "--- imports (预期含 api-ms-win-crt-*, NT6+ 目标机需带 UCRT) ---"
 i686-w64-mingw32-objdump -p "$OUT/SFCleaner_x86.exe" | grep "DLL Name"

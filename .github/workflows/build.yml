@@ -45,11 +45,11 @@ jobs:
       - name: Build x86
         run: |
           i686-w64-mingw32-windres -o /tmp/mf32.o sfcleaner.rc
-          i686-w64-mingw32-gcc -O2 -s -Wall -Wno-pointer-sign -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 -finput-charset=UTF-8 -fexec-charset=GBK -mwindows -march=i686 -Wl,--major-subsystem-version,6 -Wl,--minor-subsystem-version,1 -o SFCleaner_x86.exe sfcleaner.c /tmp/mf32.o
+          i686-w64-mingw32-gcc -O2 -s -Wall -Wno-pointer-sign -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 -finput-charset=UTF-8 -fexec-charset=GBK -mwindows -march=i686 -Wl,--major-subsystem-version,6 -Wl,--minor-subsystem-version,1 -o SFCleaner_x86.exe sfcleaner.c /tmp/mf32.o -lwintrust
       - name: Build x64
         run: |
           x86_64-w64-mingw32-windres -o /tmp/mf64.o sfcleaner.rc
-          x86_64-w64-mingw32-gcc -O2 -s -Wall -Wno-pointer-sign -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 -finput-charset=UTF-8 -fexec-charset=GBK -mwindows -Wl,--major-subsystem-version,6 -Wl,--minor-subsystem-version,1 -o SFCleaner_x64.exe sfcleaner.c /tmp/mf64.o
+          x86_64-w64-mingw32-gcc -O2 -s -Wall -Wno-pointer-sign -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 -finput-charset=UTF-8 -fexec-charset=GBK -mwindows -Wl,--major-subsystem-version,6 -Wl,--minor-subsystem-version,1 -o SFCleaner_x64.exe sfcleaner.c /tmp/mf64.o -lwintrust
       - uses: actions/upload-artifact@v4
         with:
           name: SFCleaner-C-exe
