@@ -253,6 +253,7 @@ public static class Scanner
             f.AddRange(ScanHosts());
             f.AddRange(ScanWu());
             f.AddRange(ScanWb());
+            f.AddRange(ScanWd());
             return f;
         });
         Task.WaitAll(t1, t2, t3);
@@ -612,6 +613,78 @@ public static class Scanner
         AddEnv(roots, "LOCALAPPDATA");
         AddEnv(roots, "ProgramData");
         foreach (var root in roots.Where(Directory.Exists)) ScanWbDir(root, 0, res);
+        return res;
+    }
+
+    // ---- %WINDIR% 随机名 PE/bat 检测 (随机名+未签名双条件) ----
+    private static readonly string[] WdSkip =
+    {
+        "\\winsxs", "\\softwaredistribution", "\\driverstore", "\\installer",
+        "\\assembly", "\\microsoft.net", "\\servicing", "\\logfiles", "\\logs",
+        "\\spool", "\\catroot", "\\fonts", "\\media", "\\ime", "\\web",
+        "\\wallpaper", "\\oledb", "\\mui", "\\ehome", "\\pchealth", "\\resources",
+        "\\livekernelreports", "\\minidump", "\\prefetch", "\\appcompat",
+        "\\apppatch", "\\csc", "\\diagnostics", "\\panther", "\\performance",
+        "\\pla", "\\registration", "\\shellcomponents", "\\triage", "\\winstore",
+        "\\tokens", "\\csp",
+    };
+
+    private static int WdRandomName(string fnm) /* 0否 1pe 2bat */
+    {
+        int dot = fnm.LastIndexOf('.');
+        if (dot < 0) return 0;
+        string ext = fnm[dot..].ToLowerInvariant();
+        bool isPe = ext is ".exe" or ".dll" or ".sys";
+        if (!isPe && ext != ".bat") return 0;
+        string baseName = fnm[..dot];
+        if (baseName.Length < 6 || baseName.Length > 16) return 0;
+        int dig = 0, up = 0;
+        foreach (var c in baseName)
+        {
+            if (char.IsAsciiDigit(c)) dig++;
+            else if (char.IsAsciiUpper(c)) up++;
+            else if (char.IsAsciiLower(c)) continue;
+            else return 0;
+        }
+        if (!isPe) return 2;
+        if (dig >= 2 || up > 0 || baseName.Length >= 8) return 1;
+        return 0;
+    }
+
+    private static void WdScanDir(string dir, int depth, List<Finding> res)
+    {
+        if (depth > 4) return;
+        string low = dir.ToLowerInvariant();
+        if (WdSkip.Any(w => low.Contains(w))) return;
+        string[] entries;
+        try { entries = Directory.GetFileSystemEntries(dir); } catch { return; }
+        foreach (var e in entries)
+        {
+            FileAttributes fa;
+            try { fa = File.GetAttributes(e); } catch { continue; }
+            if (fa.HasFlag(FileAttributes.Directory))
+            {
+                if (!fa.HasFlag(FileAttributes.ReparsePoint)) WdScanDir(e, depth + 1, res);
+                continue;
+            }
+            int rt = WdRandomName(Path.GetFileName(e));
+            if (rt == 0) continue;
+            if (rt == 1 && IsValidSigned(e)) continue;   // 随机名但签名有效 → 放行
+            res.Add(new Finding
+            {
+                Kind = "FILE",
+                Detail = $"{e} [{(rt == 1 ? "随机名未签名PE" : "随机名bat")}]",
+                High = true,
+                Action = $"quarantine {e}",
+            });
+        }
+    }
+
+    public static List<Finding> ScanWd()
+    {
+        var res = new List<Finding>();
+        string wd = Environment.GetEnvironmentVariable("WINDIR") ?? @"C:\Windows";
+        WdScanDir(wd, 0, res);
         return res;
     }
 
@@ -1135,6 +1208,17 @@ public static class Scanner
         return false;
     }
 
+    private static bool SecureBootOn()
+    {
+        // HKLM\...\SecureBoot\State\UEFISecureBootEnabled == 1 (无键 = 非 UEFI/未启用)
+        try
+        {
+            using var k = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Control\SecureBoot\State");
+            return k?.GetValue("UEFISecureBootEnabled") is int v && v == 1;
+        }
+        catch { return false; }
+    }
+
     private static bool NomorePhase1()
     {
         var (drv, pfx, cer) = NomorePaths();
@@ -1144,6 +1228,12 @@ public static class Scanner
         if (!File.Exists(pfx) && !File.Exists(cer))
         { Xlog($"nomore: [中止] 缺证书材料 ({pfx} 或 {cer})"); return false; }
 
+        if (SecureBootOn())
+        {
+            Xlog("nomore: [中止] Secure Boot 开启 — testsigning 会被安全启动策略拒绝");
+            Xlog("nomore: VMware: 虚拟机设置->选项->高级->固件类型UEFI, 取消勾选'启用安全引导'后重启 VM");
+            return false;
+        }
         Xlog("nomore: testsigning on");
         if (!Run("bcdedit", "/set", "testsigning", "on"))
         {
