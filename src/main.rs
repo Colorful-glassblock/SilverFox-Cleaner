@@ -31,11 +31,6 @@ extern "system" {
 }
 #[link(name = "advapi32")]
 extern "system" {
-    fn RegCreateKeyExW(h: isize, sub: *const u16, res: u32, cls: *const u16, opt: u32,
-                       sam: u32, sec: *const u8, out: *mut isize, disp: *mut u32) -> i32;
-    fn RegSetValueExW(h: isize, name: *const u16, res: u32, typ: u32,
-                      data: *const u8, cb: u32) -> i32;
-    fn RegCloseKey(h: isize) -> i32;
     fn OpenProcessToken(ph: isize, a: u32, t: *mut isize) -> i32;
     fn LookupPrivilegeValueW(s: *const u16, n: *const u16, l: *mut u64) -> i32;
     fn AdjustTokenPrivileges(t: isize, d: i32, n: *const u8, l: u32, p: *mut u8, r: *mut u32) -> i32;
@@ -124,9 +119,7 @@ const MEM_COMMIT: u32 = 0x1000;
 const TOKEN_ADJUST: u32 = 0x20;
 const TOKEN_QUERY: u32 = 0x8;
 const SE_ENABLED: u32 = 2;
-const HKEY_LOCAL_MACHINE: isize = 0x80000002isize;
-const KEY_SET_VALUE: u32 = 0x0002;
-const REG_MULTI_SZ: u32 = 7;
+
 
 const WM_DESTROY: u32 = 2;
 const WM_COMMAND: u32 = 0x111;
@@ -1036,34 +1029,6 @@ fn nomore_phase1() -> bool {
     true
 }
 
-/* 把扫描结果喂给驱动: DrvPaths (REG_MULTI_SZ) — SYSTEM_START 自启后每轮照单清理 */
-fn nomore_feed_driver(f: &[Finding]) {
-    let mut buf: Vec<u16> = Vec::new();
-    for x in f {
-        if x.kind != "FILE" { continue; }
-        let path = match x.detail.find(" [") { Some(i) => &x.detail[..i], None => x.detail.as_str() };
-        if path.len() < 4 || buf.len() > 14000 { continue; }
-        let mut w = utf16(path);
-        w.pop();
-        buf.extend(w);
-        buf.push(0);
-    }
-    if buf.is_empty() { return; }
-    buf.push(0);
-    unsafe {
-        let mut hk: isize = 0;
-        let sub = utf16(r"SOFTWARE\SFCleaner");
-        let name = utf16("DrvPaths");
-        if RegCreateKeyExW(HKEY_LOCAL_MACHINE, sub.as_ptr(), 0, std::ptr::null(), 0,
-                           KEY_SET_VALUE, std::ptr::null(), &mut hk, std::ptr::null_mut()) == 0 {
-            RegSetValueExW(hk, name.as_ptr(), 0, REG_MULTI_SZ,
-                           buf.as_ptr() as *const u8, (buf.len() * 2) as u32);
-            RegCloseKey(hk);
-        }
-    }
-    xlog("nomore: DrvPaths 已写入");
-}
-
 fn nomore_phase2() {
     autorun_del(); // 先清 RunOnce, 防完成后残留条目把 phase1 再拉起来
     xlog("nomore: phase2 - 先解除 testsigning (已装载驱动不受影响, 防后续异常残留)");
@@ -1091,9 +1056,11 @@ fn nomore_run() {
     if marker_get() == 3 {
         nomore_phase2();
     } else {
-        xlog("nomore: 先扫描再武装 — 发现项将喂给驱动照单清理");
+        xlog("nomore: 先扫描留档 — 驱动为纯内建检测, 不依赖注册表喂单");
         let findings = scan_all();
-        nomore_feed_driver(&findings);
+        for x in &findings {
+            xlog(&format!("[{}] {}", x.kind, x.detail));
+        }
         if !nomore_phase1() {
             unsafe {
                 MessageBoxW(0, utf16("不客气模式未启动\n详见 extreme.log — 常见: Secure Boot 开启 / 缺 SFCleanerDrv.sys / 证书导入失败").as_ptr(),
