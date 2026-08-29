@@ -831,7 +831,8 @@ public static class Scanner
                     if (head.IndexOf(StegMagic) >= 0) md += " [STEGR1Xp]";
                     if (head.IndexOf(JelgMagic) >= 0) md += " [JELG]";
                     if (n >= 4 && head[0] == 0x89 && head[1] == (byte)'P' && head[2] == (byte)'N' &&
-                        head[3] == (byte)'G' && !fnm.EndsWith(".png")) md += " [PNG伪装]";
+                        head[3] == (byte)'G' && !fnm.EndsWith(".png")
+                        && !p.ToLowerInvariant().Contains(@"\packages\")) md += " [PNG伪装]"; /* UWP 磁贴缓存合法 */
                 }
                 string hs = "";
                 try
