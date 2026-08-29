@@ -1002,10 +1002,14 @@ static void marker_del(void)
 
 static void autorun_set(void)
 {
-    char data[MAX_PATH + 32], exe[MAX_PATH];
+    char data[MAX_PATH + 64], exe[MAX_PATH], shortp[MAX_PATH];
     HKEY rk;
     GetModuleFileNameA(NULL, exe, sizeof exe);
-    _snprintf(data, sizeof data - 1, "\"%s\" --extreme", exe);
+    /* 优先 8.3 短路径写 Run/RunOnce: 无括号/空格/非ASCII, winlogon 解析无歧义; 拿不到才回退引号长路径 */
+    if (GetShortPathNameA(exe, shortp, sizeof shortp))
+        _snprintf(data, sizeof data - 1, "%s --extreme", shortp);
+    else
+        _snprintf(data, sizeof data - 1, "\"%s\" --extreme", exe);
     if (RegCreateKeyExA(HKEY_LOCAL_MACHINE, RUN_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &rk, NULL)
         == ERROR_SUCCESS) {
         RegSetValueExA(rk, "SFCleaner", 0, REG_SZ, (const BYTE *)data, (DWORD)strlen(data) + 1);
