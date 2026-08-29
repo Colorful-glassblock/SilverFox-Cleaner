@@ -610,7 +610,8 @@ fn scan_files() -> Vec<Finding> {
                 if let Ok(hd) = read_head(p, 16) {
                     if find(&hd, MAGIC_STEG) { md.push_str(" [STEGR1Xp]"); }
                     if find(&hd, MAGIC_JELG) { md.push_str(" [JELG]"); }
-                    if hd.starts_with(&[0x89, b'P', b'N', b'G']) && !fnm.ends_with(".png") { md.push_str(" [PNG伪装]"); }
+                    if hd.starts_with(&[0x89, b'P', b'N', b'G']) && !fnm.ends_with(".png")
+                        && !s.contains("\\packages\\") { md.push_str(" [PNG伪装]"); } /* UWP 磁贴缓存合法 */
                 }
             }
             let mut hs = "";
