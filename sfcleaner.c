@@ -17,6 +17,7 @@
 #include <stdarg.h>
 #include <wintrust.h>
 #include <softpub.h>
+#include <mscat.h>
 
 /* ---- 常量 ---- */
 #define QUAR_ROOT   "C:\\ProgramData\\sf_quarantine"
@@ -617,6 +618,8 @@ static void scan_files(void)
 }
 
 /* ---- 白加黑检测: 同目录 [有效签名EXE + 未签名DLL] (跨变种结构特征) ---- */
+static int bj_catalog_signed(const char *path);
+
 static int bj_is_signed(const char *path)
 {
     WINTRUST_FILE_INFO fi;
@@ -638,7 +641,63 @@ static int bj_is_signed(const char *path)
     res = WinVerifyTrust(NULL, &action, &wd);
     wd.dwStateAction = WTD_STATEACTION_CLOSE;
     WinVerifyTrust(NULL, &action, &wd);
-    return res == 0;
+    return res == 0 || bj_catalog_signed(path);
+}
+
+/* catalog 回退: 系统自带 PE 无内嵌签名, 由 catalog 数据库覆盖.
+   内嵌验签 TRUST_E_NOSIGNATURE 时: 算文件哈希 -> 枚举 catalog -> WTD_CHOICE_CATALOG 复验 */
+static int bj_catalog_signed(const char *path)
+{
+    HANDLE fh;
+    HCATADMIN hca = NULL;
+    HCATINFO hc = NULL, hprev = NULL;
+    GUID act = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    BYTE hash[100];
+    DWORD cb = sizeof hash;
+    wchar_t wpath[MAX_PATH], wtag[256];
+    int ok = 0, i;
+    fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                     NULL, OPEN_EXISTING, 0, NULL);
+    if (fh == INVALID_HANDLE_VALUE) return 0;
+    if (CryptCATAdminAcquireContext(&hca, &act, 0)) {
+        if (CryptCATAdminCalcHashFromFileHandle(fh, &cb, hash, 0) && cb > 0 && cb <= sizeof hash) {
+            for (i = 0; i < (int)cb; i++)
+                _snwprintf(wtag + i * 2, 3, L"%02X", hash[i]);
+            MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, MAX_PATH);
+            /* 返回的 catalog 都含此文件哈希, 验第一个即可判定, 无需遍历 */
+            hc = CryptCATAdminEnumCatalogFromHash(hca, hash, cb, 0, NULL);
+            if (hc) {
+                CATALOG_INFO ci;
+                WINTRUST_CATALOG_INFO wci;
+                WINTRUST_DATA wd;
+                memset(&ci, 0, sizeof ci);
+                ci.cbStruct = sizeof ci;
+                if (CryptCATCatalogInfoFromContext(hc, &ci, 0)) {
+                    memset(&wci, 0, sizeof wci);
+                    wci.cbStruct = sizeof wci;
+                    wci.pcwszCatalogFilePath = ci.wszCatalogFile;
+                    wci.pcwszMemberTag = wtag;
+                    wci.pcwszMemberFilePath = wpath;
+                    wci.pbCalculatedFileHash = hash;   /* mingw 头为扩展版字段 */
+                    wci.cbCalculatedFileHash = cb;
+                    memset(&wd, 0, sizeof wd);
+                    wd.cbStruct = sizeof wd;
+                    wd.dwUIChoice = WTD_UI_NONE;
+                    wd.fdwRevocationChecks = WTD_REVOKE_NONE;
+                    wd.dwUnionChoice = WTD_CHOICE_CATALOG;
+                    wd.pCatalog = &wci;
+                    wd.dwStateAction = WTD_STATEACTION_VERIFY;
+                    if (WinVerifyTrust(NULL, &act, &wd) == 0) ok = 1;
+                    wd.dwStateAction = WTD_STATEACTION_CLOSE;
+                    WinVerifyTrust(NULL, &act, &wd);
+                }
+                CryptCATAdminReleaseCatalogContext(hca, hc, 0);
+            }
+        }
+        CryptCATAdminReleaseContext(hca, 0);
+    }
+    CloseHandle(fh);
+    return ok;
 }
 
 static void bj_scan_dir(const char *dir, int depth)
