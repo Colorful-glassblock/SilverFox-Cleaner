@@ -749,7 +749,7 @@ public static class Scanner
         "\\livekernelreports", "\\minidump", "\\prefetch", "\\appcompat",
         "\\apppatch", "\\csc", "\\diagnostics", "\\panther", "\\performance",
         "\\pla", "\\registration", "\\shellcomponents", "\\triage", "\\winstore",
-        "\\tokens", "\\csp",
+        "\\tokens", "\\csp", "\\msdtc",
     };
 
     private static int WdRandomName(string fnm) /* 0否 1pe 2bat */
