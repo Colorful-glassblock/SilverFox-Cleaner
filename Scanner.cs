@@ -1135,6 +1135,17 @@ public static class Scanner
         return false;
     }
 
+    private static bool SecureBootOn()
+    {
+        // HKLM\...\SecureBoot\State\UEFISecureBootEnabled == 1 (无键 = 非 UEFI/未启用)
+        try
+        {
+            using var k = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Control\SecureBoot\State");
+            return k?.GetValue("UEFISecureBootEnabled") is int v && v == 1;
+        }
+        catch { return false; }
+    }
+
     private static bool NomorePhase1()
     {
         var (drv, pfx, cer) = NomorePaths();
@@ -1144,6 +1155,12 @@ public static class Scanner
         if (!File.Exists(pfx) && !File.Exists(cer))
         { Xlog($"nomore: [中止] 缺证书材料 ({pfx} 或 {cer})"); return false; }
 
+        if (SecureBootOn())
+        {
+            Xlog("nomore: [中止] Secure Boot 开启 — testsigning 会被安全启动策略拒绝");
+            Xlog("nomore: VMware: 虚拟机设置->选项->高级->固件类型UEFI, 取消勾选'启用安全引导'后重启 VM");
+            return false;
+        }
         Xlog("nomore: testsigning on");
         if (!Run("bcdedit", "/set", "testsigning", "on"))
         {
