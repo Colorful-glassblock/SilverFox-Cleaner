@@ -93,8 +93,52 @@ internal static partial class Native
     [DllImport("wintrust.dll", CharSet = CharSet.Unicode)]
     internal static extern int WinVerifyTrust(IntPtr hwnd, ref Guid actionId, ref WINTRUST_DATA data);
 
+    [DllImport("wintrust.dll", CharSet = CharSet.Unicode)]
+    internal static extern int WinVerifyTrust(IntPtr hwnd, ref Guid actionId, ref WINTRUST_CATALOG_INFO data);
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     internal static extern uint GetShortPathName(string lpszLongPath, StringBuilder lpszShortPath, uint cchBuffer);
+
+    // catalog 验签: 系统 PE 无内嵌签名, 由 catalog 数据库覆盖
+    [DllImport("wintrust.dll")]
+    internal static extern bool CryptCATAdminAcquireContext(out IntPtr hCatAdmin, ref Guid pgSubsystem, uint dwFlags);
+
+    [DllImport("wintrust.dll", SetLastError = true)]
+    internal static extern bool CryptCATAdminCalcHashFromFileHandle(IntPtr hFile, ref uint pcbHash, byte[] pbHash, uint dwFlags);
+
+    [DllImport("wintrust.dll")]
+    internal static extern IntPtr CryptCATAdminEnumCatalogFromHash(IntPtr hCatAdmin, byte[] pbHash, uint cbHash, uint dwFlags, IntPtr phPrevCatInfo);
+
+    [DllImport("wintrust.dll", CharSet = CharSet.Unicode)]
+    internal static extern bool CryptCATCatalogInfoFromContext(IntPtr hCatInfo, ref CATALOG_INFO psCatInfo, uint dwFlags);
+
+    [DllImport("wintrust.dll")]
+    internal static extern bool CryptCATAdminReleaseCatalogContext(IntPtr hCatAdmin, IntPtr hCatInfo, uint dwFlags);
+
+    [DllImport("wintrust.dll")]
+    internal static extern bool CryptCATAdminReleaseContext(IntPtr hCatAdmin, uint dwFlags);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    internal struct CATALOG_INFO
+    {
+        public uint cbStruct;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string wszCatalogFile;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    internal struct WINTRUST_CATALOG_INFO
+    {
+        public uint cbStruct;
+        public uint dwCatalogVersion;
+        public string pcwszCatalogFilePath;
+        public string pcwszMemberTag;
+        public string pcwszMemberFilePath;
+        public IntPtr hMemberFile;
+        public IntPtr pbCalculatedFileHash;
+        public uint cbCalculatedFileHash;
+        public IntPtr pcCatalogContext;
+    }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     internal struct WINTRUST_FILE_INFO
@@ -255,12 +299,16 @@ public static class Scanner
             var f = ScanFiles();
             f.AddRange(ScanHosts());
             f.AddRange(ScanWu());
-            f.AddRange(ScanWb());
+            return f;
+        });
+        var t4 = Task.Run(() =>
+        {
+            var f = ScanWb();
             f.AddRange(ScanWd());
             return f;
         });
-        Task.WaitAll(t1, t2, t3);
-        var all = t1.Result.Concat(t2.Result).Concat(t3.Result).ToList();
+        Task.WaitAll(t1, t2, t3, t4);
+        var all = t1.Result.Concat(t2.Result).Concat(t3.Result).Concat(t4.Result).ToList();
         all.Sort((a, b) => b.High.CompareTo(a.High));
         return all;
     }
@@ -568,9 +616,59 @@ public static class Scanner
             int r = Native.WinVerifyTrust(IntPtr.Zero, ref act, ref wd);
             wd.dwStateAction = WTD_STATEACTION_CLOSE;
             Native.WinVerifyTrust(IntPtr.Zero, ref act, ref wd);
-            return r == 0;
+            return r == 0 || IsCatalogSigned(path);
         }
         finally { Marshal.FreeHGlobal(pFi); }
+    }
+
+    // catalog 回退: 系统 PE 无内嵌签名 — 算哈希 -> 第一个含此哈希的 catalog -> WTD_CHOICE_CATALOG 复验
+    private static bool IsCatalogSigned(string path)
+    {
+        const uint WTD_CHOICE_CATALOG = 2;
+        if (!File.Exists(path)) return false;
+        IntPtr hCatAdmin = IntPtr.Zero;
+        try
+        {
+            var action = Native.WinTrustActionGenericVerifyV2;
+            if (!Native.CryptCATAdminAcquireContext(out hCatAdmin, ref action, 0)) return false;
+            using var fs = File.OpenRead(path);
+            var hash = new byte[100];
+            uint cb = (uint)hash.Length;
+            if (!Native.CryptCATAdminCalcHashFromFileHandle(fs.SafeFileHandle.DangerousGetHandle(), ref cb, hash, 0)
+                || cb == 0 || cb > hash.Length) return false;
+            var tag = new StringBuilder((int)cb * 2 + 1);
+            for (int i = 0; i < cb; i++) tag.AppendFormat("{0:X2}", hash[i]);
+            IntPtr hCat = Native.CryptCATAdminEnumCatalogFromHash(hCatAdmin, hash, cb, 0, IntPtr.Zero);
+            if (hCat == IntPtr.Zero) return false;
+            try
+            {
+                var ci = new Native.CATALOG_INFO { cbStruct = (uint)Marshal.SizeOf<Native.CATALOG_INFO>() };
+                if (!Native.CryptCATCatalogInfoFromContext(hCat, ref ci, 0)) return false;
+                var hashPtr = Marshal.AllocHGlobal(hash.Length);
+                try
+                {
+                    Marshal.Copy(hash, 0, hashPtr, hash.Length);
+                    var wci = new Native.WINTRUST_CATALOG_INFO
+                    {
+                        cbStruct = (uint)Marshal.SizeOf<Native.WINTRUST_CATALOG_INFO>(),
+                        dwCatalogVersion = 0,
+                        pcwszCatalogFilePath = ci.wszCatalogFile,
+                        pcwszMemberTag = tag.ToString(),
+                        pcwszMemberFilePath = path,
+                        hMemberFile = IntPtr.Zero,
+                        pbCalculatedFileHash = hashPtr,
+                        cbCalculatedFileHash = cb,
+                        pcCatalogContext = IntPtr.Zero,
+                    };
+                    int r = Native.WinVerifyTrust(IntPtr.Zero, ref action, ref wci);
+                    return r == 0;
+                }
+                finally { Marshal.FreeHGlobal(hashPtr); }
+            }
+            finally { Native.CryptCATAdminReleaseCatalogContext(hCatAdmin, hCat, 0); }
+        }
+        catch { return false; }
+        finally { if (hCatAdmin != IntPtr.Zero) Native.CryptCATAdminReleaseContext(hCatAdmin, 0); }
     }
 
     private static void ScanWbDir(string dir, int depth, List<Finding> res)
@@ -578,9 +676,10 @@ public static class Scanner
         if (depth > 4) return;
         string low = dir.ToLowerInvariant();
         if (low.Contains("sf_quarantine") || WbWhitelist.Any(w => low.Contains(w))) return;
-        bool se = false, ud = false;
-        string? hit = null;
-        List<string> subs = new();
+        /* 枚举先行: 无 exe 或无 dll 的目录 (绝大多数) 0 次验签; 配对才查, 找到即停 */
+        var exes = new List<string>(24);
+        var dlls = new List<string>(64);
+        var subs = new List<string>();
         string[] entries;
         try { entries = Directory.GetFileSystemEntries(dir); } catch { return; }
         foreach (var e in entries)
@@ -593,17 +692,25 @@ public static class Scanner
                 continue;
             }
             string fnm = Path.GetFileName(e).ToLowerInvariant();
-            if (fnm.EndsWith(".exe") && !se && IsValidSigned(e)) se = true;
-            else if (fnm.EndsWith(".dll") && !ud && !IsValidSigned(e)) { ud = true; hit = e; }
+            if (fnm.EndsWith(".exe")) { if (exes.Count < 24) exes.Add(e); }
+            else if (fnm.EndsWith(".dll")) { if (dlls.Count < 64) dlls.Add(e); }
         }
-        if (se && ud && hit != null)
-            res.Add(new Finding
+        if (exes.Count > 0 && dlls.Count > 0)
+        {
+            bool se = exes.Any(IsValidSigned);
+            if (se)
             {
-                Kind = "FILE",
-                Detail = $"{hit} [白加黑: 有效签名EXE+未签名DLL]",
-                High = false,
-                Action = $"quarantine {hit}",
-            });
+                string? hit = dlls.FirstOrDefault(d => !IsValidSigned(d));
+                if (hit != null)
+                    res.Add(new Finding
+                    {
+                        Kind = "FILE",
+                        Detail = $"{hit} [白加黑: 有效签名EXE+未签名DLL]",
+                        High = false,
+                        Action = $"quarantine {hit}",
+                    });
+            }
+        }
         foreach (var sd in subs) ScanWbDir(sd, depth + 1, res);
     }
 
