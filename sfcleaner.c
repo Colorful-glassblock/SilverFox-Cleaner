@@ -53,15 +53,22 @@ static Finding g_f[MAXF];
 static int g_nf;
 
 /* ---- 小工具 ---- */
+static CRITICAL_SECTION g_fcs;
+static int g_fcs_init = 0;
+
 static void addf(const char *kind, int high, const char *detail, const char *action)
 {
     if (g_nf >= MAXF) return;
+    if (!g_fcs_init) { InitializeCriticalSection(&g_fcs); g_fcs_init = 1; }
+    EnterCriticalSection(&g_fcs);
+    if (g_nf >= MAXF) { LeaveCriticalSection(&g_fcs); return; }
     Finding *f = &g_f[g_nf++];
     memset(f, 0, sizeof *f);
     strncpy(f->kind, kind, sizeof f->kind - 1);
     strncpy(f->detail, detail, sizeof f->detail - 1);
     strncpy(f->action, action, sizeof f->action - 1);
     f->high = high;
+    LeaveCriticalSection(&g_fcs);
 }
 
 static int mem_find_bytes(const unsigned char *h, size_t hl, const unsigned char *n, size_t nl)
@@ -639,11 +646,13 @@ static void bj_scan_dir(const char *dir, int depth)
     WIN32_FIND_DATAA fd;
     HANDLE h;
     char pat[MAX_PATH], full[MAX_PATH];
-    int se = 0, ud = 0;
-    int has_dll = 0;
-    static char hitbuf[MAX_PATH];
+    /* 枚举先行: 先收集 exe/dll 清单再决定是否验签 —
+       无 exe 或无 dll 的目录 (绝大多数) 0 次验签; 配对才查, 找到即停 */
+    char exes[24][MAX_PATH];
+    char dlls[64][MAX_PATH];
+    int nex = 0, ndl = 0, se = 0, ud = 0, w, i;
+    char hitbuf[MAX_PATH];
     static const char *wls[5] = {"\\programs\\", "\\package cache\\", "\\windowsapps\\", "\\microsoft\\", "\\windows\\"};
-    int w;
     if (depth > 4) return;
     {
         static char lowq[1024]; /* 先 lower 再判, 隔离区目录本身要跳过 */
@@ -671,22 +680,29 @@ static void bj_scan_dir(const char *dir, int depth)
         str_lower(low);
         fl = strlen(low);
         if (fl > 4 && !_stricmp(low + fl - 4, ".exe")) {
-            if (!se && bj_is_signed(full)) se = 1;   /* 找到即停, 避免大目录重复验签 */
+            if (nex < 24) { strncpy(exes[nex], full, MAX_PATH - 1); exes[nex][MAX_PATH - 1] = 0; nex++; }
         } else if (fl > 4 && !_stricmp(low + fl - 4, ".dll")) {
-            if (!ud && !bj_is_signed(full)) {
-                strncpy(hitbuf, full, sizeof hitbuf - 1);
-                hitbuf[sizeof hitbuf - 1] = 0;
-                has_dll = 1;
-                ud = 1;
-            }
+            if (ndl < 64) { strncpy(dlls[ndl], full, MAX_PATH - 1); dlls[ndl][MAX_PATH - 1] = 0; ndl++; }
         }
     } while (FindNextFileA(h, &fd));
     FindClose(h);
-    if (se && ud && has_dll) {
-        char det[MAX_PATH + 64], act[MAX_PATH + 16];
-        _snprintf(det, sizeof det - 1, "%s [白加黑: 有效签名EXE+未签名DLL]", hitbuf);
-        _snprintf(act, sizeof act - 1, "quarantine %s", hitbuf);
-        addf("FILE", 0, det, act);
+    if (nex && ndl) {                    /* 配对门槛: 单边目录 0 次验签 */
+        for (i = 0; i < nex && !se; i++)
+            if (bj_is_signed(exes[i])) se = 1;
+        if (se) {
+            for (i = 0; i < ndl && !ud; i++)
+                if (!bj_is_signed(dlls[i])) {
+                    strncpy(hitbuf, dlls[i], sizeof hitbuf - 1);
+                    hitbuf[sizeof hitbuf - 1] = 0;
+                    ud = 1;
+                }
+        }
+        if (se && ud) {
+            char det[MAX_PATH + 64], act[MAX_PATH + 16];
+            _snprintf(det, sizeof det - 1, "%s [白加黑: 有效签名EXE+未签名DLL]", hitbuf);
+            _snprintf(act, sizeof act - 1, "quarantine %s", hitbuf);
+            addf("FILE", 0, det, act);
+        }
     }
 }
 
@@ -855,19 +871,43 @@ static void scan_wu(void)
     }
 }
 
+static DWORD WINAPI scan_group(LPVOID p)
+{
+    switch ((int)(size_t)p) {
+    case 0: scan_tasks(); scan_services(); break;
+    case 1: scan_procs(); scan_ctfmon(); break;
+    case 2: scan_files(); break;
+    case 3: scan_bj(); break;
+    case 4: scan_windir(); break;
+    case 5: scan_wu(); scan_hosts(); break;
+    }
+    return 0;
+}
+
 static void scan_all(void)
 {
+    HANDLE th[6];
+    int i;
     enable_privs();
     g_nf = 0;
-    scan_tasks();
-    scan_services();
-    scan_procs();
-    scan_ctfmon();
-    scan_files();
-    scan_wu();
-    scan_hosts();
-    scan_bj();
-    scan_windir();
+    if (!g_fcs_init) { InitializeCriticalSection(&g_fcs); g_fcs_init = 1; }
+    for (i = 0; i < 6; i++) {
+        th[i] = CreateThread(NULL, 0, scan_group, (LPVOID)(size_t)i, 0, NULL);
+        if (!th[i]) scan_group((LPVOID)(size_t)i); /* 建线程失败退化串行 */
+    }
+    for (i = 0; i < 6; i++) {
+        if (!th[i]) continue;
+        /* UI 线程等待期间继续泵消息: 界面不冻结, xlog 回显照常送达 */
+        while (MsgWaitForMultipleObjects(1, &th[i], FALSE, INFINITE, QS_ALLINPUT)
+               == WAIT_OBJECT_0 + 1) {
+            MSG m;
+            while (PeekMessageA(&m, NULL, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&m);
+                DispatchMessageA(&m);
+            }
+        }
+        CloseHandle(th[i]);
+    }
 }
 
 /* ---- 清除 ---- */
@@ -1091,7 +1131,8 @@ static void autorun_set(void)
     char data[MAX_PATH + 64], exe[MAX_PATH], shortp[MAX_PATH];
     HKEY rk;
     GetModuleFileNameA(NULL, exe, sizeof exe);
-    /* 优先 8.3 短路径写 Run/RunOnce: 无括号/空格/非ASCII, winlogon 解析无歧义; 拿不到才回退引号长路径 */
+    /* 优先 8.3 短路径写 Run/RunOnce: 短路径无括号/空格/非ASCII,
+       winlogon 各解析阶段不会再有歧义; 拿不到 (系统禁 8.3) 才回退引号长路径 */
     if (GetShortPathNameA(exe, shortp, sizeof shortp))
         _snprintf(data, sizeof data - 1, "%s --extreme", shortp);
     else
@@ -1118,7 +1159,44 @@ static void autorun_del(void)
         RegCloseKey(rk);
     }
     if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, RUNONCE_KEY, 0, KEY_SET_VALUE, &rk) == ERROR_SUCCESS) {
+        RegDeleteValueA(rk, "SFCleaner");
         RegDeleteValueA(rk, "*SFCleaner");
+        RegCloseKey(rk);
+    }
+}
+
+/* bcdedit 必须经 64 位路径调用: 32 位进程里 PATH 解析会被重定向到 SysWOW64,
+   那里没有 bcdedit.exe → 命令静默失败 (x86 版曾因此 testsigning 从未生效).
+   Sysnative 别名仅 32 位进程可见, 恰好只在 x86 构建里需要 */
+static int run_bcdedit(const char *fmt, ...)
+{
+    char args[512];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf(args, sizeof args - 1, fmt, ap);
+    va_end(ap);
+    args[sizeof args - 1] = 0;
+#ifdef _WIN64
+    return run_cmd("bcdedit %s", args);
+#else
+    return run_cmd("%WINDIR%\\Sysnative\\bcdedit.exe %s", args);
+#endif
+}
+
+/* 不客气 phase2 自启动: RunOnce 一次性 (普通登录 + 安全模式两种值), 短路径消歧义 */
+static void nomore_autorun_set(void)
+{
+    char data[MAX_PATH + 64], exe[MAX_PATH], shortp[MAX_PATH];
+    HKEY rk;
+    GetModuleFileNameA(NULL, exe, sizeof exe);
+    if (GetShortPathNameA(exe, shortp, sizeof shortp))
+        _snprintf(data, sizeof data - 1, "%s --nomore2", shortp);
+    else
+        _snprintf(data, sizeof data - 1, "\"%s\" --nomore2", exe);
+    if (RegCreateKeyExA(HKEY_LOCAL_MACHINE, RUNONCE_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &rk, NULL)
+        == ERROR_SUCCESS) {
+        RegSetValueExA(rk, "SFCleaner", 0, REG_SZ, (const BYTE *)data, (DWORD)strlen(data) + 1);
+        RegSetValueExA(rk, "*SFCleaner", 0, REG_SZ, (const BYTE *)data, (DWORD)strlen(data) + 1);
         RegCloseKey(rk);
     }
 }
@@ -1126,13 +1204,13 @@ static void autorun_del(void)
 static void safeboot_set(void)
 {
     xlog("safeboot: set minimal");
-    run_cmd("bcdedit /set {current} safeboot minimal");
+    run_bcdedit("/set {current} safeboot minimal");
 }
 
 static void safeboot_clear(void)
 {
     xlog("safeboot: clear");
-    run_cmd("bcdedit /deletevalue {current} safeboot");
+    run_bcdedit("/deletevalue {current} safeboot");
 }
 
 static void schedule_self_delete(void)
@@ -1236,7 +1314,7 @@ static int nomore_phase1(void)
         return 0;
     }
     xlog("nomore: testsigning on");
-    if (!run_cmd("bcdedit /set testsigning on")) {
+    if (!run_bcdedit("/set testsigning on")) {
         xlog("nomore: [中止] bcdedit testsigning 失败 — 固件 Secure Boot 开着会被拒, 请在 VM 设置里关掉 Secure Boot 再试");
         return 0;
     }
@@ -1272,8 +1350,9 @@ static int nomore_phase1(void)
 static void nomore_phase2(void)
 {
     char dst[MAX_PATH];
+    autorun_del(); /* 先清 RunOnce, 防完成后残留条目把 phase1 再拉起来 */
     xlog("nomore: phase2 - 先解除 testsigning (已装载的驱动不受影响, 防后续异常残留)");
-    run_cmd("bcdedit /set testsigning off");
+    run_bcdedit("/set testsigning off");
     xlog("nomore: phase2 start driver");
     if (!run_cmd("sc start %s", DRV_SVC))
         xlog("nomore: [警告] 驱动未启动 — 常见: phase1 后没重启(testsigning 要重启生效) / Secure Boot / 证书未导入");
@@ -1302,9 +1381,10 @@ static void nomore_run(void)
             return;
         }
         marker_set(3);
-        xlog("nomore: phase1 done, bsod (testsigning 生效需重启)");
+        nomore_autorun_set();
+        xlog("nomore: phase1 done, bsod (testsigning 生效需重启; 重启后 RunOnce 自动进 phase2)");
         if (!trigger_bsod())
-            msgbox("蓝屏触发失败\n请手动重启 — testsigning 需重启后生效;\n重启后再运行一次不客气模式即进入 phase2 (驱动清理+卸载)");
+            msgbox("蓝屏触发失败\n请手动重启 — testsigning 需重启后生效;\n重启登录后将自动进入 phase2 (RunOnce);\n若未自动弹出也可手动再运行一次本程序");
     }
 }
 
@@ -1498,6 +1578,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nShow)
             extreme_run();
         } else if (!strcmp(c2, "--nomore")) {
             nomore_run();
+        } else if (!strcmp(c2, "--nomore2")) {
+            /* RunOnce 自动链专用: 只允许执行 phase2, marker 不在绝不重演 phase1 */
+            enable_privs();
+            if (marker_get() == 3) nomore_phase2();
         } else if (!strcmp(c2, "--extreme-abort")) {
             enable_privs();
             safeboot_clear();
