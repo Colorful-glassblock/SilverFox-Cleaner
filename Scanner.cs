@@ -793,6 +793,23 @@ public static class Scanner
         return 0;
     }
 
+    private static byte[]? s_selfDrvSha;
+    private static long s_selfDrvLen = -1;
+
+    /* 本版驱动 (内嵌资源) 的 SHA-512 — 无内嵌时不做哈希豁免 */
+    private static void EnsureSelfDrvSha()
+    {
+        if (s_selfDrvSha != null || s_selfDrvLen == -2) return;
+        try
+        {
+            using var st = typeof(Scanner).Assembly.GetManifestResourceStream("SFCleaner.SFCleanerDrv.sys");
+            if (st == null) { s_selfDrvLen = -2; return; }
+            s_selfDrvSha = System.Security.Cryptography.SHA512.HashData(st);
+            s_selfDrvLen = st.Length;
+        }
+        catch { s_selfDrvLen = -2; }
+    }
+
     private static void WdScanDir(string dir, int depth, List<Finding> res)
     {
         if (depth > 4) return;
@@ -809,8 +826,22 @@ public static class Scanner
                 if (!fa.HasFlag(FileAttributes.ReparsePoint)) WdScanDir(e, depth + 1, res);
                 continue;
             }
-            int rt = WdRandomName(Path.GetFileName(e));
+            string wdfnm = Path.GetFileName(e);
+            int rt = WdRandomName(wdfnm);
             if (rt == 0) continue;
+            /* SHA-512 哈希排除: 逐字节等于本版驱动才豁免 (改名伪装照样被扫) */
+            EnsureSelfDrvSha();
+            if (s_selfDrvSha != null)
+            {
+                try
+                {
+                    var fi = new FileInfo(e);
+                    if (fi.Length == s_selfDrvLen
+                        && System.Security.Cryptography.SHA512.HashData(File.ReadAllBytes(e)).AsSpan().SequenceEqual(s_selfDrvSha))
+                        continue;
+                }
+                catch { /* 读取失败照常走检测 */ }
+            }
             if (rt == 1 && IsValidSigned(e)) continue;   // 随机名但签名有效 → 放行
             res.Add(new Finding
             {
