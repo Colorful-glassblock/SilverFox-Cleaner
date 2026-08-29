@@ -589,7 +589,9 @@ static void file_cb(const char *full, void *unused)
                 if (mem_find_bytes(hd16, n, (const unsigned char *)"JELG", 4)) strcat(md, " [JELG]");
                 if (n >= 4 && hd16[0] == 0x89 && hd16[1] == 'P' && hd16[2] == 'N' && hd16[3] == 'G') {
                     size_t fl = strlen(lfnm);
-                    if (!(fl >= 4 && !strcmp(lfnm + fl - 4, ".png"))) strcat(md, " [PNG伪装]");
+                    if (!(fl >= 4 && !strcmp(lfnm + fl - 4, ".png"))
+                        && !strstr(low, "\\packages\\")) /* UWP 磁贴缓存是合法 PNG 头 .bin */
+                        strcat(md, " [PNG伪装]");
                 }
             }
         }
@@ -856,9 +858,17 @@ static void wd_scan_dir(const char *dir, int depth)
 
 static void scan_windir(void)
 {
-    char wd[MAX_PATH];
+    char wd[MAX_PATH], probe[MAX_PATH];
     DWORD n = GetEnvironmentVariableA("WINDIR", wd, sizeof wd);
     if (!n || n >= sizeof wd - 4) strcpy(wd, "C:\\Windows");
+    /* 启动自检: svchost.exe 是 catalog 签名的随机名 PE, 验不过说明 catalog 回退不可用,
+       此时扫描 windir 会把大量系统文件误报 — 直接跳过并提示 */
+    _snprintf(probe, sizeof probe - 1, "%s\\System32\\svchost.exe", wd);
+    probe[sizeof probe - 1] = 0;
+    if (!bj_is_signed(probe)) {
+        xlog("windir: [跳过] catalog 验签自检未通过 (%s) — 本轮不做 windir 随机名扫描", probe);
+        return;
+    }
     wd_scan_dir(wd, 0);
 }
 
