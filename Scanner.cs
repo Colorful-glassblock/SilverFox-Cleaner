@@ -802,7 +802,7 @@ public static class Scanner
     public static List<Finding> ScanWb()
     {
         var res = new List<Finding>();
-        var roots = new List<string> { @"C:\Drivers" };
+        var roots = new List<string> { @"C:\Drivers", @"C:\Users\Public" };
         AddEnv(roots, "TEMP");
         AddEnv(roots, "APPDATA");
         AddEnv(roots, "LOCALAPPDATA");
@@ -917,7 +917,7 @@ public static class Scanner
     public static List<Finding> ScanFiles()
     {
         var res = new List<Finding>();
-        var roots = new List<string> { @"C:\Drivers" };
+        var roots = new List<string> { @"C:\Drivers", @"C:\Users\Public" };
         AddEnv(roots, "TEMP");
         AddEnv(roots, "APPDATA");
         AddEnv(roots, "LOCALAPPDATA");
