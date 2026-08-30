@@ -166,6 +166,18 @@ internal static partial class Native
 
     internal static readonly Guid WinTrustActionGenericVerifyV2 =
         new Guid(0x00AAC56B, 0xCD44, 0x11D0, 0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE);
+
+    // 版本资源: 改名白加黑检测 (腾讯ACE改名steam.exe)
+    [DllImport("version.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    internal static extern uint GetFileVersionInfoSizeW(string lptstrFilename, out uint dwHandle);
+
+    [DllImport("version.dll", CharSet = CharSet.Unicode)]
+    internal static extern bool GetFileVersionInfoW(string lptstrFilename, uint dwHandle,
+        uint dwLen, byte[] lpData);
+
+    [DllImport("version.dll", CharSet = CharSet.Unicode)]
+    internal static extern bool VerQueryValueW(byte[] pBlock, string lpSubBlock,
+        out IntPtr lpBuffer, out uint puLen);
 }
 
 // 加密隔离容器（与 Rust v4.1 字节级兼容）
@@ -242,7 +254,7 @@ public static class Scanner
         ["4d.skendh.com", "de.sjd82.org", "skendh.com", "sjd82.org", "dmo/client"];
 
     private static readonly string[] NameHits =
-        ["ekxzjr", "dd9ocged", "srl.exe", "wdybq.dll", "drivers.dat", "drivers.dat.0",
+        ["steam.exe", "ekxzjr", "dd9ocged", "srl.exe", "wdybq.dll", "drivers.dat", "drivers.dat.0",
          "wow64log.dll", "vafdska.sys", "vmservice.sys"];
 
     private static readonly byte[] StegMagic = "STEGR1Xp"u8.ToArray();
@@ -578,6 +590,28 @@ public static class Scanner
     private static readonly string[] WbWhitelist =
         { @"\programs\", @"\package cache\", @"\windowsapps\", @"\microsoft\", @"\windows\" };
 
+    /* 版本资源 OriginalFilename: 改名白加黑核心信号 */
+    private static string? VerOriginalFilename(string path)
+    {
+        try
+        {
+            uint h = 0;
+            uint sz = Native.GetFileVersionInfoSizeW(path, out h);
+            if (sz == 0 || sz > 262144) return null;
+            var vbuf = new byte[sz];
+            if (!Native.GetFileVersionInfoW(path, 0, sz, vbuf)) return null;
+            if (!Native.VerQueryValueW(vbuf, @"\VarFileInfo\Translation", out IntPtr pTrans, out uint tsz)
+                || tsz < 4) return null;
+            short lang = Marshal.ReadInt16(pTrans);
+            short cp = Marshal.ReadInt16(pTrans, 2);
+            string sub = $@"\StringFileInfo\{lang:x4}{cp:x4}\OriginalFilename";
+            if (!Native.VerQueryValueW(vbuf, sub, out IntPtr pOrig, out uint olen) || olen < 2)
+                return null;
+            return Marshal.PtrToStringUni(pOrig);
+        }
+        catch { return null; }
+    }
+
     private static bool IsValidSigned(string path)
     {
         // WINTRUST_FILE_INFO 含 string 非 blittable, 不能用 GCHandle pin —
@@ -707,7 +741,8 @@ public static class Scanner
     {
         if (depth > 4) return;
         string low = dir.ToLowerInvariant();
-        if (low.Contains("sf_quarantine") || WbWhitelist.Any(w => low.Contains(w))) return;
+        if (low.Contains("sf_quarantine")) return;
+        bool whitelisted = WbWhitelist.Any(w => low.Contains(w));   /* 白名单目录降级: 只跑改名检测 */
         /* 枚举先行: 无 exe 或无 dll 的目录 (绝大多数) 0 次验签; 配对才查, 找到即停 */
         var exes = new List<string>(24);
         var dlls = new List<string>(64);
@@ -727,20 +762,41 @@ public static class Scanner
             if (fnm.EndsWith(".exe")) { if (exes.Count < 24) exes.Add(e); }
             else if (fnm.EndsWith(".dll")) { if (dlls.Count < 64) dlls.Add(e); }
         }
-        if (exes.Count > 0 && dlls.Count > 0)
+        /* 改名检测 (白名单目录也跑): 签名有效但 OriginalFilename 与磁盘名不符
+           — 腾讯ACE改名steam.exe: 内嵌签名改名仍有效, 版本资源不会跟着改 */
+        if (exes.Count > 0 && (whitelisted || dlls.Count > 0))
         {
-            bool se = exes.Any(IsValidSigned);
-            if (se)
+            foreach (var e in exes)
             {
-                string? hit = dlls.FirstOrDefault(d => !IsValidSigned(d));
-                if (hit != null)
-                    res.Add(new Finding
-                    {
-                        Kind = "FILE",
-                        Detail = $"{hit} [白加黑: 有效签名EXE+未签名DLL]",
-                        High = false,
-                        Action = $"quarantine {hit}",
-                    });
+                if (!IsValidSigned(e)) continue;
+                string? orig = VerOriginalFilename(e);
+                if (orig == null) continue;
+                string baseName = Path.GetFileName(e).ToLowerInvariant();
+                if (baseName == orig.ToLowerInvariant()) continue;
+                res.Add(new Finding
+                {
+                    Kind = "FILE",
+                    Detail = $"{e} [白加黑: 签名EXE被改名 (OriginalFilename={orig})]",
+                    High = true,
+                    Action = $"quarantine {e}",
+                });
+                break;
+            }
+            if (!whitelisted)
+            {
+                bool se = exes.Any(IsValidSigned);
+                if (se)
+                {
+                    string? hit = dlls.FirstOrDefault(d => !IsValidSigned(d));
+                    if (hit != null)
+                        res.Add(new Finding
+                        {
+                            Kind = "FILE",
+                            Detail = $"{hit} [白加黑: 有效签名EXE+未签名DLL]",
+                            High = false,
+                            Action = $"quarantine {hit}",
+                        });
+                }
             }
         }
         foreach (var sd in subs) ScanWbDir(sd, depth + 1, res);
