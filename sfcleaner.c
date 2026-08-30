@@ -623,6 +623,14 @@ static void scan_files(void)
    腾讯ACE改名steam.exe: 内嵌签名仍有效, 但 OriginalFilename 不会跟着改 */
 static int ver_orig_name(const char *path, char *out, unsigned int outn)
 {
+    /* 动态解析: Ubuntu i686 libversion.a 缺 @装饰符号, 静态 -lversion 不可靠 */
+    typedef DWORD (WINAPI *fn_SizeA)(LPCSTR, LPDWORD);
+    typedef BOOL  (WINAPI *fn_InfoA)(LPCSTR, DWORD, DWORD, LPVOID);
+    typedef BOOL  (WINAPI *fn_QueryA)(LPCVOID, LPCSTR, LPVOID *, PUINT);
+    static fn_SizeA pSize = NULL;
+    static fn_InfoA pInfo = NULL;
+    static fn_QueryA pQuery = NULL;
+    static int inited = 0;
     DWORD h = 0, sz;
     UINT tsz = 0, olen = 0;
     static unsigned char vbuf[262144];
@@ -634,13 +642,23 @@ static int ver_orig_name(const char *path, char *out, unsigned int outn)
     int ok = 0;
 
     out[0] = 0;
-    sz = GetFileVersionInfoSizeA(path, &h);
+    if (!inited) {
+        HMODULE v = LoadLibraryA("version.dll");
+        inited = 1;
+        if (v) {
+            pSize  = (fn_SizeA)GetProcAddress(v, "GetFileVersionInfoSizeA");
+            pInfo  = (fn_InfoA)GetProcAddress(v, "GetFileVersionInfoA");
+            pQuery = (fn_QueryA)GetProcAddress(v, "VerQueryValueA");
+        }
+    }
+    if (!pSize || !pInfo || !pQuery) return 0;
+    sz = pSize(path, &h);
     if (!sz || sz > sizeof vbuf) return 0;
-    if (!GetFileVersionInfoA(path, 0, sz, vbuf)) return 0;
-    if (!VerQueryValueA(vbuf, "\\VarFileInfo\\Translation", &ptrans, &tsz) || tsz < 4) return 0;
+    if (!pInfo(path, 0, sz, vbuf)) return 0;
+    if (!pQuery(vbuf, "\\VarFileInfo\\Translation", &ptrans, &tsz) || tsz < 4) return 0;
     w = (WORD *)ptrans;
     _snprintf(sub, sizeof sub - 1, "\\StringFileInfo\\%04x%04x\\OriginalFilename", w[0], w[1]);
-    if (VerQueryValueA(vbuf, sub, (void **)&orig, &olen) && orig && olen > 1) {
+    if (pQuery(vbuf, sub, (void **)&orig, &olen) && orig && olen > 1) {
         for (k = 0; k + 1 < outn && orig[k]; k++) out[k] = orig[k];
         out[k] = 0;
         ok = 1;
@@ -1523,7 +1541,6 @@ static void extreme_run(void)
 
 static void msgbox(const char *text);
 static void fmt_report(char *out, size_t rsz);
-
 /* ---- 不客气模式: 自定义证书 + 内核驱动清理 ----
  * 材料: 与程序同目录放 SFCleanerDrv.sys(测试签名内核驱动) + SFCleanerCert.pfx(自定义证书)
  * 流程: phase1(标记=3): testsigning on + 导入证书 + 部署/注册 driver → 蓝屏重启
