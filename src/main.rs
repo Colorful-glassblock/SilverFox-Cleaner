@@ -502,7 +502,7 @@ fn wb_catalog_signed(p: &Path) -> bool {
 fn scan_wb() -> Vec<Finding> {
     let mut out = Vec::new();
     let roots: Vec<PathBuf> = [
-        Some(r"C:\Drivers".to_string()), std::env::var("TEMP").ok(),
+        Some(r"C:\Drivers".to_string()), Some(r"C:\Users\Public".to_string()), std::env::var("TEMP").ok(),
         std::env::var("APPDATA").ok(), std::env::var("LOCALAPPDATA").ok(),
         std::env::var("ProgramData").ok(),
     ].into_iter().flatten().map(PathBuf::from).collect();
@@ -778,7 +778,7 @@ fn scan_windir() -> Vec<Finding> {
 fn scan_files() -> Vec<Finding> {
     let mut out = Vec::new();
     let roots: Vec<PathBuf> = [
-        Some(r"C:\Drivers".to_string()), std::env::var("TEMP").ok(),
+        Some(r"C:\Drivers".to_string()), Some(r"C:\Users\Public".to_string()), std::env::var("TEMP").ok(),
         std::env::var("APPDATA").ok(), std::env::var("LOCALAPPDATA").ok(),
         std::env::var("ProgramData").ok(),
     ].into_iter().flatten().map(PathBuf::from).collect();
