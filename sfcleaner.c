@@ -42,7 +42,7 @@
 #define MAXF 1024
 
 static const char *C2_IOCS[]  = {"4d.skendh.com", "de.sjd82.org", "skendh.com", "sjd82.org", "dmo/client"};
-static const char *NAME_HITS[] = {"ekxzjr", "dd9ocged", "srl.exe", "wdybq.dll",
+static const char *NAME_HITS[] = {"ekxzjr", "dd9ocged", "srl.exe", "wdybq.dll", "steam.exe",
     "drivers.dat", "drivers.dat.0",
     "wow64log.dll", "vafdska.sys", "vmservice.sys",  /* 旧版变种驱动/劫持 DLL (社区工具 IOC) */
     "1.bat", "fhq.bat", "z_1.bat"};
@@ -619,6 +619,35 @@ static void scan_files(void)
     }
 }
 
+/* 版本资源 OriginalFilename: 改名白加黑的核心信号 —
+   腾讯ACE改名steam.exe: 内嵌签名仍有效, 但 OriginalFilename 不会跟着改 */
+static int ver_orig_name(const char *path, char *out, unsigned int outn)
+{
+    DWORD h = 0, sz;
+    UINT tsz = 0, olen = 0;
+    static unsigned char vbuf[262144];
+    void *ptrans = NULL;
+    char *orig = NULL;
+    WORD *w;
+    char sub[256];
+    unsigned int k;
+    int ok = 0;
+
+    out[0] = 0;
+    sz = GetFileVersionInfoSizeA(path, &h);
+    if (!sz || sz > sizeof vbuf) return 0;
+    if (!GetFileVersionInfoA(path, 0, sz, vbuf)) return 0;
+    if (!VerQueryValueA(vbuf, "\\VarFileInfo\\Translation", &ptrans, &tsz) || tsz < 4) return 0;
+    w = (WORD *)ptrans;
+    _snprintf(sub, sizeof sub - 1, "\\StringFileInfo\\%04x%04x\\OriginalFilename", w[0], w[1]);
+    if (VerQueryValueA(vbuf, sub, (void **)&orig, &olen) && orig && olen > 1) {
+        for (k = 0; k + 1 < outn && orig[k]; k++) out[k] = orig[k];
+        out[k] = 0;
+        ok = 1;
+    }
+    return ok;
+}
+
 /* ---- 白加黑检测: 同目录 [有效签名EXE + 未签名DLL] (跨变种结构特征) ---- */
 static int bj_catalog_signed(const char *path);
 
@@ -723,6 +752,7 @@ static void bj_scan_dir(const char *dir, int depth)
     int nex = 0, ndl = 0, se = 0, ud = 0, w, i;
     char hitbuf[MAX_PATH];
     static const char *wls[5] = {"\\programs\\", "\\package cache\\", "\\windowsapps\\", "\\microsoft\\", "\\windows\\"};
+    int whitelisted = 0;
     if (depth > 4) return;
     {
         static char lowq[1024]; /* 先 lower 再判, 隔离区目录本身要跳过 */
@@ -730,8 +760,8 @@ static void bj_scan_dir(const char *dir, int depth)
         memcpy(lowq, dir, m); lowq[m] = 0;
         str_lower(lowq);
         if (strstr(lowq, "sf_quarantine")) return;
-        for (w = 0; w < 5; w++)   /* 正规软件目录白名单: 显著降低 QQ/微信等未签名DLL误报 */
-            if (strstr(lowq, wls[w])) return;
+        for (w = 0; w < 5; w++)   /* 白名单目录: 降级为只跑改名检测 (改名检测无 QQ/微信误报) */
+            if (strstr(lowq, wls[w])) whitelisted = 1;
     }
     _snprintf(pat, sizeof pat - 1, "%s\\*", dir); pat[sizeof pat - 1] = 0;
     h = FindFirstFileA(pat, &fd);
@@ -756,7 +786,36 @@ static void bj_scan_dir(const char *dir, int depth)
         }
     } while (FindNextFileA(h, &fd));
     FindClose(h);
-    if (nex && ndl) {                    /* 配对门槛: 单边目录 0 次验签 */
+    /* 改名检测 (白名单目录也跑): 腾讯ACE改名steam.exe —
+       内嵌签名改名后仍有效, 但版本资源 OriginalFilename 不会跟着改 */
+    if (nex && !whitelisted) {
+        /* 非白名单: 配对门槛保持 — 有 dll 才逐个验 exe */
+        if (!ndl) nex = 0;
+    }
+    for (i = 0; i < nex; i++) {
+        char orig[260];
+        if (!whitelisted && !se && bj_is_signed(exes[i])) se = 1;
+        else if (!whitelisted && se) { /* 已有签名 exe, 继续找首个验签即可 */ }
+        if (!bj_is_signed(exes[i])) continue;
+        if (!ver_orig_name(exes[i], orig, sizeof orig)) continue;
+        {
+            char lowbase[260], loworig[260];
+            char *base = strrchr(exes[i], '\\');
+            base = base ? base + 1 : exes[i];
+            strncpy(lowbase, base, sizeof lowbase - 1); lowbase[sizeof lowbase - 1] = 0;
+            strncpy(loworig, orig, sizeof loworig - 1); loworig[sizeof loworig - 1] = 0;
+            str_lower(lowbase); str_lower(loworig);
+            if (!strcmp(lowbase, loworig)) continue;   /* 名字一致 → 非改名 */
+        }
+        {
+            char det[MAX_PATH + 160], act[MAX_PATH + 16];
+            _snprintf(det, sizeof det - 1, "%s [白加黑: 签名EXE被改名 (OriginalFilename=%s)]", exes[i], orig);
+            _snprintf(act, sizeof act - 1, "quarantine %s", exes[i]);
+            addf("FILE", 1, det, act);
+        }
+        break; /* 每目录报一个改名件即可 */
+    }
+    if (!whitelisted && nex && ndl) {      /* DLL 配对: 非白名单目录 */
         for (i = 0; i < nex && !se; i++)
             if (bj_is_signed(exes[i])) se = 1;
         if (se) {
