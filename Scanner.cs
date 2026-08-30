@@ -82,6 +82,9 @@ internal static partial class Native
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     internal static extern bool MoveFileExW(string src, IntPtr dst, uint flags);
 
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    internal static extern bool MoveFileExW(string src, string dst, uint flags);
+
     [DllImport("ntdll.dll")]
     internal static extern int RtlAdjustPrivilege(uint privilege, bool enable, bool currentThread, out byte previous);
 
@@ -1114,12 +1117,23 @@ public static class Scanner
         Run("icacls", path, "/grant", "Administrators:F");
     }
 
+    /* 按映像名终止进程 (隔离运行中程序前先杀) */
+    private static void KillImage(string img)
+    {
+        try { Run("taskkill", "/f", "/im", img, "/t"); } catch { }
+    }
+
     private static bool Quarantine(string src, string qdir, IProgress<string>? log)
     {
         if (!File.Exists(src)) return true;
         try { Directory.CreateDirectory(qdir); } catch { /* 已存在 */ }
         ulong ts = QuarCrypt.TsFromDirName(Path.GetFileName(qdir));
         TakeOwn(src);
+
+        /* .exe 先杀运行实例 (否则删除必失败) */
+        if (string.Equals(Path.GetExtension(src), ".exe", StringComparison.OrdinalIgnoreCase))
+            KillImage(Path.GetFileName(src));
+
         string staged = Path.Combine(qdir, Path.GetFileName(src));
         try { File.Move(src, staged); }
         catch
@@ -1129,7 +1143,20 @@ public static class Scanner
                 File.Copy(src, staged, overwrite: true);
                 File.Delete(src);
             }
-            catch { return false; }
+            catch
+            {
+                /* 加密副本已成功, 原件被锁: 改名挂起 (同卷 rename 不需解锁, 原位立即消失) +
+                   MOVEFILE_DELAY_UNTIL_REBOOT 重启删除 */
+                try
+                {
+                    string pend = src + ".sfcpend";
+                    File.Move(src, pend, overwrite: true);
+                    Native.MoveFileExW(src, pend, 0x1 | 0x4);
+                    log?.Report($"[!] {src} 被占用 → 已改名挂起重启删除");
+                    return true;
+                }
+                catch { return false; }
+            }
         }
         try
         {
