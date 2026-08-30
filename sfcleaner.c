@@ -769,6 +769,7 @@ static void bj_scan_dir(const char *dir, int depth)
     char dlls[64][MAX_PATH];
     int nex = 0, ndl = 0, se = 0, ud = 0, w, i;
     char hitbuf[MAX_PATH];
+    char sexepath[MAX_PATH];
     static const char *wls[5] = {"\\programs\\", "\\package cache\\", "\\windowsapps\\", "\\microsoft\\", "\\windows\\"};
     int whitelisted = 0;
     if (depth > 4) return;
@@ -804,51 +805,47 @@ static void bj_scan_dir(const char *dir, int depth)
         }
     } while (FindNextFileA(h, &fd));
     FindClose(h);
-    /* 改名检测 (白名单目录也跑): 腾讯ACE改名steam.exe —
-       内嵌签名改名后仍有效, 但版本资源 OriginalFilename 不会跟着改 */
-    if (nex && !whitelisted) {
-        /* 非白名单: 配对门槛保持 — 有 dll 才逐个验 exe */
-        if (!ndl) nex = 0;
-    }
-    for (i = 0; i < nex; i++) {
-        char orig[260];
-        if (!whitelisted && !se && bj_is_signed(exes[i])) se = 1;
-        else if (!whitelisted && se) { /* 已有签名 exe, 继续找首个验签即可 */ }
-        if (!bj_is_signed(exes[i])) continue;
-        if (!ver_orig_name(exes[i], orig, sizeof orig)) continue;
-        {
-            char lowbase[260], loworig[260];
-            char *base = strrchr(exes[i], '\\');
-            base = base ? base + 1 : exes[i];
-            strncpy(lowbase, base, sizeof lowbase - 1); lowbase[sizeof lowbase - 1] = 0;
-            strncpy(loworig, orig, sizeof loworig - 1); loworig[sizeof loworig - 1] = 0;
-            str_lower(lowbase); str_lower(loworig);
-            if (!strcmp(lowbase, loworig)) continue;   /* 名字一致 → 非改名 */
-        }
-        {
-            char det[MAX_PATH + 160], act[MAX_PATH + 16];
-            _snprintf(det, sizeof det - 1, "%s [白加黑: 签名EXE被改名 (OriginalFilename=%s)]", exes[i], orig);
-            _snprintf(act, sizeof act - 1, "quarantine %s", exes[i]);
-            addf("FILE", 1, det, act);
-        }
-        break; /* 每目录报一个改名件即可 */
-    }
-    if (!whitelisted && nex && ndl) {      /* DLL 配对: 非白名单目录 */
+    /* 白加黑本体 = 配对: [有效签名EXE + 未签名DLL] 同目录.
+       改名 (OriginalFilename≠磁盘名) 只作佐证: 升高置信+补细节, 不单独成条 —
+       单独成条会误伤 VC_redist 等版本资源残缺的正规安装器 */
+    if (nex && ndl) {
+        char sexepath[MAX_PATH];
         for (i = 0; i < nex && !se; i++)
-            if (bj_is_signed(exes[i])) se = 1;
+            if (bj_is_signed(exes[i])) {
+                se = 1;
+                strncpy(sexepath, exes[i], sizeof sexepath - 1);
+                sexepath[sizeof sexepath - 1] = 0;
+            }
         if (se) {
-            for (i = 0; i < ndl && !ud; i++)
-                if (!bj_is_signed(dlls[i])) {
-                    strncpy(hitbuf, dlls[i], sizeof hitbuf - 1);
-                    hitbuf[sizeof hitbuf - 1] = 0;
-                    ud = 1;
-                }
-        }
-        if (se && ud) {
-            char det[MAX_PATH + 64], act[MAX_PATH + 16];
-            _snprintf(det, sizeof det - 1, "%s [白加黑: 有效签名EXE+未签名DLL]", hitbuf);
-            _snprintf(act, sizeof act - 1, "quarantine %s", hitbuf);
-            addf("FILE", 0, det, act);
+            char orig[260] = "";
+            int renamed = 0;
+            if (ver_orig_name(sexepath, orig, sizeof orig) && orig[0]) {
+                char lowbase[260], loworig[260];
+                char *base = strrchr(sexepath, '\\');
+                base = base ? base + 1 : sexepath;
+                strncpy(lowbase, base, sizeof lowbase - 1); lowbase[sizeof lowbase - 1] = 0;
+                strncpy(loworig, orig, sizeof loworig - 1); loworig[sizeof loworig - 1] = 0;
+                str_lower(lowbase); str_lower(loworig);
+                renamed = strcmp(lowbase, loworig) != 0 && strlen(orig) >= 4;
+            }
+            /* 白名单目录仅当签名 EXE 被改名时才成立 (正规软件名实一致) */
+            if (!whitelisted || renamed) {
+                for (i = 0; i < ndl && !ud; i++)
+                    if (!bj_is_signed(dlls[i])) {
+                        strncpy(hitbuf, dlls[i], sizeof hitbuf - 1);
+                        hitbuf[sizeof hitbuf - 1] = 0;
+                        ud = 1;
+                    }
+            }
+            if (se && ud) {
+                char det[MAX_PATH + 192], act[MAX_PATH + 16];
+                if (renamed)
+                    _snprintf(det, sizeof det - 1, "%s [白加黑: 签名EXE被改名 (OriginalFilename=%s)+未签名DLL]", hitbuf, orig);
+                else
+                    _snprintf(det, sizeof det - 1, "%s [白加黑: 有效签名EXE+未签名DLL]", hitbuf);
+                _snprintf(act, sizeof act - 1, "quarantine %s", hitbuf);
+                addf("FILE", renamed, det, act);
+            }
         }
     }
 }
