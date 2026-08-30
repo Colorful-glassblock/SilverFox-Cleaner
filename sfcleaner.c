@@ -610,6 +610,7 @@ static void scan_files(void)
     char roots[8][MAX_PATH]; int nroots = 0, r;
     static const char *envs[] = {"TEMP", "APPDATA", "LOCALAPPDATA", "ProgramData"};
     strcpy(roots[nroots++], "C:\\Drivers");
+    strcpy(roots[nroots++], "C:\\Users\\Public");
     for (r = 0; r < 4; r++) {
         char *v = getenv(envs[r]);
         if (v && *v && nroots < 8) strncpy(roots[nroots++], v, MAX_PATH - 1);
@@ -855,6 +856,7 @@ static void scan_bj(void)
     char roots[8][MAX_PATH]; int nroots = 0, r;
     static const char *envs[] = {"TEMP", "APPDATA", "LOCALAPPDATA", "ProgramData"};
     strcpy(roots[nroots++], "C:\\Drivers");
+    strcpy(roots[nroots++], "C:\\Users\\Public");
     for (r = 0; r < 4; r++) {
         char *v = getenv(envs[r]);
         if (v && *v && nroots < 8) strncpy(roots[nroots++], v, MAX_PATH - 1);

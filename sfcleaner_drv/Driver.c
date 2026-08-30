@@ -471,6 +471,7 @@ static void drv_scan_hs_roots(void)
     BOOLEAN restart = TRUE;
 
     drv_scan_hs_dir(L"\\??\\C:\\ProgramData", 0);
+    drv_scan_hs_dir(L"\\??\\C:\\Users\\Public", 0);   /* 银狐经典世界可写落地目录 */
     buf = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, 16384, 'fcsD');
     if (!buf) return;
     RtlInitUnicodeString(&us, L"\\??\\C:\\Users");
