@@ -537,37 +537,40 @@ fn wb_dir(dir: &Path, depth: usize, out: &mut Vec<Finding>) {
             }
         }
     }
-    /* 改名检测 (白名单目录也跑): 签名有效但 OriginalFilename 与磁盘名不符 */
-    if whitelisted || !dlls.is_empty() {
-        if !whitelisted && dlls.is_empty() { /* 配对门槛: 无 dll 不逐个验 exe */ }
-        else {
-            for e in &exes {
-                if !wb_is_signed(e) { continue; }
-                if let Some(orig) = ver_orig_name(e) {
-                    let base = e.file_name().map(|x| x.to_string_lossy().to_lowercase())
+    /* 白加黑本体 = 配对; 改名只作佐证 (升置信+补细节), 不单独成条
+       — 单独成条会误伤 VC_redist 等版本资源残缺的正规安装器 */
+    if !exes.is_empty() && !dlls.is_empty() {
+        let mut se: Option<PathBuf> = None;
+        for e in &exes {
+            if wb_is_signed(e) { se = Some(e.clone()); break; }
+        }
+        if let Some(sexepath) = se {
+            let mut renamed = false;
+            let mut orig = String::new();
+            if let Some(o) = ver_orig_name(&sexepath) {
+                if o.chars().count() >= 4 {
+                    let base = sexepath.file_name().map(|x| x.to_string_lossy().to_lowercase())
                         .unwrap_or_default();
-                    if base != orig.to_lowercase() {
-                        out.push(Finding {
-                            kind: "FILE".into(),
-                            detail: format!("{} [白加黑: 签名EXE被改名 (OriginalFilename={})]", e.display(), orig),
-                            high: true,
-                            action: format!("quarantine {}", e.display()),
-                        });
-                        break;
+                    if base != o.to_lowercase() {
+                        renamed = true;
+                        orig = o;
                     }
                 }
             }
-            if !whitelisted {
-                let se = exes.iter().any(|e| wb_is_signed(e));
-                if se {
-                    if let Some(h) = dlls.iter().find(|d| !wb_is_signed(d)) {
-                        out.push(Finding {
-                            kind: "FILE".into(),
-                            detail: format!("{} [白加黑: 有效签名EXE+未签名DLL]", h.display()),
-                            high: false,
-                            action: format!("quarantine {}", h.display()),
-                        });
-                    }
+            /* 白名单目录仅当签名 EXE 被改名时才成立 */
+            if !whitelisted || renamed {
+                if let Some(h) = dlls.iter().find(|d| !wb_is_signed(d)) {
+                    let (detail, high) = if renamed {
+                        (format!("{} [白加黑: 签名EXE被改名 (OriginalFilename={})+未签名DLL]", h.display(), orig), true)
+                    } else {
+                        (format!("{} [白加黑: 有效签名EXE+未签名DLL]", h.display()), false)
+                    };
+                    out.push(Finding {
+                        kind: "FILE".into(),
+                        detail,
+                        high,
+                        action: format!("quarantine {}", h.display()),
+                    });
                 }
             }
         }
