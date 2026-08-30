@@ -762,40 +762,37 @@ public static class Scanner
             if (fnm.EndsWith(".exe")) { if (exes.Count < 24) exes.Add(e); }
             else if (fnm.EndsWith(".dll")) { if (dlls.Count < 64) dlls.Add(e); }
         }
-        /* 改名检测 (白名单目录也跑): 签名有效但 OriginalFilename 与磁盘名不符
-           — 腾讯ACE改名steam.exe: 内嵌签名改名仍有效, 版本资源不会跟着改 */
-        if (exes.Count > 0 && (whitelisted || dlls.Count > 0))
+        /* 白加黑本体 = 配对; 改名只作佐证 (升置信+补细节), 不单独成条
+           — 单独成条会误伤 VC_redist 等版本资源残缺的正规安装器 */
+        if (exes.Count > 0 && dlls.Count > 0)
         {
-            foreach (var e in exes)
+            string? sexepath = exes.FirstOrDefault(IsValidSigned);
+            if (sexepath != null)
             {
-                if (!IsValidSigned(e)) continue;
-                string? orig = VerOriginalFilename(e);
-                if (orig == null) continue;
-                string baseName = Path.GetFileName(e).ToLowerInvariant();
-                if (baseName == orig.ToLowerInvariant()) continue;
-                res.Add(new Finding
+                bool renamed = false;
+                string orig = "";
+                string? o = VerOriginalFilename(sexepath);
+                if (o != null && o.Length >= 4)
                 {
-                    Kind = "FILE",
-                    Detail = $"{e} [白加黑: 签名EXE被改名 (OriginalFilename={orig})]",
-                    High = true,
-                    Action = $"quarantine {e}",
-                });
-                break;
-            }
-            if (!whitelisted)
-            {
-                bool se = exes.Any(IsValidSigned);
-                if (se)
+                    string baseName = Path.GetFileName(sexepath).ToLowerInvariant();
+                    if (baseName != o.ToLowerInvariant()) { renamed = true; orig = o; }
+                }
+                /* 白名单目录仅当签名 EXE 被改名时才成立 */
+                if (!whitelisted || renamed)
                 {
                     string? hit = dlls.FirstOrDefault(d => !IsValidSigned(d));
                     if (hit != null)
+                    {
                         res.Add(new Finding
                         {
                             Kind = "FILE",
-                            Detail = $"{hit} [白加黑: 有效签名EXE+未签名DLL]",
-                            High = false,
+                            Detail = renamed
+                                ? $"{hit} [白加黑: 签名EXE被改名 (OriginalFilename={orig})+未签名DLL]"
+                                : $"{hit} [白加黑: 有效签名EXE+未签名DLL]",
+                            High = renamed,
                             Action = $"quarantine {hit}",
                         });
+                    }
                 }
             }
         }
