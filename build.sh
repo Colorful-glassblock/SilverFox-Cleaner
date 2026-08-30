@@ -9,6 +9,16 @@ FLAGS="-O2 -s -Wall -Wno-pointer-sign \
  -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 \
  -finput-charset=UTF-8 -fexec-charset=GBK -mwindows"
 
+# 可选: 存在驱动/证书时 xxd 生成内嵌头 (CI 或手动放置 SFCleanerDrv.sys + SFCleanerCert.cer)
+if [ -f SFCleanerDrv.sys ] && [ -f SFCleanerCert.cer ]; then
+  echo "[embed] 生成 embed_drv.h + embed_cer.h (驱动+证书将内嵌进 exe)"
+  xxd -i -n sfc_drv SFCleanerDrv.sys > embed_drv.h
+  xxd -i -n sfc_cer SFCleanerCert.cer > embed_cer.h
+else
+  echo "[embed] 未找到 SFCleanerDrv.sys/SFCleanerCert.cer, 跳过内嵌 (需外部文件)"
+  rm -f embed_drv.h embed_cer.h
+fi
+
 echo "[1/2] x86  (UCRT, subsystem 6.1, requireAdministrator manifest)"
 i686-w64-mingw32-windres -o /tmp/mf32.o sfcleaner.rc
 i686-w64-mingw32-gcc $FLAGS -march=i686 -Wl,--major-subsystem-version,6 -Wl,--minor-subsystem-version,1 \
