@@ -241,20 +241,55 @@ static int seal_file(const char *staged, const char *origPath, const char *qdir)
     return 1;
 }
 
+/* 按映像名终止进程 (隔离运行中程序前先杀) */
+static void kill_image(const char *img)
+{
+    HANDLE hs = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32 pe;
+    HANDLE ph;
+    if (hs == INVALID_HANDLE_VALUE) return;
+    pe.dwSize = sizeof pe;
+    if (Process32First(hs, &pe)) {
+        do {
+            if (!_stricmp(pe.szExeFile, img)) {
+                ph = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+                if (ph) { TerminateProcess(ph, 0); CloseHandle(ph); }
+            }
+        } while (Process32Next(hs, &pe));
+    }
+    CloseHandle(hs);
+}
+
 static int quarantine_one(const char *src, const char *qdir)
 {
-    char staged[MAX_PATH];
+    char staged[MAX_PATH], pend[MAX_PATH];
     const char *base = strrchr(src, '\\');
+    const char *ext;
     if (!base) base = src; else base++;
     if (GetFileAttributesA(src) == INVALID_FILE_ATTRIBUTES) return 1;
     mkdir_p(qdir);
     take_own(src);
+
+    /* .exe 先杀运行实例 (否则删除必失败) */
+    ext = strrchr(base, '.');
+    if (ext && !_stricmp(ext, ".exe")) kill_image(base);
+
     _snprintf(staged, sizeof staged - 1, "%s\\%s", qdir, base);
     if (!MoveFileA(src, staged)) {
-        if (!CopyFileA(src, staged, FALSE) || !DeleteFileA(src)) return 0;
+        if (!CopyFileA(src, staged, FALSE)) return 0;
     }
     if (!seal_file(staged, src, qdir)) { remove(staged); return 0; }
-    return 1;
+
+    /* 原件移除梯: 删 → 去属性再删 → 改名挂起 (原位置立即消失, 重启删除) */
+    if (DeleteFileA(src)) return 1;
+    SetFileAttributesA(src, FILE_ATTRIBUTE_NORMAL);
+    if (DeleteFileA(src)) return 1;
+    _snprintf(pend, sizeof pend - 1, "%s.sfcpend", src);
+    if (MoveFileExA(src, pend, MOVEFILE_REPLACE_EXISTING | MOVEFILE_DELAY_UNTIL_REBOOT)) {
+        xlog("隔离: %s 被占用 → 已改名挂起重启删除", src);
+        return 1;
+    }
+    return 0;
 }
 
 static int unseal_restore(const char *p, unsigned long long ts, char *desc)
