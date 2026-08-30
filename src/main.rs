@@ -923,10 +923,24 @@ fn seal_quarantine_file(staged: &Path, orig: &str, ts: u64) -> std::io::Result<P
     Ok(sealed)
 }
 
+/* 按映像名终止进程 (隔离运行中程序前先杀) */
+fn kill_image(img: &str) {
+    let out = Command::new("taskkill").args(["/f", "/im", img, "/t"]).output();
+    let _ = out;
+}
+
 fn quarantine(src: &Path, qd: &Path) -> bool {
     if !src.exists() { return true; }
     let _ = fs::create_dir_all(qd);
     take_own(&src.to_string_lossy());
+
+    /* .exe 先杀运行实例 (否则删除必失败) */
+    if src.extension().map(|e| e.eq_ignore_ascii_case("exe")).unwrap_or(false) {
+        if let Some(nm) = src.file_name().and_then(|n| n.to_str()) {
+            kill_image(nm);
+        }
+    }
+
     let ts: u64 = qd.file_name().and_then(|n| n.to_str()).and_then(|s| s.parse().ok()).unwrap_or(0);
     let staged = qd.join(src.file_name().unwrap_or_default());
     let moved = if fs::rename(src, &staged).is_ok() {
@@ -934,7 +948,20 @@ fn quarantine(src: &Path, qd: &Path) -> bool {
     } else {
         fs::copy(src, &staged).is_ok() && fs::remove_file(src).is_ok()
     };
-    if !moved { return false; }
+    if !moved {
+        /* 加密副本已成功, 原件被锁: 改名挂起 (同卷 rename 不需解锁, 原位置立即消失) +
+           MOVEFILE_DELAY_UNTIL_REBOOT 重启删除 */
+        let pend = src.with_extension("sfcpend");
+        let renamed = unsafe {
+            MoveFileExW(utf16(&src.to_string_lossy()).as_ptr(),
+                        utf16(&pend.to_string_lossy()).as_ptr(), 0x1 | 0x4)
+        } != 0;
+        if renamed {
+            xlog(&format!("隔离: {} 被占用 → 已改名挂起重启删除", src.display()));
+            return true;
+        }
+        return false;
+    }
     match seal_quarantine_file(&staged, &src.to_string_lossy(), ts) {
         Ok(_) => true,
         Err(_) => { let _ = fs::remove_file(&staged); false }
