@@ -52,6 +52,12 @@ extern "system" {
     fn GetStockObject(i: i32) -> isize;
     fn CreateSolidBrush(c: u32) -> isize;
 }
+#[link(name = "version")]
+extern "system" {
+    fn GetFileVersionInfoSizeW(l: *const u16, h: *mut u32) -> u32;
+    fn GetFileVersionInfoW(l: *const u16, h: u32, cb: u32, d: *mut u8) -> i32;
+    fn VerQueryValueW(d: *const u8, sub: *const u16, buf: *mut *mut u8, len: *mut u32) -> i32;
+}
 #[link(name = "wintrust")]
 extern "system" {
     fn WinVerifyTrust(hwnd: isize, action: *const Guid, data: *mut WTData) -> i32;
@@ -365,6 +371,35 @@ fn scan_wu() -> Vec<Finding> {
     out
 }
 
+/* 版本资源 OriginalFilename: 改名白加黑核心信号 (腾讯ACE改名steam.exe) */
+fn ver_orig_name(p: &Path) -> Option<String> {
+    let wpath = utf16(&p.to_string_lossy());
+    unsafe {
+        let mut h: u32 = 0;
+        let sz = GetFileVersionInfoSizeW(wpath.as_ptr(), &mut h);
+        if sz == 0 || sz > 262144 { return None; }
+        let mut vbuf = vec![0u8; sz as usize];
+        if GetFileVersionInfoW(wpath.as_ptr(), 0, sz, vbuf.as_mut_ptr()) == 0 { return None; }
+        let mut sub = utf16("\\VarFileInfo\\Translation");
+        let mut ptrans: *mut u8 = std::ptr::null_mut();
+        let mut tsz: u32 = 0;
+        if VerQueryValueW(vbuf.as_ptr(), sub.as_mut_ptr(), &mut ptrans, &mut tsz) == 0 || tsz < 4 {
+            return None;
+        }
+        let lang = u16::from_le_bytes([*ptrans, *ptrans.add(1)]);
+        let cp = u16::from_le_bytes([*ptrans.add(2), *ptrans.add(3)]);
+        sub = utf16(&format!("\\StringFileInfo\\{:04x}{:04x}\\OriginalFilename", lang, cp));
+        let mut porig: *mut u8 = std::ptr::null_mut();
+        let mut olen: u32 = 0;
+        if VerQueryValueW(vbuf.as_ptr(), sub.as_mut_ptr(), &mut porig, &mut olen) == 0 || olen < 2 {
+            return None;
+        }
+        let ws: Vec<u16> = std::slice::from_raw_parts(porig as *const u16, (olen / 2) as usize)
+            .iter().take_while(|&&c| c != 0).copied().collect();
+        Some(String::from_utf16_lossy(&ws))
+    }
+}
+
 fn wb_is_signed(p: &Path) -> bool {
     let wpath = utf16(&p.to_string_lossy());
     let mut fi = WTFileInfo {
@@ -480,7 +515,7 @@ fn wb_dir(dir: &Path, depth: usize, out: &mut Vec<Finding>) {
     let low = dir.to_string_lossy().to_lowercase();
     if low.contains("sf_quarantine") { return; }
     const WL: [&str; 5] = ["\\programs\\", "\\package cache\\", "\\windowsapps\\", "\\microsoft\\", "\\windows\\"];
-    if WL.iter().any(|w| low.contains(w)) { return; }
+    let whitelisted = WL.iter().any(|w| low.contains(w));   /* 白名单目录降级: 只跑改名检测 */
     /* 枚举先行: 无 exe 或无 dll 的目录 (绝大多数) 0 次验签; 配对才查, 找到即停 */
     let mut exes: Vec<PathBuf> = Vec::new();
     let mut dlls: Vec<PathBuf> = Vec::new();
@@ -502,16 +537,38 @@ fn wb_dir(dir: &Path, depth: usize, out: &mut Vec<Finding>) {
             }
         }
     }
-    if !exes.is_empty() && !dlls.is_empty() {
-        let se = exes.iter().any(|e| wb_is_signed(e));
-        if se {
-            if let Some(h) = dlls.iter().find(|d| !wb_is_signed(d)) {
-                out.push(Finding {
-                    kind: "FILE".into(),
-                    detail: format!("{} [白加黑: 有效签名EXE+未签名DLL]", h.display()),
-                    high: false,
-                    action: format!("quarantine {}", h.display()),
-                });
+    /* 改名检测 (白名单目录也跑): 签名有效但 OriginalFilename 与磁盘名不符 */
+    if whitelisted || !dlls.is_empty() {
+        if !whitelisted && dlls.is_empty() { /* 配对门槛: 无 dll 不逐个验 exe */ }
+        else {
+            for e in &exes {
+                if !wb_is_signed(e) { continue; }
+                if let Some(orig) = ver_orig_name(e) {
+                    let base = e.file_name().map(|x| x.to_string_lossy().to_lowercase())
+                        .unwrap_or_default();
+                    if base != orig.to_lowercase() {
+                        out.push(Finding {
+                            kind: "FILE".into(),
+                            detail: format!("{} [白加黑: 签名EXE被改名 (OriginalFilename={})]", e.display(), orig),
+                            high: true,
+                            action: format!("quarantine {}", e.display()),
+                        });
+                        break;
+                    }
+                }
+            }
+            if !whitelisted {
+                let se = exes.iter().any(|e| wb_is_signed(e));
+                if se {
+                    if let Some(h) = dlls.iter().find(|d| !wb_is_signed(d)) {
+                        out.push(Finding {
+                            kind: "FILE".into(),
+                            detail: format!("{} [白加黑: 有效签名EXE+未签名DLL]", h.display()),
+                            high: false,
+                            action: format!("quarantine {}", h.display()),
+                        });
+                    }
+                }
             }
         }
     }
@@ -723,7 +780,7 @@ fn scan_files() -> Vec<Finding> {
         std::env::var("ProgramData").ok(),
     ].into_iter().flatten().map(PathBuf::from).collect();
     let nh = ["ekxzjr", "dd9ocged", "srl.exe", "wdybq.dll", "drivers.dat", "drivers.dat.0",
-        "wow64log.dll", "vafdska.sys", "vmservice.sys"];
+        "wow64log.dll", "vafdska.sys", "vmservice.sys", "steam.exe"];
     for root in &roots {
         walk(root, 0, &mut |p| {
             let s = p.to_string_lossy().to_lowercase();
