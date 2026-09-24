@@ -46,6 +46,12 @@ extern "system" {
     fn PostQuitMessage(c: i32);
     fn SendMessageW(h: isize, m: u32, w: usize, l: isize) -> isize;
     fn MessageBoxW(p: isize, t: *const u16, c: *const u16, t2: u32) -> i32;
+    fn PeekMessageW(m: *mut u8, h: isize, a: u32, b: u32, r: u32) -> i32;
+    fn SetWindowTextW(h: isize, s: *const u16) -> i32;
+}
+#[link(name = "comctl32")]
+extern "system" {
+    fn InitCommonControlsEx(p: *const u8) -> i32;
 }
 #[link(name = "gdi32")]
 extern "system" {
@@ -132,6 +138,19 @@ const WM_COMMAND: u32 = 0x111;
 const WM_SETFONT: u32 = 0x30;
 const EM_SETSEL: u32 = 0xB1;
 const EM_REPLACESEL: u32 = 0xC2;
+/* 进度条 (comctl32) */
+const ICC_PROGRESS_CLASS: u32 = 0x20;
+const PBM_SETRANGE32: u32 = 0x0406;
+const PBM_SETPOS: u32 = 0x0402;
+const PBM_SETMARQUEE: u32 = 0x040A;
+const PM_REMOVE: u32 = 1;
+static GUI_BAR: AtomicIsize = AtomicIsize::new(0);
+static GUI_STAT: AtomicIsize = AtomicIsize::new(0);
+static FILES_DONE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static PHASE_DONE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static FIND_CNT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+const PHASES_TOTAL: i64 = 9;
+static LIVE: std::sync::Mutex<Vec<Finding>> = std::sync::Mutex::new(Vec::new());
 const ES_MULTILINE: u32 = 4;
 const ES_READONLY: u32 = 0x800;
 const ES_AUTOVSCROLL: u32 = 0x80;
@@ -189,34 +208,113 @@ fn take_own(path: &str) {
 }
 
 // ---- 扫描 ----
-fn scan_all() -> Vec<Finding> {
+fn live_push(fs: &[Finding]) {
+    if fs.is_empty() { return; }
+    FIND_CNT.fetch_add(fs.len() as i64, std::sync::atomic::Ordering::Relaxed);
+    LIVE.lock().unwrap().extend_from_slice(fs);
+}
+
+/// UI 消息泵 + 实时刷新 (发现项上屏 / 状态行 / 跑马灯)。
+/// 扫描期间由 UI 线程反复调用, 界面不冻结, 结果即时可见。
+fn ui_tick() {
+    unsafe {
+        let mut msg = [0u8; 48];
+        while PeekMessageW(msg.as_mut_ptr(), 0, 0, 0, PM_REMOVE) != 0 {
+            TranslateMessage(msg.as_ptr());
+            DispatchMessageW(msg.as_ptr());
+        }
+    }
+    let staged: Vec<Finding> = { let mut q = LIVE.lock().unwrap(); std::mem::take(&mut *q) };
+    for f in staged {
+        gui_append(&format!("[{}] {}\n", f.kind, f.detail));
+    }
+    let bar = GUI_BAR.load(std::sync::atomic::Ordering::SeqCst);
+    let stat = GUI_STAT.load(std::sync::atomic::Ordering::SeqCst);
+    if stat != 0 {
+        let t = utf16(&format!("已遍历文件 {} · 发现 {} 项 · 阶段 {}/{}",
+            FILES_DONE.load(std::sync::atomic::Ordering::Relaxed),
+            FIND_CNT.load(std::sync::atomic::Ordering::Relaxed),
+            PHASE_DONE.load(std::sync::atomic::Ordering::Relaxed), PHASES_TOTAL));
+        unsafe { SetWindowTextW(stat, t.as_ptr()); }
+    }
+    if bar != 0 {
+        unsafe { SendMessageW(bar, PBM_SETMARQUEE, 1, 40); }
+    }
+}
+
+fn scan_all() -> Vec<Finding> { scan_all_with(false) }
+
+/// live=true 时: 结果分 9 步实时入队 + 等待期泵消息刷新 UI。
+fn scan_all_with(live: bool) -> Vec<Finding> {
     enable_privs();
+    FILES_DONE.store(0, std::sync::atomic::Ordering::Relaxed);
+    PHASE_DONE.store(0, std::sync::atomic::Ordering::Relaxed);
+    FIND_CNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    if live {
+        let bar = GUI_BAR.load(std::sync::atomic::Ordering::SeqCst);
+        let stat = GUI_STAT.load(std::sync::atomic::Ordering::SeqCst);
+        if bar != 0 { unsafe { SendMessageW(bar, PBM_SETMARQUEE, 1, 40); } }
+        if stat != 0 { let t = utf16("扫描中… (多线程并行)"); unsafe { SetWindowTextW(stat, t.as_ptr()); } }
+    }
     let results = Arc::new(Mutex::new(Vec::new()));
     let mut handles = Vec::new();
-    let r1 = Arc::clone(&results);
-    handles.push(thread::spawn(move || {
-        let mut f = scan_tasks(); f.extend(scan_services());
-        r1.lock().unwrap().extend(f);
-    }));
-    let r2 = Arc::clone(&results);
-    handles.push(thread::spawn(move || {
-        let mut f = scan_procs(); f.extend(scan_ctfmon());
-        r2.lock().unwrap().extend(f);
-    }));
-    let r3 = Arc::clone(&results);
-    handles.push(thread::spawn(move || {
-        let mut f = scan_files();
-        f.extend(scan_hosts());
-        f.extend(scan_wu());
-        r3.lock().unwrap().extend(f);
-    }));
-    let r4 = Arc::clone(&results);
-    handles.push(thread::spawn(move || {
-        let mut f = scan_wb();
-        f.extend(scan_windir());
-        r4.lock().unwrap().extend(f);
-    }));
+    {
+        let r = Arc::clone(&results);
+        handles.push(thread::spawn(move || {
+            let mut all: Vec<Finding> = Vec::new();
+            let f = scan_tasks(); if live { live_push(&f); } all.extend(f); PHASE_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let f = scan_services(); if live { live_push(&f); } all.extend(f); PHASE_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            r.lock().unwrap().extend(all);
+        }));
+    }
+    {
+        let r = Arc::clone(&results);
+        handles.push(thread::spawn(move || {
+            let mut all: Vec<Finding> = Vec::new();
+            let f = scan_procs(); if live { live_push(&f); } all.extend(f); PHASE_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let f = scan_ctfmon(); if live { live_push(&f); } all.extend(f); PHASE_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            r.lock().unwrap().extend(all);
+        }));
+    }
+    {
+        let r = Arc::clone(&results);
+        handles.push(thread::spawn(move || {
+            let mut all: Vec<Finding> = Vec::new();
+            let f = scan_files(); if live { live_push(&f); } all.extend(f); PHASE_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let f = scan_hosts(); if live { live_push(&f); } all.extend(f); PHASE_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let f = scan_wu(); if live { live_push(&f); } all.extend(f); PHASE_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            r.lock().unwrap().extend(all);
+        }));
+    }
+    {
+        let r = Arc::clone(&results);
+        handles.push(thread::spawn(move || {
+            let mut all: Vec<Finding> = Vec::new();
+            let f = scan_wb(); if live { live_push(&f); } all.extend(f); PHASE_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let f = scan_windir(); if live { live_push(&f); } all.extend(f); PHASE_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            r.lock().unwrap().extend(all);
+        }));
+    }
+    if live {
+        while handles.iter().any(|h| !h.is_finished()) {
+            ui_tick();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
     for h in handles { h.join().unwrap(); }
+    if live {
+        ui_tick();
+        let bar = GUI_BAR.load(std::sync::atomic::Ordering::SeqCst);
+        let stat = GUI_STAT.load(std::sync::atomic::Ordering::SeqCst);
+        if bar != 0 {
+            unsafe {
+                SendMessageW(bar, PBM_SETMARQUEE, 0, 0);
+                SendMessageW(bar, PBM_SETRANGE32, 0, 100);
+                SendMessageW(bar, PBM_SETPOS, 100, 0);
+            }
+        }
+        if stat != 0 { let t = utf16("扫描完成"); unsafe { SetWindowTextW(stat, t.as_ptr()); } }
+    }
     let mut out = results.lock().unwrap().clone();
     out.sort_by(|a, b| b.high.cmp(&a.high));
     out
@@ -827,7 +925,10 @@ fn walk(dir: &Path, depth: usize, cb: &mut impl FnMut(&Path)) {
     if let Ok(rd) = fs::read_dir(dir) {
         for e in rd.flatten() {
             let p = e.path();
-            if p.is_dir() { walk(&p, depth + 1, cb); } else { cb(&p); }
+            if p.is_dir() { walk(&p, depth + 1, cb); } else {
+                FILES_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                cb(&p);
+            }
         }
     }
 }
@@ -1366,8 +1467,8 @@ unsafe extern "system" fn wndproc(hwnd: isize, msg: u32, wp: usize, lp: isize) -
         WM_COMMAND if (wp >> 16) == 0 => match (wp & 0xFFFF) as usize {
             1 => {
                 gui_append(&format!("[{}] 扫描中 (多线程)...\n", now_str()));
-                let f = scan_all();
-                gui_append(&fmt_report(&f));
+                let f = scan_all_with(true);
+                gui_append(&format!("\n共 {} 项 (高置信 {})\n", f.len(), f.iter().filter(|x| x.high).count()));
                 gui_append("[提示] 点击 [清除] 处理以上项\n\n");
                 0
             }
@@ -1470,9 +1571,16 @@ fn run_gui() {
         let b5 = CreateWindowExW(0, utf16("BUTTON").as_ptr(), utf16("🗑 清空隔离区").as_ptr(), WS_CHILD | WS_VISIBLE, 504, 12, 150, 38, hwnd, 5, inst, std::ptr::null());
         let b6 = CreateWindowExW(0, utf16("BUTTON").as_ptr(), utf16("☢ 极端").as_ptr(), WS_CHILD | WS_VISIBLE, 624, 12, 110, 38, hwnd, 6, inst, std::ptr::null());
         let b7 = CreateWindowExW(0, utf16("BUTTON").as_ptr(), utf16("⚡ 不客气").as_ptr(), WS_CHILD | WS_VISIBLE, 744, 12, 130, 38, hwnd, 7, inst, std::ptr::null());
-        let edit = CreateWindowExW(0x200, utf16("EDIT").as_ptr(), utf16("").as_ptr(), WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL | ES_WANTRETURN, 14, 58, 880, 490, hwnd, 4, inst, std::ptr::null());
+        /* 注册进度条类 (comctl32) 并强制链接导入 */
+        let icc: Vec<u8> = [8u32.to_le_bytes(), ICC_PROGRESS_CLASS.to_le_bytes()].concat();
+        InitCommonControlsEx(icc.as_ptr());
+        let bar = CreateWindowExW(0, utf16("msctls_progress32").as_ptr(), utf16("").as_ptr(), WS_CHILD | WS_VISIBLE | 0x01 /*PBS_SMOOTH*/, 14, 56, 700, 14, hwnd, 8, inst, std::ptr::null());
+        let barstat = CreateWindowExW(0, utf16("STATIC").as_ptr(), utf16("就绪").as_ptr(), WS_CHILD | WS_VISIBLE, 722, 56, 172, 16, hwnd, 9, inst, std::ptr::null());
+        GUI_BAR.store(bar, Ordering::SeqCst);
+        GUI_STAT.store(barstat, Ordering::SeqCst);
+        let edit = CreateWindowExW(0x200, utf16("EDIT").as_ptr(), utf16("").as_ptr(), WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL | ES_WANTRETURN, 14, 74, 880, 472, hwnd, 4, inst, std::ptr::null());
         let status = CreateWindowExW(0, utf16("STATIC").as_ptr(), utf16("就绪 — 扫描 | SYSTEM + TrustedInstaller | 加密隔离: sf_quarantine (仅本工具可还原)").as_ptr(), WS_CHILD | WS_VISIBLE, 14, 556, 880, 24, hwnd, 5, inst, std::ptr::null());
-        for h in [b1, b2, b3, b4, b5, b6, b7, edit, status] { SendMessageW(h, WM_SETFONT, font as usize, 1); }
+        for h in [b1, b2, b3, b4, b5, b6, b7, edit, status, barstat] { SendMessageW(h, WM_SETFONT, font as usize, 1); }
         GUI_LOG.store(edit, Ordering::SeqCst);
         gui_append("╔════════════════════════════════════╗\n║  SilverFox Cleaner v4.1 — dmo/client ║\n╚════════════════════════════════════╝\n\n检测: 持久化 / 落盘物 / 互斥 / SrL / ctfmon内存注入\n权限: SYSTEM + TrustedInstaller 提权\n隔离: 时间戳加密 SFQENC1 (明文不落盘防复活)\n还原: [♻ 还原隔离区] 或 restore 子命令\n扫描: 多线程并行 (任务+服务 | 进程+内存 | 文件)\n\n");
         let mut msg = [0u8; 48];
