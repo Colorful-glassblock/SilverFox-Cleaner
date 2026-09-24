@@ -16,6 +16,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <wintrust.h>
+#include <commctrl.h>   /* 进度条 PROGRESS_CLASS/PBM_* */
 #include <softpub.h>
 #include <mscat.h>
 
@@ -52,6 +53,14 @@ static const char *SVC_PATS[][2] = {{"EkxZJr", "1"}, {"SrL.exe", "1"}, {"cd /d",
 typedef struct { char kind[12]; char detail[700]; int high; char action[400]; } Finding;
 static Finding g_f[MAXF];
 static int g_nf;
+
+/* ---- 进度条与实时状态 (扫描线程 → PostMessage 回传 UI) ---- */
+#define WM_SFC_PROGRESS (WM_APP + 1)   /* 计数变化 */
+#define WM_SFC_SCANBEGIN (WM_APP + 2)  /* 开始: 跑马灯 */
+#define WM_SFC_SCANDONE  (WM_APP + 3)  /* 结束: 停表 */
+static HWND g_hwnd = NULL, g_prog = NULL, g_stat = NULL;
+static volatile LONG g_files_done = 0, g_phase_done = 0;
+#define SFC_PHASES 6
 
 /* ---- 小工具 ---- */
 static CRITICAL_SECTION g_fcs;
@@ -346,7 +355,12 @@ static void walk_paths(const char *dir, int depth, void (*cb)(const char *full, 
         full[sizeof full - 1] = 0;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) walk_paths(full, depth + 1, cb, ctx);
-        } else cb(full, ctx);
+        } else {
+            LONG n;
+            cb(full, ctx);
+            n = InterlockedIncrement(&g_files_done);
+            if (g_hwnd && !(n & 0x3F)) PostMessageA(g_hwnd, WM_SFC_PROGRESS, 0, 0);
+        }
     } while (FindNextFileA(h, &fd));
     FindClose(h);
 }
@@ -1205,6 +1219,8 @@ static DWORD WINAPI scan_group(LPVOID p)
     case 4: scan_windir(); break;
     case 5: scan_wu(); scan_hosts(); break;
     }
+    InterlockedIncrement(&g_phase_done);
+    if (g_hwnd) PostMessageA(g_hwnd, WM_SFC_PROGRESS, 0, 0);
     return 0;
 }
 
@@ -1214,6 +1230,9 @@ static void scan_all(void)
     int i;
     enable_privs();
     g_nf = 0;
+    g_files_done = 0;
+    g_phase_done = 0;
+    if (g_hwnd) PostMessageA(g_hwnd, WM_SFC_SCANBEGIN, 0, 0);
     if (!g_fcs_init) { InitializeCriticalSection(&g_fcs); g_fcs_init = 1; }
     for (i = 0; i < 6; i++) {
         th[i] = CreateThread(NULL, 0, scan_group, (LPVOID)(size_t)i, 0, NULL);
@@ -1232,6 +1251,7 @@ static void scan_all(void)
         }
         CloseHandle(th[i]);
     }
+    if (g_hwnd) PostMessageA(g_hwnd, WM_SFC_SCANDONE, 0, 0);
 }
 
 /* ---- 清除 ---- */
@@ -1759,6 +1779,30 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
     char buf[16384];
     switch (m) {
     case WM_DESTROY: PostQuitMessage(0); return 0;
+    case WM_SFC_SCANBEGIN:   /* 开始: 跑马灯 + 初始状态 */
+        if (g_prog) {
+            SendMessageA(g_prog, PBM_SETMARQUEE, TRUE, 40);
+            SetWindowTextA(g_stat, "扫描中… (多线程并行)");
+        }
+        return 0;
+    case WM_SFC_PROGRESS:    /* 实时: 已遍历文件 / 发现项 / 阶段 */
+        if (g_stat) {
+            _snprintf(buf, sizeof buf - 1,
+                      "已遍历文件 %ld · 发现 %d 项 · 阶段 %ld/%d%s",
+                      g_files_done, g_nf, g_phase_done, SFC_PHASES,
+                      g_phase_done >= SFC_PHASES ? " · 汇总中" : "");
+            buf[sizeof buf - 1] = 0;
+            SetWindowTextA(g_stat, buf);
+        }
+        return 0;
+    case WM_SFC_SCANDONE:    /* 结束: 停跑马灯, 进度拉满 */
+        if (g_prog) {
+            SendMessageA(g_prog, PBM_SETMARQUEE, FALSE, 0);
+            SendMessageA(g_prog, PBM_SETRANGE32, 0, 100);
+            SendMessageA(g_prog, PBM_SETPOS, 100, 0);
+        }
+        if (g_stat) SetWindowTextA(g_stat, "扫描完成");
+        return 0;
     case WM_COMMAND:
         if (HIWORD(wp)) break; /* 仅接受 BN_CLICKED: EDIT 控件(同ID 7)的 EN_UPDATE/EN_CHANGE
                                   通知也走 WM_COMMAND, 不拦会导致启动即弹不客气确认 */
@@ -1838,6 +1882,12 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
 static void run_gui(void)
 {
     WNDCLASSA wc; HWND hwnd; HFONT font;
+    {   /* 注册进度条控件类并强制 comctl32 导入 (否则 PROGRESS_CLASSA 不存在) */
+        INITCOMMONCONTROLSEX icc;
+        icc.dwSize = sizeof icc;
+        icc.dwICC = ICC_PROGRESS_CLASS;
+        InitCommonControlsEx(&icc);
+    }
     static const char *btns[7] = {"扫描", "清除", "关于", "还原隔离区", "清空隔离区", "极端", "不客气"};
     static const int bx[7] = {14, 144, 274, 364, 504, 624, 744};
     static const int bw[7] = {120, 120, 80, 130, 150, 110, 130};
@@ -1862,10 +1912,20 @@ static void run_gui(void)
                                    wc.hInstance, NULL);
         SendMessageA(g_btn[i], WM_SETFONT, (WPARAM)font, TRUE);
     }
+    g_hwnd = hwnd;
+    /* 进度条 (跑马灯) + 实时状态行: 扫描中即时可见, 不再黑箱 */
+    g_prog = CreateWindowExA(0, PROGRESS_CLASSA, "",
+                             WS_CHILD | WS_VISIBLE | PBS_SMOOTH,
+                             14, 56, 700, 14, hwnd, (HMENU)8, wc.hInstance, NULL);
+    SendMessageA(g_prog, PBM_SETRANGE32, 0, 100);
+    g_stat = CreateWindowExA(0, "STATIC", "就绪",
+                             WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS,
+                             722, 56, 168, 16, hwnd, (HMENU)9, wc.hInstance, NULL);
+    SendMessageA(g_stat, WM_SETFONT, (WPARAM)font, TRUE);
     g_edit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
                              WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | WS_VSCROLL
                              | ES_AUTOVSCROLL | ES_WANTRETURN,
-                             14, 58, 876, 490, hwnd, (HMENU)7, wc.hInstance, NULL);
+                             14, 74, 876, 474, hwnd, (HMENU)7, wc.hInstance, NULL);
     SendMessageA(g_edit, WM_SETFONT, (WPARAM)font, TRUE);
     gui_append("SilverFox Cleaner C (NT6+, 重写版) - dmo/client\n"
                "build: " __DATE__ " " __TIME__ "\n"
