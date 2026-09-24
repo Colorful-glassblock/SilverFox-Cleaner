@@ -1,5 +1,6 @@
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using System.Collections.ObjectModel;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Windowing;
 using Windows.Graphics;
@@ -9,6 +10,7 @@ namespace SFCleaner;
 public sealed partial class MainWindow : Window
 {
     private List<Finding> _findings = [];
+    private readonly ObservableCollection<Finding> _items = [];   /* 实时上屏 (增量动画) */
     private bool _busy;
 
     public MainWindow()
@@ -23,6 +25,7 @@ public sealed partial class MainWindow : Window
         AppendLog("权限: SYSTEM + TrustedInstaller 提权 | 隔离: 时间戳加密 SFQENC1 (仅本工具可还原)");
         AppendLog("扫描: 多线程并行 (任务+服务 | 进程+内存 | 文件)");
         AppendLog("");
+        LvFindings.ItemsSource = _items;   /* 增量集合: 发现即插入, 配合 Entrance/Add 动画 */
     }
 
     private void AppendLog(string s) => TbLog.Text += s + "\n";
@@ -37,12 +40,33 @@ public sealed partial class MainWindow : Window
         _busy = true;
         BtnScan.IsEnabled = BtnClean.IsEnabled = false;
         BusyRing.IsActive = true;
+        _items.Clear();
+        TblEmpty.Visibility = Visibility.Collapsed;
+        BarScan.Value = 0;
+        BarScan.IsIndeterminate = true;
+        TblLive.Text = "准备中…";
         TblStatus.Text = "扫描中 (多线程并行)…";
         AppendLog($"[{DateTime.Now:HH:mm:ss}] 扫描中…");
 
-        _findings = await Task.Run(Scanner.ScanAll);
+        /* 三段实时回报: 日志 / 进度(0..1) / 发现项(即时插入 → 动画上屏) */
+        var log = new Progress<string>(AppendLog);
+        var prog = new Progress<double>(p =>
+        {
+            BarScan.IsIndeterminate = false;
+            BarScan.Value = Math.Round(p * 100);
+            TblLive.Text = $"已发现 {_items.Count} 项 · {p * 100:F0}%";
+        });
+        var found = new Progress<Finding>(f =>
+        {
+            _items.Add(f);
+            TblLive.Text = $"已发现 {_items.Count} 项" + (BarScan.IsIndeterminate ? "" : $" · {BarScan.Value:F0}%");
+        });
 
-        LvFindings.ItemsSource = _findings;
+        _findings = await Task.Run(() => Scanner.ScanAll(log, prog, found));
+
+        BarScan.IsIndeterminate = false;
+        BarScan.Value = 100;
+        TblLive.Text = $"完成 · {_findings.Count} 项";
         bool none = _findings.Count == 0;
         TblEmpty.Visibility = none ? Visibility.Visible : Visibility.Collapsed;
         int hi = _findings.Count(f => f.High);

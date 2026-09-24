@@ -9,6 +9,7 @@
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
@@ -66,11 +67,41 @@
             <ProgressRing x:Name="BusyRing" IsActive="False" Width="22" Height="22" Margin="8,0,0,0"/>
         </StackPanel>
 
-        <Grid Grid.Row="2">
+        <Grid Grid.Row="2" ColumnSpacing="10">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <ProgressBar x:Name="BarScan" Grid.Column="0" Minimum="0" Maximum="100" Value="0"
+                         IsIndeterminate="False" VerticalAlignment="Center"
+                         CornerRadius="4" Height="6">
+                <ProgressBar.Transitions>
+                    <TransitionCollection>
+                        <RepositionThemeTransition/>
+                    </TransitionCollection>
+                </ProgressBar.Transitions>
+            </ProgressBar>
+            <TextBlock x:Name="TblLive" Grid.Column="1" Opacity="0.6" FontSize="12"
+                       VerticalAlignment="Center" Text="待扫描"/>
+        </Grid>
+
+        <Grid Grid.Row="3">
             <ListView x:Name="LvFindings" SelectionMode="None">
+                <ListView.ItemContainerTransitions>
+                    <TransitionCollection>
+                        <AddDeleteThemeTransition/>
+                        <RepositionThemeTransition/>
+                        <EntranceThemeTransition FromVerticalOffset="24" IsStaggeringEnabled="True"/>
+                    </TransitionCollection>
+                </ListView.ItemContainerTransitions>
                 <ListView.ItemTemplate>
                     <DataTemplate x:DataType="local:Finding">
                         <Border Background="#14FFFFFF" CornerRadius="6" Padding="14,8" Margin="0,2">
+                            <Border.Transitions>
+                                <TransitionCollection>
+                                    <EntranceThemeTransition FromVerticalOffset="16"/>
+                                </TransitionCollection>
+                            </Border.Transitions>
                             <StackPanel Spacing="2">
                                 <TextBlock Text="{x:Bind Head}" FontSize="14" TextWrapping="Wrap"/>
                                 <TextBlock Text="{x:Bind Action}" FontSize="12" Opacity="0.55" TextWrapping="Wrap"/>
@@ -85,7 +116,7 @@
                        HorizontalAlignment="Center" VerticalAlignment="Center"/>
         </Grid>
 
-        <Expander Grid.Row="3" Header="日志" IsExpanded="True" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+        <Expander Grid.Row="4" Header="日志" IsExpanded="True" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
             <TextBox x:Name="TbLog"
                      IsReadOnly="True" AcceptsReturn="True"
                      FontFamily="Consolas" FontSize="12"
@@ -94,7 +125,7 @@
                      BorderThickness="0" Background="Transparent"/>
         </Expander>
 
-        <StackPanel Grid.Row="4" Orientation="Horizontal" Spacing="10">
+        <StackPanel Grid.Row="5" Orientation="Horizontal" Spacing="10">
             <TextBlock x:Name="TblStats" FontWeight="SemiBold"/>
             <TextBlock x:Name="TblStatus" Opacity="0.55"
                        Text="就绪 — 点击扫描开始检测"/>

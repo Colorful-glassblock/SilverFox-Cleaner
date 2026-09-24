@@ -291,36 +291,30 @@ public static class Scanner
 
     // ---- 扫描入口 ----
 
-    public static List<Finding> ScanAll()
+    public static List<Finding> ScanAll() => ScanAll(null, null, null);
+
+    /// <summary>流式扫描: log 日志 / prog 进度(0..1) / found 实时发现项 — 结果不等扫完才上屏。</summary>
+    public static List<Finding> ScanAll(IProgress<string>? log, IProgress<double>? prog, IProgress<Finding>? found)
     {
         EnablePrivileges();
-        var t1 = Task.Run(() =>
+        const int stepsTotal = 9;          // t1:2 t2:2 t3:3 t4:2
+        int doneSteps = 0;
+        void Step()
         {
-            var f = ScanTasks();
-            f.AddRange(ScanServices());
-            return f;
-        });
-        var t2 = Task.Run(() =>
+            int d = Interlocked.Increment(ref doneSteps);
+            prog?.Report(Math.Min(1.0, (double)d / stepsTotal));
+        }
+        var bag = new System.Collections.Concurrent.ConcurrentBag<Finding>();
+        void Emit(IEnumerable<Finding> fs)
         {
-            var f = ScanProcs();
-            f.AddRange(ScanCtfmon());
-            return f;
-        });
-        var t3 = Task.Run(() =>
-        {
-            var f = ScanFiles();
-            f.AddRange(ScanHosts());
-            f.AddRange(ScanWu());
-            return f;
-        });
-        var t4 = Task.Run(() =>
-        {
-            var f = ScanWb();
-            f.AddRange(ScanWd());
-            return f;
-        });
+            foreach (var f in fs) { bag.Add(f); found?.Report(f); }
+        }
+        var t1 = Task.Run(() => { Emit(ScanTasks()); Step(); Emit(ScanServices()); Step(); });
+        var t2 = Task.Run(() => { Emit(ScanProcs()); Step(); Emit(ScanCtfmon()); Step(); });
+        var t3 = Task.Run(() => { Emit(ScanFiles(log, found)); Step(); Emit(ScanHosts()); Step(); Emit(ScanWu()); Step(); });
+        var t4 = Task.Run(() => { Emit(ScanWb()); Step(); Emit(ScanWd()); Step(); });
         Task.WaitAll(t1, t2, t3, t4);
-        var all = t1.Result.Concat(t2.Result).Concat(t3.Result).Concat(t4.Result).ToList();
+        var all = bag.ToList();
         all.Sort((a, b) => b.High.CompareTo(a.High));
         return all;
     }
@@ -917,9 +911,12 @@ public static class Scanner
         return res;
     }
 
-    public static List<Finding> ScanFiles()
+    public static List<Finding> ScanFiles() => ScanFiles(null, null);
+
+    public static List<Finding> ScanFiles(IProgress<string>? log, IProgress<Finding>? found)
     {
         var res = new List<Finding>();
+        long seenFiles = 0;
         var roots = new List<string> { @"C:\Drivers", @"C:\Users\Public" };
         AddEnv(roots, "TEMP");
         AddEnv(roots, "APPDATA");
@@ -931,6 +928,8 @@ public static class Scanner
             foreach (var p in Walk(root, 4))
             {
                 if (p.ToLowerInvariant().Contains("sf_quarantine")) continue;
+                if ((Interlocked.Increment(ref seenFiles) & 0xFF) == 0)
+                    log?.Report($"  已扫描 {seenFiles} 个文件 (发现 {res.Count} 项)");
                 string fnm;
                 long sz;
                 try
@@ -963,13 +962,15 @@ public static class Scanner
                 catch { /* 属性不可读忽略 */ }
                 if (byNm || md.Length > 0 || (hs.Length > 0 && isExt))
                 {
-                    res.Add(new Finding
+                    var nf = new Finding
                     {
                         Kind = "FILE",
                         Detail = byNm ? p : p + md + hs,
                         High = byNm,
                         Action = $"quarantine {p}"
-                    });
+                    };
+                    res.Add(nf);
+                    found?.Report(nf);          /* 实时上屏, 不等整轮扫完 */
                 }
             }
         }
