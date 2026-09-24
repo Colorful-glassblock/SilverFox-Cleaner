@@ -166,8 +166,12 @@ jobs:
             echo "tag=$BR-pre-$SHA8" >> "$GITHUB_OUTPUT"
             echo "prerelease=true"   >> "$GITHUB_OUTPUT"
             echo "title=SFCleaner-WinUI3 pre-$SHA8" >> "$GITHUB_OUTPUT"
-            [ "$LINEAR" = "0" ] && echo "::warning::历史非线性(含 merge commit) — 降级为 pre-release"
+            if [ "$LINEAR" = "0" ]; then
+              echo "::warning::历史非线性(含 merge commit) — 降级为 pre-release"
+            fi
           fi
+          # 兜底: 本步只产出 outputs, 分支末行不得毒化 step 退出码 (非 release push 曾因此必红)
+          :
       - name: 发布 (tag 已存在则跳过, 不覆盖)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
