@@ -18,6 +18,7 @@
 #include <wintrust.h>
 #include <commctrl.h>   /* 进度条 PROGRESS_CLASS/PBM_* */
 #include <softpub.h>
+#include "ml_feat.h"    /* ML 复核: 结构匹配文件打分 (22 特征逻辑回归) */
 #include <mscat.h>
 
 /* ---- 常量 ---- */
@@ -79,6 +80,15 @@ static void addf(const char *kind, int high, const char *detail, const char *act
     strncpy(f->action, action, sizeof f->action - 1);
     f->high = high;
     LeaveCriticalSection(&g_fcs);
+}
+
+/* 自身路径豁免: 本 exe 内嵌 STEGR1Xp/JELG 魔数等特征串, 按结构匹配会打到自己 */
+static int is_self_path(const char *full)
+{
+    static char self[MAX_PATH];
+    static int init = 0;
+    if (!init) { init = 1; GetModuleFileNameA(NULL, self, MAX_PATH); }
+    return self[0] && _stricmp(full, self) == 0;
 }
 
 static int mem_find_bytes(const unsigned char *h, size_t hl, const unsigned char *n, size_t nl)
@@ -645,11 +655,20 @@ static void file_cb(const char *full, void *unused)
             }
         }
         if (byNm || md[0]) {
-            char det[MAX_PATH + 64], act[MAX_PATH + 16];
+            char det[MAX_PATH + 96], act[MAX_PATH + 16], mlb[24] = "";
+            int high = byNm;
+            if (!byNm && !is_self_path(full)) {
+                /* 结构匹配 → ML 复核: >0.7 升为高置信; 非 PE 不给分 (ml_score 返 -1) */
+                double pr = ml_score(full);
+                if (pr >= 0.0) {
+                    _snprintf(mlb, sizeof mlb - 1, " [ML %.2f]", pr);
+                    if (pr > 0.7) high = 1;
+                }
+            }
             if (byNm) { strncpy(det, full, sizeof det - 1); det[sizeof det - 1] = 0; }
-            else _snprintf(det, sizeof det - 1, "%s%s", full, md);
+            else _snprintf(det, sizeof det - 1, "%s%s%s", full, md, mlb);
             _snprintf(act, sizeof act - 1, "quarantine %s", full);
-            addf("FILE", byNm, det, act);
+            addf("FILE", high, det, act);
         }
     }
 }
