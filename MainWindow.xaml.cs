@@ -32,6 +32,18 @@ public sealed partial class MainWindow : Window
 
     // ---- 扫描 ----
 
+    private void MlToggle_Click(object sender, ToggleMenuFlyoutItemClickEventArgs e)
+    {
+        Scanner.MlEnabled = MlToggle.IsChecked == true;
+        AppendLog(Scanner.MlEnabled
+            ? "[ML] 结构匹配 ML 复核已开启 (实验性; 打分>0.7 升为高置信)"
+            : "[ML] 结构匹配 ML 复核已关闭 (默认)");
+        TblStatus.Text = Scanner.MlEnabled ? "ML 复核: 开 (实验性)" : "ML 复核: 关";
+    }
+
+    private async void NomoreMenu_Click(object sender, RoutedEventArgs e)
+        => await Nomore_Click(sender, e);   // 菜单入口, 对话框内已含不稳定警告
+
     private async void Scan_Click(object sender, RoutedEventArgs e) => await RunScanAsync();
 
     private async Task RunScanAsync()
@@ -257,12 +269,13 @@ public sealed partial class MainWindow : Window
         var dlg = new ContentDialog
         {
             XamlRoot = Content.XamlRoot,
-            Title = "⚡ 不客气模式确认",
+            Title = "⚡ 不客气模式确认 (实验性功能 — 不稳定)",
             Content = new TextBlock
             {
                 TextWrapping = TextWrapping.Wrap,
                 MaxWidth = 440,
-                Text = "导入自定义证书 + 装载内核驱动清理\n"
+                Text = "⚠ 实验性功能, 不稳定! 仅限虚拟机, 请保存所有工作!\n\n"
+                     + "导入自定义证书 + 装载内核驱动清理\n"
                      + "testsigning ON → 蓝屏重启 → 驱动清理 → 卸载 → 删证书 → testsigning OFF\n\n"
                      + "材料: SFCleanerDrv.sys + SFCleanerCert.pfx/cer 与程序同目录",
             },

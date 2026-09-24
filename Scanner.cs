@@ -7,7 +7,10 @@ using Microsoft.Win32;
 
 namespace SFCleaner;
 
-public sealed class Finding
+/// 实验性: 结构匹配 ML 复核开关 (默认关; 「实验性功能」菜单可开启)
+    public static bool MlEnabled;
+
+    public sealed class Finding
 {
     public required string Kind { get; init; }
     public required string Detail { get; init; }
@@ -965,7 +968,7 @@ public static class Scanner
                     /* 结构匹配 → ML 复核: >0.7 升为高置信; 非 PE 不给分 */
                     bool high = byNm;
                     string mls = "";
-                    if (!byNm && !IsSelfPath(p) && MlModel.ScorePath(p) is double pr)
+                    if (!byNm && MlEnabled && !IsSelfPath(p) && MlModel.ScorePath(p) is double pr)
                     {
                         mls = $" [ML {pr:F2}]";
                         if (pr > 0.7) high = true;

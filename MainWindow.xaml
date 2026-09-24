@@ -16,6 +16,13 @@
         </Grid.RowDefinitions>
 
         <StackPanel Grid.Row="0" Spacing="2">
+            <MenuBar>
+                <MenuBarItem Title="实验性功能">
+                    <ToggleMenuFlyoutItem x:Name="MlToggle" Text="开启 ML 复核 (实验性, 默认关)" Click="MlToggle_Click"/>
+                    <MenuFlyoutSeparator/>
+                    <MenuFlyoutItem Text="不客气模式 (不稳定)…" Click="NomoreMenu_Click"/>
+                </MenuBarItem>
+            </MenuBar>
             <TextBlock Text="🦊 SilverFox Cleaner" FontSize="26" FontWeight="SemiBold"/>
             <TextBlock Text="银狐 (dmo/client) 检测清除 · SYSTEM + TrustedInstaller 提权 · 隔离区 C:\ProgramData\sf_quarantine"
                        Opacity="0.65" FontSize="13"/>
