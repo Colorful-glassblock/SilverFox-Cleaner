@@ -10,7 +10,7 @@ mod ml_model;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -51,6 +51,9 @@ extern "system" {
     fn MessageBoxW(p: isize, t: *const u16, c: *const u16, t2: u32) -> i32;
     fn PeekMessageW(m: *mut u8, h: isize, a: u32, b: u32, r: u32) -> i32;
     fn SetWindowTextW(h: isize, s: *const u16) -> i32;
+    fn CreateMenu() -> isize;
+    fn AppendMenuW(h: isize, f: u32, i: usize, s: *const u16) -> i32;
+    fn CheckMenuItem(h: isize, i: usize, f: u32) -> i32;
 }
 #[link(name = "comctl32")]
 extern "system" {
@@ -149,6 +152,16 @@ const PBM_SETMARQUEE: u32 = 0x040A;
 const PM_REMOVE: u32 = 1;
 static GUI_BAR: AtomicIsize = AtomicIsize::new(0);
 static GUI_STAT: AtomicIsize = AtomicIsize::new(0);
+/* ---- 实验性功能: 结构匹配 ML 复核 (默认关) ---- */
+static ML_ENABLED: AtomicI32 = AtomicI32::new(0);
+static MENU_MAIN: AtomicIsize = AtomicIsize::new(0);
+const MENU_ML_TOGGLE: usize = 0x110;
+const MENU_NOMORE: usize = 0x111;
+const MF_POPUP: u32 = 0x10;
+const MF_SEPARATOR: u32 = 0x800;
+const MF_CHECKED: u32 = 0x8;
+const MF_STRING: u32 = 0x0;
+const MF_BYCOMMAND: u32 = 0x0;
 static FILES_DONE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static PHASE_DONE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static FIND_CNT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
@@ -923,7 +936,7 @@ fn scan_files() -> Vec<Finding> {
                 /* 结构匹配 → ML 复核: >0.7 升为高置信; 非 PE 不给分 */
                 let mut high = by_nm;
                 let mut marks = if by_nm { String::new() } else { format!("{}{}", md, hs) };
-                if !by_nm && !is_self_path(&p) {
+                if !by_nm && ML_ENABLED.load(Ordering::Relaxed) != 0 && !is_self_path(&p) {
                     if let Some(pr) = ml_feat::ml_score(&p) {
                         marks.push_str(&format!(" [ML {:.2}]", pr));
                         if pr > 0.7 { high = true; }
@@ -1552,6 +1565,28 @@ unsafe extern "system" fn wndproc(hwnd: isize, msg: u32, wp: usize, lp: isize) -
                 }
                 0
             }
+            MENU_ML_TOGGLE => {
+                let on = ML_ENABLED.fetch_xor(1, Ordering::SeqCst) == 0;
+                CheckMenuItem(MENU_MAIN.load(Ordering::SeqCst), MENU_ML_TOGGLE,
+                              if on { MF_BYCOMMAND | MF_CHECKED } else { MF_BYCOMMAND });
+                gui_append(&format!("[ML] 结构匹配 ML 复核已{} (实验性; 打分>0.7 升为高置信)\n", if on { "开启" } else { "关闭" }));
+                0
+            }
+            MENU_NOMORE => {
+                let m = utf16("⚡ 不客气模式 (实验性功能 — 不稳定)
+
+⚠ 警告: 需内核驱动 + testsigning, 必须关 Secure Boot
+过程: 导入自定义证书 → 蓝屏重启 → 驱动清理 → 卸载 → 删证书
+仅限虚拟机, 先保存全部工作!
+
+确定继续?");
+                let c = utf16("SilverFox Cleaner 不客气模式");
+                if MessageBoxW(hwnd, m.as_ptr(), c.as_ptr(), MB_OKCANCEL | MB_ICONWARNING) == IDOK {
+                    gui_append("[!!] 不客气模式启动 (实验性, 不稳定)\n");
+                    nomore_run();
+                }
+                0
+            }
             7 => {
                 let m = utf16("⚡ 不客气模式确认\n\n导入自定义证书 + 装载内核驱动清理\ntestsigning ON → 蓝屏重启 → 驱动清理\n→ 卸载 → 删证书 → testsigning OFF\n\n材料: SFCleanerDrv.sys + SFCleanerCert.pfx 同目录");
                 let c = utf16("SilverFox Cleaner 不客气模式");
@@ -1586,7 +1621,15 @@ fn run_gui() {
         };
         RegisterClassExW(&wc as *const WndClass as *const u8);
         let title = utf16("SilverFox Cleaner v4.2 — 银狐检测清除 (dmo/client)");
-        let hwnd = CreateWindowExW(0, cn.as_ptr(), title.as_ptr(), WS_OVERLAPPEDWINDOW | WS_VISIBLE, 200, 200, 920, 640, 0, 0, inst, std::ptr::null());
+        /* 实验性功能菜单: 开启ML (默认关, 勾选切换) / 不客气模式 (不稳定) */
+        let menumain = CreateMenu();
+        let menusub = CreateMenu();
+        AppendMenuW(menusub, MF_STRING, MENU_ML_TOGGLE, utf16("开启 ML 复核 (实验性, 默认关)").as_ptr());
+        AppendMenuW(menusub, MF_SEPARATOR, 0, std::ptr::null());
+        AppendMenuW(menusub, MF_STRING, MENU_NOMORE, utf16("不客气模式 (不稳定)…").as_ptr());
+        AppendMenuW(menumain, MF_POPUP, menusub as usize, utf16("实验性功能").as_ptr());
+        MENU_MAIN.store(menumain, Ordering::SeqCst);
+        let hwnd = CreateWindowExW(0, cn.as_ptr(), title.as_ptr(), WS_OVERLAPPEDWINDOW | WS_VISIBLE, 200, 200, 920, 640, 0, menumain, inst, std::ptr::null());
         if hwnd == 0 { return; }
         let font = GetStockObject(DEFAULT_GUI_FONT);
         let b1 = CreateWindowExW(0, utf16("BUTTON").as_ptr(), utf16("🔍 扫描").as_ptr(), WS_CHILD | WS_VISIBLE, 14, 12, 120, 38, hwnd, 1, inst, std::ptr::null());
