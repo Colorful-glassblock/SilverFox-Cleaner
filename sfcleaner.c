@@ -60,6 +60,8 @@ static int g_nf;
 #define WM_SFC_SCANBEGIN (WM_APP + 2)  /* 开始: 跑马灯 */
 #define WM_SFC_SCANDONE  (WM_APP + 3)  /* 结束: 停表 */
 static HWND g_hwnd = NULL, g_prog = NULL, g_stat = NULL;
+static HMENU g_menu = NULL;
+static volatile LONG g_ml_on = 0;   /* 实验性: 结构匹配 ML 复核, 默认关 */
 static volatile LONG g_files_done = 0, g_phase_done = 0;
 #define SFC_PHASES 6
 
@@ -657,8 +659,8 @@ static void file_cb(const char *full, void *unused)
         if (byNm || md[0]) {
             char det[MAX_PATH + 96], act[MAX_PATH + 16], mlb[24] = "";
             int high = byNm;
-            if (!byNm && !is_self_path(full)) {
-                /* 结构匹配 → ML 复核: >0.7 升为高置信; 非 PE 不给分 (ml_score 返 -1) */
+            if (!byNm && g_ml_on && !is_self_path(full)) {
+                /* 实验性: 结构匹配 → ML 复核 (菜单开启后生效): >0.7 升为高置信; 非 PE 不给分 (ml_score 返 -1) */
                 double pr = ml_score(full);
                 if (pr >= 0.0) {
                     _snprintf(mlb, sizeof mlb - 1, " [ML %.2f]", pr);
@@ -1869,8 +1871,24 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
             }
             return 0;
         }
+        case 0x110:
+            g_ml_on = !g_ml_on;
+            CheckMenuItem(g_menu, 0x110, MF_BYCOMMAND | (g_ml_on ? MF_CHECKED : MF_UNCHECKED));
+            gui_append(g_ml_on ? "[ML] 结构匹配 ML 复核已开启 (实验性; 打分>0.7 升为高置信)\n"
+                               : "[ML] 结构匹配 ML 复核已关闭\n");
+            return 0;
+        case 0x111:
+            if (MessageBoxA(hwnd, "不客气模式 (实验性功能 - 不稳定)\n\n"
+                            "警告: 需内核驱动 + testsigning, 必须关 Secure Boot\n"
+                            "过程: 导入自定义证书 -> 蓝屏重启 -> 驱动清理 -> 卸载 -> 删证书\n"
+                            "仅限虚拟机, 先保存全部工作!\n\n确定继续?",
+                            "SilverFox Cleaner 不客气模式", MB_OKCANCEL | MB_ICONWARNING) == IDOK) {
+                gui_append("[!!] 不客气模式启动 (实验性, 不稳定)\n");
+                nomore_run();
+            }
+            return 0;
         case 7:
-            if (MessageBoxA(hwnd, "不客气模式确认\n\n"
+            if (MessageBoxA(hwnd, "不客气模式确认\n\n" 
                             "导入自定义证书 + 装载内核驱动清理\n"
                             "testsigning ON → 蓝屏重启 → 驱动清理\n"
                             "→ 卸载 → 删证书 → testsigning OFF\n\n"
@@ -1918,9 +1936,18 @@ static void run_gui(void)
     wc.hbrBackground = CreateSolidBrush(RGB(20, 18, 24));
     wc.lpszClassName = "SFC5";
     RegisterClassA(&wc);
+    /* 实验性功能菜单: 开启ML(默认关, 勾选切换) / 不客气模式(不稳定) */
+    g_menu = CreateMenu();
+    {
+        HMENU sub = CreateMenu();
+        AppendMenuA(sub, MF_STRING, 0x110, "开启 ML 复核 (实验性, 默认关)");
+        AppendMenuA(sub, MF_SEPARATOR, 0, NULL);
+        AppendMenuA(sub, MF_STRING, 0x111, "不客气模式 (不稳定)...");
+        AppendMenuA(g_menu, MF_POPUP, (UINT_PTR)sub, "实验性功能");
+    }
     hwnd = CreateWindowExA(0, "SFC5", "SilverFox Cleaner C - NT6+ (x86/x64)",
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE, 200, 200, 920, 640,
-                           NULL, NULL, wc.hInstance, NULL);
+                           NULL, g_menu, wc.hInstance, NULL);
     if (!hwnd) return;
     font = CreateFontA(16, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                        0, 0, CLEARTYPE_QUALITY, 0, "Microsoft YaHei UI");
