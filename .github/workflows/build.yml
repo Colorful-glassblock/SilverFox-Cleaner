@@ -57,11 +57,11 @@ jobs:
       - name: Build x86
         run: |
           i686-w64-mingw32-windres -o /tmp/mf32.o sfcleaner.rc
-          i686-w64-mingw32-gcc -O2 -s -Wall -Wno-pointer-sign -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 -finput-charset=UTF-8 -fexec-charset=GBK -mwindows -march=i686 -Wl,--major-subsystem-version,6 -Wl,--minor-subsystem-version,1 -o SFCleaner_x86.exe sfcleaner.c /tmp/mf32.o -lwintrust -lcomctl32
+          i686-w64-mingw32-gcc -O2 -s -Wall -Wno-pointer-sign -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 -finput-charset=UTF-8 -fexec-charset=GBK -mwindows -march=i686 -Wl,--major-subsystem-version,6 -Wl,--minor-subsystem-version,1 -o SFCleaner_x86.exe sfcleaner.c ml_feat.c ml_model.c /tmp/mf32.o -lwintrust -lcomctl32
       - name: Build x64
         run: |
           x86_64-w64-mingw32-windres -o /tmp/mf64.o sfcleaner.rc
-          x86_64-w64-mingw32-gcc -O2 -s -Wall -Wno-pointer-sign -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 -finput-charset=UTF-8 -fexec-charset=GBK -mwindows -Wl,--major-subsystem-version,6 -Wl,--minor-subsystem-version,1 -o SFCleaner_x64.exe sfcleaner.c /tmp/mf64.o -lwintrust -lcomctl32
+          x86_64-w64-mingw32-gcc -O2 -s -Wall -Wno-pointer-sign -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 -finput-charset=UTF-8 -fexec-charset=GBK -mwindows -Wl,--major-subsystem-version,6 -Wl,--minor-subsystem-version,1 -o SFCleaner_x64.exe sfcleaner.c ml_feat.c ml_model.c /tmp/mf64.o -lwintrust -lcomctl32
       - uses: actions/upload-artifact@v4
         with:
           name: SFCleaner-C-exe
@@ -129,10 +129,15 @@ jobs:
 
           TEXT=$(printf '%s\n%s' "$RANGE_MSG" "$PR_TEXT")
 
-          # ---- 3) 版本标记: dispatch 输入 > [ReleaseVer<ver>] ----
+          # ---- 3) 版本标记: dispatch 输入 > [ReleaseVer<ver>]
+          #   先剥掉围栏代码块/行内代码/缩进代码块再找标记 —— 说明与示例里的
+          #   [ReleaseVer x.y.z] 不应触发正式发布 (v1 事故: 文档里的示例把 CI 修复发成了正式 release)
           VER=""
-          if [ -n "${IN_VERSION:-}" ]; then VER="$IN_VERSION";
-          else VER=$(printf '%s' "$TEXT" | grep -oiE '\[releasever[[:space:]]*[0-9]+(\.[0-9]+){1,3}\]' | head -1 | sed -E 's/.*[Vv][Ee][Rr][[:space:]]*([0-9].*)\]/\1/' || true); fi
+          if [ -n "${IN_VERSION:-}" ]; then
+            VER="$IN_VERSION"
+          else
+            VER=$(printf '%s' "$TEXT" | python3 -c 'import re,sys;t=sys.stdin.read();t=re.sub(r"(?s)```.*?```"," ",t);t=re.sub(r"`[^`\n]*`"," ",t);t=re.sub(r"(?m)^\s{4,}.*$"," ",t);m=re.search(r"\[releasever\s*([0-9]+(?:\.[0-9]+){1,3})\]",t,re.I);print(m.group(1) if m else "")' || true)
+          fi
 
           # ---- 4) 线性历史 ----
           LINEAR=1
