@@ -962,11 +962,19 @@ public static class Scanner
                 catch { /* 属性不可读忽略 */ }
                 if (byNm || md.Length > 0 || (hs.Length > 0 && isExt))
                 {
+                    /* 结构匹配 → ML 复核: >0.7 升为高置信; 非 PE 不给分 */
+                    bool high = byNm;
+                    string mls = "";
+                    if (!byNm && !IsSelfPath(p) && MlModel.ScorePath(p) is double pr)
+                    {
+                        mls = $" [ML {pr:F2}]";
+                        if (pr > 0.7) high = true;
+                    }
                     var nf = new Finding
                     {
                         Kind = "FILE",
-                        Detail = byNm ? p : p + md + hs,
-                        High = byNm,
+                        Detail = byNm ? p : p + md + hs + mls,
+                        High = high,
                         Action = $"quarantine {p}"
                     };
                     res.Add(nf);
@@ -975,6 +983,16 @@ public static class Scanner
             }
         }
         return res;
+    }
+
+    private static readonly string SelfExe = Environment.ProcessPath ?? "";
+
+    /// 自身路径豁免: 本 exe 内嵌 STEGR1Xp/JELG 等特征串, 按结构匹配会打到自己
+    private static bool IsSelfPath(string p)
+    {
+        if (SelfExe.Length == 0) return false;
+        try { return string.Equals(Path.GetFullPath(p), SelfExe, StringComparison.OrdinalIgnoreCase); }
+        catch { return false; }
     }
 
     private static void AddEnv(List<string> list, string var)
