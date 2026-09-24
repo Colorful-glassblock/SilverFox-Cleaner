@@ -4,6 +4,9 @@
 #![windows_subsystem = "windows"]
 #![allow(non_snake_case, dead_code)]
 
+mod ml_feat;
+mod ml_model;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -873,6 +876,19 @@ fn scan_windir() -> Vec<Finding> {
     out
 }
 
+/// 自身路径豁免: 本 exe 内嵌 STEGR1Xp/JELG 等特征串, 按结构匹配会打到自己
+fn is_self_path(p: &Path) -> bool {
+    match std::env::current_exe() {
+        Ok(exe) => {
+            if let (Ok(a), Ok(b)) = (exe.canonicalize(), p.canonicalize()) {
+                return a == b;
+            }
+            exe.to_string_lossy().eq_ignore_ascii_case(&p.to_string_lossy())
+        }
+        Err(_) => false,
+    }
+}
+
 fn scan_files() -> Vec<Finding> {
     let mut out = Vec::new();
     let roots: Vec<PathBuf> = [
@@ -904,7 +920,16 @@ fn scan_files() -> Vec<Finding> {
                 if GetFileAttributesW(utf16(&p.to_string_lossy()).as_ptr()) & 0x6 != 0 { hs = " [隐藏+系统]"; }
             }
             if by_nm || !md.is_empty() || (hs != "" && isext) {
-                out.push(Finding { kind: "FILE".into(), detail: format!("{}{}{}", p.display(), if by_nm { String::new() } else { md }, hs), high: by_nm, action: format!("quarantine {}", p.display()) });
+                /* 结构匹配 → ML 复核: >0.7 升为高置信; 非 PE 不给分 */
+                let mut high = by_nm;
+                let mut marks = if by_nm { String::new() } else { format!("{}{}", md, hs) };
+                if !by_nm && !is_self_path(&p) {
+                    if let Some(pr) = ml_feat::ml_score(&p) {
+                        marks.push_str(&format!(" [ML {:.2}]", pr));
+                        if pr > 0.7 { high = true; }
+                    }
+                }
+                out.push(Finding { kind: "FILE".into(), detail: format!("{}{}", p.display(), marks), high, action: format!("quarantine {}", p.display()) });
             }
         });
     }
