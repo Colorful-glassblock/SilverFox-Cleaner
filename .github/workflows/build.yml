@@ -1,5 +1,17 @@
 name: Rust Build (embedded driver)
-on: [push, workflow_dispatch]
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号 (如 1.2.3); 留空=无标记走 pre-release'
+        required: false
+        default: ''
+      prerelease:
+        description: '强制 pre-release'
+        type: boolean
+        required: false
+        default: false
 jobs:
   driver:
     runs-on: windows-latest
@@ -95,34 +107,61 @@ jobs:
           COMMIT_MSG: ${{ github.event.head_commit.message }}
           BEFORE: ${{ github.event.before }}
           REPO: ${{ github.repository }}
+          BR: rust
+          IN_VERSION: ${{ inputs.version }}
+          IN_PRE: ${{ inputs.prerelease }}
         run: |
           set -euo pipefail
           SHA8=$(git rev-parse --short=8 HEAD)
-          # ---- 关联 PR (标题+正文), squash/rebase 合并后仍可取到 ----
-          PR_TEXT=""
-          if PRJSON=$(gh api "repos/$REPO/commits/$GITHUB_SHA/pulls" 2>/dev/null); then
-            PR_TEXT=$(printf '%s' "$PRJSON" | python3 -c "import json,sys;d=json.load(sys.stdin);print(chr(10).join(((p.get('title') or '')+chr(10)+(p.get('body') or '')) for p in d) if isinstance(d,list) else '')" 2>/dev/null || true)
+
+          # ---- 1) 本次 push 区间内**全部**提交信息 (squash 后 head_commit 只含标题, 正文/多提交会丢) ----
+          RANGE_MSG=""
+          if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            RANGE_MSG=$(git log --format=%B "$BEFORE..HEAD" 2>/dev/null || true)
           fi
-          TEXT=$(printf '%s\n%s' "$COMMIT_MSG" "$PR_TEXT")
-          # ---- 版本标记 [ReleaseVer<ver>] ----
-          VER=$(printf '%s' "$TEXT" | grep -oiE '\[releasever[[:space:]]*[0-9]+(\.[0-9]+){1,3}\]' | head -1 | sed -E 's/.*[Vv][Ee][Rr][[:space:]]*([0-9].*)\]/\1/' || true)
-          # ---- 线性历史: push 区间无 merge; 兜底看 HEAD 是否 merge commit ----
+          [ -n "$RANGE_MSG" ] || RANGE_MSG="$COMMIT_MSG"
+
+          # ---- 2) 关联 PR: 先按提交查, 再按 merge_commit_sha 反查 merged PR (squash 场景) ----
+          PR_TEXT=""
+          PR_TEXT=$(gh api "repos/$REPO/commits/$GITHUB_SHA/pulls" 2>/dev/null | python3 -c "import json,sys;d=json.load(sys.stdin);print(chr(10).join(((p.get('title') or '')+chr(10)+(p.get('body') or '')) for p in d) if isinstance(d,list) else '')" 2>/dev/null || true)
+          if [ -z "$PR_TEXT" ]; then
+            PR_TEXT=$(gh pr list --repo "$REPO" --base "$BR" --state merged --limit 20 \
+              --json title,body,mergeCommit 2>/dev/null \
+              | python3 -c "import json,sys;sha=sys.argv[1];d=json.load(sys.stdin);print(chr(10).join(((p.get('title') or '')+chr(10)+(p.get('body') or '')) for p in d if ((p.get('mergeCommit') or {}).get('oid') or '')==sha))" "$GITHUB_SHA" 2>/dev/null || true)
+          fi
+          [ -n "$PR_TEXT" ] && echo "::notice::已取到关联 PR 文本 (${#PR_TEXT} 字符)"
+
+          TEXT=$(printf '%s\n%s' "$RANGE_MSG" "$PR_TEXT")
+
+          # ---- 3) 版本标记: dispatch 输入 > [ReleaseVer<ver>] ----
+          VER=""
+          if [ -n "${IN_VERSION:-}" ]; then VER="$IN_VERSION";
+          else VER=$(printf '%s' "$TEXT" | grep -oiE '\[releasever[[:space:]]*[0-9]+(\.[0-9]+){1,3}\]' | head -1 | sed -E 's/.*[Vv][Ee][Rr][[:space:]]*([0-9].*)\]/\1/' || true); fi
+
+          # ---- 4) 线性历史 ----
           LINEAR=1
           if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
             [ -n "$(git rev-list --merges "$BEFORE..HEAD")" ] && LINEAR=0
           else
             [ "$(git rev-list --parents -n1 HEAD | wc -w)" -gt 2 ] && LINEAR=0
           fi
-          if [ "$LINEAR" = "1" ] && [ -n "$VER" ]; then
-            echo "tag=rust-release-$VER" >> "$GITHUB_OUTPUT"
-            echo "prerelease=false"   >> "$GITHUB_OUTPUT"
+
+          # ---- 5) 结论 ----
+          FORCE_PRE="${IN_PRE:-false}"
+          if [ "$LINEAR" = "1" ] && [ -n "$VER" ] && [ "$FORCE_PRE" != "true" ]; then
+            echo "tag=$BR-release-$VER" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false"      >> "$GITHUB_OUTPUT"
             echo "title=silverfox-cleaner $VER" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=rust-pre-$SHA8" >> "$GITHUB_OUTPUT"
-            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$BR-pre-$SHA8" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true"   >> "$GITHUB_OUTPUT"
             echo "title=silverfox-cleaner pre-$SHA8" >> "$GITHUB_OUTPUT"
-            [ "$LINEAR" = "0" ] && echo "::warning::历史非线性(含 merge commit) — 降级为 pre-release"
+            if [ "$LINEAR" = "0" ]; then
+              echo "::warning::历史非线性(含 merge commit) — 降级为 pre-release"
+            fi
           fi
+          # 兜底: 本步只产出 outputs, 分支末行不得毒化 step 退出码 (非 release push 曾因此必红)
+          :
       - name: 发布 (tag 已存在则跳过, 不覆盖)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
