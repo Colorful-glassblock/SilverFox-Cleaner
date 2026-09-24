@@ -7,11 +7,11 @@ using Microsoft.Win32;
 
 namespace SFCleaner;
 
-/// 实验性: 结构匹配 ML 复核开关 (默认关; 「实验性功能」菜单可开启)
+public sealed class Finding
+{
+    /// 实验性: 结构匹配 ML 复核开关 (默认关; 「实验性功能」菜单可开启)
     public static bool MlEnabled;
 
-    public sealed class Finding
-{
     public required string Kind { get; init; }
     public required string Detail { get; init; }
     public bool High { get; init; }

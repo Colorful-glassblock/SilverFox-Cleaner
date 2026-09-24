@@ -32,7 +32,7 @@ public sealed partial class MainWindow : Window
 
     // ---- 扫描 ----
 
-    private void MlToggle_Click(object sender, ToggleMenuFlyoutItemClickEventArgs e)
+    private void MlToggle_Click(object sender, RoutedEventArgs e)
     {
         Scanner.MlEnabled = MlToggle.IsChecked == true;
         AppendLog(Scanner.MlEnabled
