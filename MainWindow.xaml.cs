@@ -41,8 +41,8 @@ public sealed partial class MainWindow : Window
         TblStatus.Text = Scanner.MlEnabled ? "ML 复核: 开 (实验性)" : "ML 复核: 关";
     }
 
-    private async void NomoreMenu_Click(object sender, RoutedEventArgs e)
-        => await Nomore_Click(sender, e);   // 菜单入口, 对话框内已含不稳定警告
+    private void NomoreMenu_Click(object sender, RoutedEventArgs e)
+        => Nomore_Click(sender, e);   // 菜单入口 (async void 不 await), 对话框内已含不稳定警告
 
     private async void Scan_Click(object sender, RoutedEventArgs e) => await RunScanAsync();
 
