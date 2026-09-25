@@ -300,7 +300,7 @@ public static class Scanner
     public static List<Finding> ScanAll(IProgress<string>? log, IProgress<double>? prog, IProgress<Finding>? found)
     {
         EnablePrivileges();
-        const int stepsTotal = 9;          // t1:2 t2:2 t3:3 t4:2
+        const int stepsTotal = 10;         // t1:2 t2:2 t3:4 t4:2
         int doneSteps = 0;
         void Step()
         {
@@ -314,7 +314,7 @@ public static class Scanner
         }
         var t1 = Task.Run(() => { Emit(ScanTasks()); Step(); Emit(ScanServices()); Step(); });
         var t2 = Task.Run(() => { Emit(ScanProcs()); Step(); Emit(ScanCtfmon()); Step(); });
-        var t3 = Task.Run(() => { Emit(ScanFiles(log, found)); Step(); Emit(ScanHosts()); Step(); Emit(ScanWu()); Step(); });
+        var t3 = Task.Run(() => { Emit(ScanFiles(log, found)); Step(); Emit(ScanMlDeep()); Step(); Emit(ScanHosts()); Step(); Emit(ScanWu()); Step(); });
         var t4 = Task.Run(() => { Emit(ScanWb()); Step(); Emit(ScanWd()); Step(); });
         Task.WaitAll(t1, t2, t3, t4);
         var all = bag.ToList();
@@ -842,7 +842,18 @@ public static class Scanner
             else return 0;
         }
         if (!isPe) return 2;
-        if (dig >= 2 || up > 0 || baseName.Length >= 8) return 1;
+        /* 随机名形态: 大小写+数字混排, 或数字嵌在字母中间。
+           纯小写长名(ntoskrnl/vmswitch)与尾部数字(vcruntime140/msvcp140)不算 ——
+           否则 System32 大量合法文件被误判「随机名未签名PE」 */
+        for (int i = 0; i + 1 < baseName.Length; i++)
+        {
+            bool d0 = baseName[i] >= '0' && baseName[i] <= '9'
+                      && (i == 0 || !(baseName[i - 1] >= '0' && baseName[i - 1] <= '9')); /* 孤立数字 */
+            bool d1 = baseName[i + 1] >= 'a' && baseName[i + 1] <= 'z'
+                      || baseName[i + 1] >= 'A' && baseName[i + 1] <= 'Z';
+            if (d0 && d1) return 1;
+        }
+        if (dig >= 1 && up >= 1) return 1;
         return 0;
     }
 
@@ -1001,6 +1012,32 @@ public static class Scanner
         catch { return false; }
     }
 
+    /// <summary>实验性深度 ML 扫描 (需开启 ML): AppData / TEMP / ProgramData / Program Files 全量 PE 打分。</summary>
+    public static List<Finding> ScanMlDeep()
+    {
+        var res = new List<Finding>();
+        if (!MlEnabled) return res;   // 实验性: 默认关
+        var roots = new List<string> { @"C:\Program Files", @"C:\Program Files (x86)" };
+        AddEnv(roots, "APPDATA");
+        AddEnv(roots, "LOCALAPPDATA");
+        AddEnv(roots, "TEMP");
+        AddEnv(roots, "ProgramData");
+        foreach (var root in roots.Where(Directory.Exists))
+            foreach (var p in Walk(root, 8))
+            {
+                if (p.ToLowerInvariant().Contains("sf_quarantine") || IsSelfPath(p)) continue;
+                if (MlModel.ScorePath(p) is double pr && pr > 0.7)
+                    res.Add(new Finding
+                    {
+                        Kind = "FILE",
+                        Detail = $"{p} [ML深度 {pr:F2}]",
+                        High = true,
+                        Action = $"quarantine {p}"
+                    });
+            }
+        return res;
+    }
+
     private static void AddEnv(List<string> list, string var)
     {
         var v = Environment.GetEnvironmentVariable(var);
@@ -1047,7 +1084,7 @@ public static class Scanner
 
     // ---- 清除 ----
 
-    public static CleanStats Clean(IReadOnlyList<Finding> fs, IProgress<string>? log = null)
+    public static CleanStats Clean(IReadOnlyList<Finding> fs, IProgress<string>? log = null, IProgress<double>? prog = null)
     {
         EnablePrivileges();
         int ok = 0, fail = 0;
@@ -1058,6 +1095,7 @@ public static class Scanner
         }
         long ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         string qd = $@"C:\ProgramData\sf_quarantine\{ts}";
+        int idx = 0;
         foreach (var f in fs)
         {
             bool s;
@@ -1102,6 +1140,9 @@ public static class Scanner
                 default: s = true; break;
             }
             if (s) ok++; else fail++;
+            idx++;
+            prog?.Report((double)idx / fs.Count);
+            log?.Report($"[{idx}/{fs.Count}] {(s ? "[+]" : "[-]")} {f.Kind}: {BeforeBracket(f.Detail)}");
         }
         return new CleanStats(ok, fail);
     }

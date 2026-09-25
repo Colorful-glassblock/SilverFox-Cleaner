@@ -41,9 +41,6 @@ public sealed partial class MainWindow : Window
         TblStatus.Text = Scanner.MlEnabled ? "ML 复核: 开 (实验性)" : "ML 复核: 关";
     }
 
-    private void NomoreMenu_Click(object sender, RoutedEventArgs e)
-        => Nomore_Click(sender, e);   // 菜单入口 (async void 不 await), 对话框内已含不稳定警告
-
     private async void Scan_Click(object sender, RoutedEventArgs e) => await RunScanAsync();
 
     private async Task RunScanAsync()
@@ -120,8 +117,17 @@ public sealed partial class MainWindow : Window
         AppendLog($"[{DateTime.Now:HH:mm:ss}] 清除中…");
 
         var log = new Progress<string>(AppendLog);
-        var res = await Task.Run(() => Scanner.Clean(_findings, log));
+        var prog = new Progress<double>(p2 =>
+        {
+            BarScan.IsIndeterminate = false;
+            BarScan.Value = Math.Round(p2 * 100);
+            TblLive.Text = $"清除中 {p2:P0}";
+        });
+        var res = await Task.Run(() => Scanner.Clean(_findings, log, prog));
 
+        BarScan.IsIndeterminate = false;
+        BarScan.Value = 100;
+        TblLive.Text = $"清除完成 · {res.Ok}/{_findings.Count}";
         AppendLog($"完成: {res.Ok} 成功, {res.Fail} 失败");
         AppendLog("建议重启确认无复活");
         TblStatus.Text = $"清除完成: {res.Ok} 成功, {res.Fail} 失败";
