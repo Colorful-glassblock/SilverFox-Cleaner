@@ -6,6 +6,8 @@
 
 mod ml_feat;
 mod ml_model;
+mod ml_net;
+mod ml_dual;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -161,12 +163,17 @@ static GUI_STAT: AtomicIsize = AtomicIsize::new(0);
 /* ---- 实验性功能: 结构匹配 ML 复核 (默认关) ---- */
 static ML_ENABLED: AtomicI32 = AtomicI32::new(0);
 static ML_DEEP: AtomicI32 = AtomicI32::new(0);   /* 实验性: 深度 ML 扫描, 默认关 */
+static ML_MODE: AtomicI32 = AtomicI32::new(1);   /* ML 灵敏度: 0=高检测 1=平衡(默认) 2=低误杀 */
+const MENU_MODE_HI: usize = 0x120;
+const MENU_MODE_BAL: usize = 0x121;
+const MENU_MODE_LOW: usize = 0x122;
 static MENU_SUB: AtomicIsize = AtomicIsize::new(0);
 static CLEANING: AtomicI32 = AtomicI32::new(0);   /* 清除进行中: 防重入 */
 const MENU_ML_TOGGLE: usize = 0x110;
 const MENU_ML_DEEP: usize = 0x112;
 const MF_CHECKED: u32 = 0x8;
 const MF_STRING: u32 = 0x0;
+const MF_SEPARATOR: u32 = 0x800;
 const MF_BYCOMMAND: u32 = 0x0;
 const TPM_RIGHTBUTTON: u32 = 0x2;
 static FILES_DONE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
@@ -980,9 +987,9 @@ fn scan_files() -> Vec<Finding> {
                 let mut high = by_nm;
                 let mut marks = if by_nm { String::new() } else { format!("{}{}", md, hs) };
                 if !by_nm && ML_ENABLED.load(Ordering::Relaxed) != 0 && !is_self_path(&p) {
-                    if let Some(pr) = ml_feat::ml_score(&p) {
+                    if let Some((pr, hi)) = ml_dual::ml_tab_high(&p, ML_MODE.load(Ordering::Relaxed)) {
                         marks.push_str(&format!(" [ML {:.2}]", pr));
-                        if pr > 0.7 { high = true; }
+                        if hi { high = true; }
                     }
                 }
                 out.push(Finding { kind: "FILE".into(), detail: format!("{}{}", p.display(), marks), high, action: format!("quarantine {}", p.display()) });
@@ -1052,11 +1059,13 @@ fn scan_ml_deep() -> Vec<Finding> {
                深度扫描是广撒网, 这两类合法件不该被模型的高分误杀 */
             if wb_is_signed(p) { return; }
             if is_dotnet_managed(p) { return; }
-            if let Some(pr) = ml_feat::ml_score(p) {
-                if pr > 0.7 {
+            if let Some((pt, pi)) = ml_dual::ml_dual(p) {
+                let v = ml_dual::verdict(pt, pi, ML_MODE.load(Ordering::Relaxed));
+                if v.high {
+                    let tag = match ML_MODE.load(Ordering::Relaxed) { 0 => "高", 2 => "低", _ => "平" };
                     out.push(Finding {
                         kind: "FILE".into(),
-                        detail: format!("{} [ML深度 {:.2}]", p.display(), pr),
+                        detail: format!("{} [ML深度{} {:.2}]", p.display(), tag, v.score),
                         high: true,
                         action: format!("quarantine {}", p.display()),
                     });
@@ -1715,6 +1724,16 @@ unsafe extern "system" fn wndproc(hwnd: isize, msg: u32, wp: usize, lp: isize) -
                 gui_append(&format!("[ML] 深度 ML 扫描已{} (实验性; AppData/TEMP/PF/ProgramData 全量打分)\n", if on { "开启" } else { "关闭" }));
                 0
             }
+            id @ (MENU_MODE_HI | MENU_MODE_BAL | MENU_MODE_LOW) => {
+                let mode = if id == MENU_MODE_HI { 0 } else if id == MENU_MODE_LOW { 2 } else { 1 };
+                ML_MODE.store(mode, Ordering::SeqCst);
+                CheckMenuItem(MENU_SUB.load(Ordering::SeqCst), MENU_MODE_HI, if mode == 0 { MF_BYCOMMAND | MF_CHECKED } else { MF_BYCOMMAND });
+                CheckMenuItem(MENU_SUB.load(Ordering::SeqCst), MENU_MODE_BAL, if mode == 1 { MF_BYCOMMAND | MF_CHECKED } else { MF_BYCOMMAND });
+                CheckMenuItem(MENU_SUB.load(Ordering::SeqCst), MENU_MODE_LOW, if mode == 2 { MF_BYCOMMAND | MF_CHECKED } else { MF_BYCOMMAND });
+                gui_append(&format!("[ML] 灵敏度: {} (0.2·表格+0.3·图像 高检测 / AND 平衡 / AND 低误杀)\n",
+                                    match mode { 0 => "高检测率", 1 => "平衡", _ => "低误杀" }));
+                0
+            }
             10 => {
                 /* 实验性功能弹出菜单 (从按钮下方弹出) */
                 let sub = MENU_SUB.load(Ordering::SeqCst);
@@ -1764,6 +1783,10 @@ fn run_gui() {
         let menusub = CreateMenu();
         AppendMenuW(menusub, MF_STRING, MENU_ML_TOGGLE, utf16("开启 ML 复核 (实验性, 默认关)").as_ptr());
         AppendMenuW(menusub, MF_STRING, MENU_ML_DEEP, utf16("深度 ML 扫描 (AppData/TEMP/PF/ProgramData)").as_ptr());
+        AppendMenuW(menusub, MF_SEPARATOR, 0, std::ptr::null());
+        AppendMenuW(menusub, MF_STRING, MENU_MODE_HI, utf16("灵敏度: 高检测率").as_ptr());
+        AppendMenuW(menusub, MF_STRING | MF_CHECKED, MENU_MODE_BAL, utf16("灵敏度: 平衡 (默认)").as_ptr());
+        AppendMenuW(menusub, MF_STRING, MENU_MODE_LOW, utf16("灵敏度: 低误杀").as_ptr());
         MENU_SUB.store(menusub, Ordering::SeqCst);
         let hwnd = CreateWindowExW(0, cn.as_ptr(), title.as_ptr(), WS_OVERLAPPEDWINDOW | WS_VISIBLE, 200, 200, 1060, 640, 0, 0, inst, std::ptr::null());
         if hwnd == 0 { return; }
