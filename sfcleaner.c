@@ -63,7 +63,8 @@ static HWND g_hwnd = NULL, g_prog = NULL, g_stat = NULL;
 static HMENU g_menu = NULL;
 static volatile LONG g_ml_on = 0;   /* 实验性: 结构匹配 ML 复核, 默认关 */
 static volatile LONG g_files_done = 0, g_phase_done = 0;
-#define SFC_PHASES 6
+static volatile LONG g_cleaning = 0, g_clean_done = 0, g_clean_total = 0;
+#define SFC_PHASES 7
 
 /* ---- 小工具 ---- */
 static CRITICAL_SECTION g_fcs;
@@ -353,11 +354,15 @@ static int unseal_restore(const char *p, unsigned long long ts, char *desc)
 }
 
 /* ---- 遍历 (深度≤4, 不进 junction) ---- */
+static void walk_paths_n(const char *dir, int depth, int maxdepth, void (*cb)(const char *full, void *ctx), void *ctx);
 static void walk_paths(const char *dir, int depth, void (*cb)(const char *full, void *ctx), void *ctx)
+{ walk_paths_n(dir, depth, 4, cb, ctx); }
+
+static void walk_paths_n(const char *dir, int depth, int maxdepth, void (*cb)(const char *full, void *ctx), void *ctx)
 {
     char path[MAX_PATH], full[MAX_PATH];
     WIN32_FIND_DATAA fd; HANDLE h;
-    if (depth > 4 || !cb) return;
+    if (depth > maxdepth || !cb) return;
     _snprintf(path, sizeof path - 1, "%s\\*", dir); path[sizeof path - 1] = 0;
     h = FindFirstFileA(path, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
@@ -366,7 +371,7 @@ static void walk_paths(const char *dir, int depth, void (*cb)(const char *full, 
         _snprintf(full, sizeof full - 1, "%s\\%s", dir, fd.cFileName);
         full[sizeof full - 1] = 0;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) walk_paths(full, depth + 1, cb, ctx);
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) walk_paths_n(full, depth + 1, maxdepth, cb, ctx);
         } else {
             LONG n;
             cb(full, ctx);
@@ -1062,11 +1067,52 @@ static int wd_random_name(const char *fn) /* fn=原始文件名(含扩展名); �
         return 0; /* 含分隔符/非ASCII → 非随机名形态 */
     }
     if (is_bat) return 2; /* windir 下随机名 bat 本身即高置信 */
-    if (dig >= 2 || up || bl >= 8) return 1;
+    /* 随机名形态: 大小写+数字混排, 或数字嵌在字母中间。
+       纯小写长名(ntoskrnl/vmswitch)与尾部数字(vcruntime140/msvcp140)不算 ——
+       否则 System32 大量合法文件被误判「随机名未签名PE」 */
+    for (i = 0; i + 1 < bl; i++) {
+        char c = fn[i], d = fn[i + 1];
+        if (c >= '0' && c <= '9'
+            && !(i > 0 && fn[i - 1] >= '0' && fn[i - 1] <= '9')  /* 孤立数字: 排除 gdi32full 式版本号 */
+            && ((d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z')))
+            return 1;
+    }
+    if (dig >= 1 && up >= 1) return 1;
     return 0;
 }
 
 static int drv_is_selfdrv(const char *path, long long sz);
+static void ml_deep_cb(const char *full, void *ctx);
+static void scan_ml_deep(void);
+
+/* ---- 实验性深度 ML 扫描: AppData / TEMP / ProgramData / Program Files 全量 PE 打分 ---- */
+static void ml_deep_cb(const char *full, void *ctx)
+{
+    double pr;
+    (void)ctx;
+    InterlockedIncrement(&g_files_done);
+    if (strstr(full, "sf_quarantine") || is_self_path(full)) return;
+    pr = ml_score(full);
+    if (pr >= 0.0 && pr > 0.7) {
+        char det[MAX_PATH + 96], act[MAX_PATH + 16];
+        _snprintf(det, sizeof det - 1, "%s [ML深度 %.2f]", full, pr);
+        _snprintf(act, sizeof act - 1, "quarantine %s", full);
+        addf("FILE", 1, det, act);
+    }
+}
+
+static void scan_ml_deep(void)
+{
+    static const char *envs[] = {"APPDATA", "LOCALAPPDATA", "TEMP", "ProgramData",
+                                 "ProgramFiles", "ProgramFiles(x86)"};
+    char roots[8][MAX_PATH]; int nroots = 0, r;
+    if (!g_ml_on) return;   /* 实验性: 需先开启 ML */
+    for (r = 0; r < 6 && nroots < 8; r++) {
+        char *v = getenv(envs[r]);
+        if (v && *v) strncpy(roots[nroots++], v, MAX_PATH - 1);
+    }
+    for (r = 0; r < nroots; r++) walk_paths_n(roots[r], 0, 8, ml_deep_cb, NULL);
+}
 
 static void wd_scan_dir(const char *dir, int depth)
 {
@@ -1239,6 +1285,7 @@ static DWORD WINAPI scan_group(LPVOID p)
     case 3: scan_bj(); break;
     case 4: scan_windir(); break;
     case 5: scan_wu(); scan_hosts(); break;
+    case 6: scan_ml_deep(); break;
     }
     InterlockedIncrement(&g_phase_done);
     if (g_hwnd) PostMessageA(g_hwnd, WM_SFC_PROGRESS, 0, 0);
@@ -1247,7 +1294,7 @@ static DWORD WINAPI scan_group(LPVOID p)
 
 static void scan_all(void)
 {
-    HANDLE th[6];
+    HANDLE th[7];
     int i;
     enable_privs();
     g_nf = 0;
@@ -1255,11 +1302,11 @@ static void scan_all(void)
     g_phase_done = 0;
     if (g_hwnd) PostMessageA(g_hwnd, WM_SFC_SCANBEGIN, 0, 0);
     if (!g_fcs_init) { InitializeCriticalSection(&g_fcs); g_fcs_init = 1; }
-    for (i = 0; i < 6; i++) {
+    for (i = 0; i < 7; i++) {
         th[i] = CreateThread(NULL, 0, scan_group, (LPVOID)(size_t)i, 0, NULL);
         if (!th[i]) scan_group((LPVOID)(size_t)i); /* 建线程失败退化串行 */
     }
-    for (i = 0; i < 6; i++) {
+    for (i = 0; i < 7; i++) {
         if (!th[i]) continue;
         /* UI 线程等待期间继续泵消息: 界面不冻结, xlog 回显照常送达 */
         while (MsgWaitForMultipleObjects(1, &th[i], FALSE, INFINITE, QS_ALLINPUT)
@@ -1288,7 +1335,13 @@ static void kill_srl(void)
     }
 }
 
-static void do_clean(char *extra, size_t esz)
+static void do_clean_with(char *extra, size_t esz, int live);
+static DWORD WINAPI clean_worker(LPVOID p);
+static void gui_append(const char *s);
+
+static void do_clean(char *extra, size_t esz) { do_clean_with(extra, esz, 0); }
+
+static void do_clean_with(char *extra, size_t esz, int live)
 {
     char qdir[MAX_PATH];
     SYSTEMTIME st;
@@ -1305,6 +1358,7 @@ static void do_clean(char *extra, size_t esz)
     ts = (unsigned long long)st.wYear * 10000000000ULL + st.wMonth * 100000000ULL
        + st.wDay * 1000000ULL + st.wHour * 10000ULL + st.wMinute * 100ULL + st.wSecond;
     _snprintf(qdir, sizeof qdir - 1, "%s\\%llu", QUAR_ROOT, ts);
+    if (live) { g_clean_done = 0; g_clean_total = g_nf; }
     for (i = 0; i < g_nf; i++) {
         int s = 1;
         if (!strcmp(g_f[i].kind, "PROCESS")) kill_srl();
@@ -1344,8 +1398,33 @@ static void do_clean(char *extra, size_t esz)
             }
         }
         if (s) ok++; else fail++;
+        if (live) {
+            char line[520], ps[700], *br;
+            strncpy(ps, g_f[i].detail, sizeof ps - 1); ps[sizeof ps - 1] = 0;
+            br = strstr(ps, " [");
+            if (br) *br = 0;
+            InterlockedIncrement(&g_clean_done);
+            _snprintf(line, sizeof line - 1, "[清除 %ld/%ld] %s %s -> %s\n",
+                      g_clean_done, g_clean_total, s ? "[+]" : "[-]", ps, s ? "成功" : "失败");
+            gui_append(line);
+            PostMessageA(g_hwnd, WM_SFC_PROGRESS, 0, 0);
+        }
     }
     _snprintf(extra + strlen(extra), esz - strlen(extra) - 1, "完成: %d 成功, %d 失败", ok, fail);
+}
+
+/* 清除工作线程: 逐项实时回显 + 进度 (UI 线程消息泵持续运转) */
+static DWORD WINAPI clean_worker(LPVOID p)
+{
+    char extra[512];
+    (void)p;
+    do_clean_with(extra, sizeof extra, 1);
+    gui_append("[*] "); gui_append(extra);
+    gui_append("\n建议重启确认无复活\n\n");
+    g_cleaning = 0;
+    if (g_prog) { SendMessageA(g_prog, PBM_SETMARQUEE, FALSE, 0); SendMessageA(g_prog, PBM_SETPOS, 100, 0); }
+    if (g_stat) SetWindowTextA(g_stat, "清除完成");
+    return 0;
 }
 
 /* ---- 隔离区还原/清空 ---- */
@@ -1761,7 +1840,7 @@ static void nomore_run(void)
 }
 
 /* ---- GUI ---- */
-static HWND g_btn[7];
+static HWND g_btn[8];
 #define GUI_BG 0x141218
 #define GUI_FG 0xE6E0E9
 #define GUI_MUT 0x938F99
@@ -1806,12 +1885,18 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
             SetWindowTextA(g_stat, "扫描中… (多线程并行)");
         }
         return 0;
-    case WM_SFC_PROGRESS:    /* 实时: 已遍历文件 / 发现项 / 阶段 */
+    case WM_SFC_PROGRESS:    /* 实时: 扫描=已遍历文件/发现/阶段; 清除=逐项进度 */
         if (g_stat) {
-            _snprintf(buf, sizeof buf - 1,
-                      "已遍历文件 %ld · 发现 %d 项 · 阶段 %ld/%d%s",
-                      g_files_done, g_nf, g_phase_done, SFC_PHASES,
-                      g_phase_done >= SFC_PHASES ? " · 汇总中" : "");
+            if (g_cleaning) {
+                long pct = g_clean_total ? g_clean_done * 100 / g_clean_total : 0;
+                _snprintf(buf, sizeof buf - 1, "清除中 %ld/%ld (%ld%%)", g_clean_done, g_clean_total, pct);
+                if (g_prog) { SendMessageA(g_prog, PBM_SETRANGE32, 0, 100); SendMessageA(g_prog, PBM_SETPOS, pct, 0); }
+            } else {
+                _snprintf(buf, sizeof buf - 1,
+                          "已遍历文件 %ld · 发现 %d 项 · 阶段 %ld/%d%s",
+                          g_files_done, g_nf, g_phase_done, SFC_PHASES,
+                          g_phase_done >= SFC_PHASES ? " · 汇总中" : "");
+            }
             buf[sizeof buf - 1] = 0;
             SetWindowTextA(g_stat, buf);
         }
@@ -1837,14 +1922,16 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
             EnableWindow(g_btn[1], g_nf > 0);
             return 0;
         case 2:
+            if (g_cleaning) { gui_append("[!] 清除进行中, 请稍候\n"); return 0; }
             if (MessageBoxA(hwnd, "确认清除所有检出项?\n文件将加密移入隔离区。",
                             "SilverFox Cleaner C", MB_OKCANCEL | MB_ICONWARNING) == IDOK) {
-                char extra[256];
-                gui_append("[..] 清除中...\n");
-                do_clean(extra, sizeof extra);
-                gui_append("[*] ");
-                gui_append(extra);
-                gui_append("\n建议重启确认无复活\n\n");
+                gui_append("[..] 清除中 (逐项实时显示)...\n");
+                g_cleaning = 1;
+                {
+                    HANDLE th = CreateThread(NULL, 0, clean_worker, NULL, 0, NULL);
+                    if (th) CloseHandle(th);
+                    else { g_cleaning = 0; gui_append("[!] 清除线程创建失败\n"); }
+                }
             }
             return 0;
         case 3:
@@ -1877,21 +1964,12 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
             gui_append(g_ml_on ? "[ML] 结构匹配 ML 复核已开启 (实验性; 打分>0.7 升为高置信)\n"
                                : "[ML] 结构匹配 ML 复核已关闭\n");
             return 0;
-        case 0x111:
-            if (MessageBoxA(hwnd, "不客气模式 (实验性功能 - 不稳定)\n\n"
-                            "警告: 需内核驱动 + testsigning, 必须关 Secure Boot\n"
-                            "过程: 导入自定义证书 -> 蓝屏重启 -> 驱动清理 -> 卸载 -> 删证书\n"
-                            "仅限虚拟机, 先保存全部工作!\n\n确定继续?",
-                            "SilverFox Cleaner 不客气模式", MB_OKCANCEL | MB_ICONWARNING) == IDOK) {
-                gui_append("[!!] 不客气模式启动 (实验性, 不稳定)\n");
-                nomore_run();
-            }
-            return 0;
         case 7:
-            if (MessageBoxA(hwnd, "不客气模式确认\n\n" 
-                            "导入自定义证书 + 装载内核驱动清理\n"
-                            "testsigning ON → 蓝屏重启 → 驱动清理\n"
-                            "→ 卸载 → 删证书 → testsigning OFF\n\n"
+            if (MessageBoxA(hwnd, "不客气模式确认 (实验性功能 - 不稳定)\n\n"
+                            "警告: 需内核驱动 + testsigning, 必须关 Secure Boot\n"
+                            "过程: 导入自定义证书 → 蓝屏重启 → 驱动清理\n"
+                            "→ 卸载 → 删证书 → testsigning OFF\n"
+                            "仅限虚拟机, 先保存全部工作!\n\n"
                             "材料: SFCleanerDrv.sys + SFCleanerCert.pfx 与程序同目录",
                             "SilverFox Cleaner 不客气模式", MB_OKCANCEL | MB_ICONWARNING) == IDOK) {
                 gui_append("[!!] 不客气模式启动\n");
@@ -1900,6 +1978,15 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
             return 0;
         case 8:
             break;
+        case 10:
+            {
+                RECT rc;
+                SetForegroundWindow(hwnd);
+                GetWindowRect(g_btn[7], &rc);
+                TrackPopupMenu(g_menu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON,
+                               rc.left, rc.bottom, 0, hwnd, NULL);
+            }
+            return 0;
         case 6:
             if (MessageBoxA(hwnd, "极端模式确认\n\n"
                             "序列: 自启动+标记 -> 安全模式启动 -> 清除 -> 蓝屏\n"
@@ -1925,9 +2012,9 @@ static void run_gui(void)
         icc.dwICC = ICC_PROGRESS_CLASS;
         InitCommonControlsEx(&icc);
     }
-    static const char *btns[7] = {"扫描", "清除", "关于", "还原隔离区", "清空隔离区", "极端", "不客气"};
-    static const int bx[7] = {14, 144, 274, 364, 504, 624, 744};
-    static const int bw[7] = {120, 120, 80, 130, 150, 110, 130};
+    static const char *btns[8] = {"扫描", "清除", "关于", "还原隔离区", "清空隔离区", "极端", "不客气", "实验性"};
+    static const int bx[8] = {14, 144, 274, 364, 504, 624, 744, 884};
+    static const int bw[8] = {120, 120, 80, 130, 150, 110, 130, 120};
     g_btn[5] = NULL; g_btn[6] = NULL;
     int i;
     memset(&wc, 0, sizeof wc);
@@ -1936,23 +2023,17 @@ static void run_gui(void)
     wc.hbrBackground = CreateSolidBrush(RGB(20, 18, 24));
     wc.lpszClassName = "SFC5";
     RegisterClassA(&wc);
-    /* 实验性功能菜单: 开启ML(默认关, 勾选切换) / 不客气模式(不稳定) */
-    g_menu = CreateMenu();
-    {
-        HMENU sub = CreateMenu();
-        AppendMenuA(sub, MF_STRING, 0x110, "开启 ML 复核 (实验性, 默认关)");
-        AppendMenuA(sub, MF_SEPARATOR, 0, NULL);
-        AppendMenuA(sub, MF_STRING, 0x111, "不客气模式 (不稳定)...");
-        AppendMenuA(g_menu, MF_POPUP, (UINT_PTR)sub, "实验性功能");
-    }
+    /* 实验性功能: 按钮栏「实验性」按钮 → 弹出菜单: 开启ML(默认关, 勾选切换) */
+    g_menu = CreatePopupMenu();
+    AppendMenuA(g_menu, MF_STRING, 0x110, "开启 ML 复核 (实验性, 默认关)");
     hwnd = CreateWindowExA(0, "SFC5", "SilverFox Cleaner C - NT6+ (x86/x64)",
-                           WS_OVERLAPPEDWINDOW | WS_VISIBLE, 200, 200, 920, 640,
-                           NULL, g_menu, wc.hInstance, NULL);
+                           WS_OVERLAPPEDWINDOW | WS_VISIBLE, 200, 200, 1060, 640,
+                           NULL, NULL, wc.hInstance, NULL);
     if (!hwnd) return;
     font = CreateFontA(16, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                        0, 0, CLEARTYPE_QUALITY, 0, "Microsoft YaHei UI");
     if (!font) font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-    for (i = 0; i < 7; i++) {
+    for (i = 0; i < 8; i++) {
         g_btn[i] = CreateWindowExA(0, "BUTTON", btns[i], WS_CHILD | WS_VISIBLE,
                                    bx[i], 12, bw[i], 38, hwnd, (HMENU)(size_t)(i + 1),
                                    wc.hInstance, NULL);
