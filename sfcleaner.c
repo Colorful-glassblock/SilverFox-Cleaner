@@ -62,6 +62,7 @@ static int g_nf;
 static HWND g_hwnd = NULL, g_prog = NULL, g_stat = NULL;
 static HMENU g_menu = NULL;
 static volatile LONG g_ml_on = 0;   /* 实验性: 结构匹配 ML 复核, 默认关 */
+static volatile LONG g_ml_deep = 0;  /* 实验性: 深度 ML 扫描, 默认关 */
 static volatile LONG g_files_done = 0, g_phase_done = 0;
 static volatile LONG g_cleaning = 0, g_clean_done = 0, g_clean_total = 0;
 #define SFC_PHASES 7
@@ -1084,6 +1085,7 @@ static int wd_random_name(const char *fn) /* fn=原始文件名(含扩展名); �
 static int drv_is_selfdrv(const char *path, long long sz);
 static void ml_deep_cb(const char *full, void *ctx);
 static void scan_ml_deep(void);
+static int is_dotnet_managed(const char *path);
 
 /* ---- 实验性深度 ML 扫描: AppData / TEMP / ProgramData / Program Files 全量 PE 打分 ---- */
 static void ml_deep_cb(const char *full, void *ctx)
@@ -1092,6 +1094,9 @@ static void ml_deep_cb(const char *full, void *ctx)
     (void)ctx;
     InterlockedIncrement(&g_files_done);
     if (strstr(full, "sf_quarantine") || is_self_path(full)) return;
+    /* 误杀防护: 有效签名(微软/Mozilla 等)或纯托管 .NET (COM 目录)直接放行 */
+    if (bj_is_signed(full)) return;
+    if (is_dotnet_managed(full)) return;
     pr = ml_score(full);
     if (pr >= 0.0 && pr > 0.7) {
         char det[MAX_PATH + 96], act[MAX_PATH + 16];
@@ -1101,12 +1106,36 @@ static void ml_deep_cb(const char *full, void *ctx)
     }
 }
 
+/* 纯托管 .NET 判定: 数据目录[14] (COM 描述符) RVA != 0 — 参考程序集/框架 DLL 常无签名 */
+static int is_dotnet_managed(const char *path)
+{
+    unsigned char h[4096];
+    unsigned e, magic, ddoff, nrv;
+    FILE *f = fopen(path, "rb");
+    size_t n;
+    if (!f) return 0;
+    n = fread(h, 1, sizeof h, f);
+    fclose(f);
+    if (n < 0x40 || h[0] != 'M' || h[1] != 'Z') return 0;
+    e = (unsigned)h[0x3C] | ((unsigned)h[0x3D] << 8) | ((unsigned)h[0x3E] << 16) | ((unsigned)h[0x3F] << 24);
+    if (e + 4 > n || h[e] != 'P' || h[e + 1] != 'E') return 0;
+    magic = (unsigned)h[e + 24] | ((unsigned)h[e + 25] << 8);
+    if (magic != 0x10B && magic != 0x20B) return 0;
+    ddoff = e + 24 + (magic == 0x20B ? 112u : 96u);
+    if (ddoff < 4 || ddoff + 14 * 8 + 8 > n) return 0;
+    nrv = (unsigned)h[ddoff - 4] | ((unsigned)h[ddoff - 3] << 8)
+        | ((unsigned)h[ddoff - 2] << 16) | ((unsigned)h[ddoff - 1] << 24);
+    if (nrv <= 14) return 0;
+    return ((unsigned)h[ddoff + 14 * 8] | ((unsigned)h[ddoff + 14 * 8 + 1] << 8)
+            | ((unsigned)h[ddoff + 14 * 8 + 2] << 16) | ((unsigned)h[ddoff + 14 * 8 + 3] << 24)) != 0;
+}
+
 static void scan_ml_deep(void)
 {
     static const char *envs[] = {"APPDATA", "LOCALAPPDATA", "TEMP", "ProgramData",
                                  "ProgramFiles", "ProgramFiles(x86)"};
     char roots[8][MAX_PATH]; int nroots = 0, r;
-    if (!g_ml_on) return;   /* 实验性: 需先开启 ML */
+    if (!g_ml_deep) return;   /* 实验性: 独立开关, 默认关 */
     for (r = 0; r < 6 && nroots < 8; r++) {
         char *v = getenv(envs[r]);
         if (v && *v) strncpy(roots[nroots++], v, MAX_PATH - 1);
@@ -1964,6 +1993,12 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
             gui_append(g_ml_on ? "[ML] 结构匹配 ML 复核已开启 (实验性; 打分>0.7 升为高置信)\n"
                                : "[ML] 结构匹配 ML 复核已关闭\n");
             return 0;
+        case 0x112:
+            g_ml_deep = !g_ml_deep;
+            CheckMenuItem(g_menu, 0x112, MF_BYCOMMAND | (g_ml_deep ? MF_CHECKED : MF_UNCHECKED));
+            gui_append(g_ml_deep ? "[ML] 深度 ML 扫描已开启 (实验性; AppData/TEMP/PF/ProgramData 全量打分)\n"
+                                 : "[ML] 深度 ML 扫描已关闭\n");
+            return 0;
         case 7:
             if (MessageBoxA(hwnd, "不客气模式确认 (实验性功能 - 不稳定)\n\n"
                             "警告: 需内核驱动 + testsigning, 必须关 Secure Boot\n"
@@ -2026,6 +2061,7 @@ static void run_gui(void)
     /* 实验性功能: 按钮栏「实验性」按钮 → 弹出菜单: 开启ML(默认关, 勾选切换) */
     g_menu = CreatePopupMenu();
     AppendMenuA(g_menu, MF_STRING, 0x110, "开启 ML 复核 (实验性, 默认关)");
+    AppendMenuA(g_menu, MF_STRING, 0x112, "深度 ML 扫描 (AppData/TEMP/PF/ProgramData)");
     hwnd = CreateWindowExA(0, "SFC5", "SilverFox Cleaner C - NT6+ (x86/x64)",
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE, 200, 200, 1060, 640,
                            NULL, NULL, wc.hInstance, NULL);
