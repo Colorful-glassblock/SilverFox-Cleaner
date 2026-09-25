@@ -92,6 +92,13 @@ internal static partial class Native
     internal static extern int NtRaiseHardError(uint status, uint paramCount, uint unicodeMask,
         IntPtr parameters, uint validResponseOption, out uint response);
 
+    // 关键进程防护: 银狐把自身设为 BreakOnTermination (关键进程), taskkill 直接触发蓝屏
+    [DllImport("ntdll.dll")]
+    internal static extern int NtQueryInformationProcess(IntPtr h, int cls, ref int outVal, int len, out int retLen);
+
+    [DllImport("ntdll.dll")]
+    internal static extern int NtSetInformationProcess(IntPtr h, int cls, ref int inVal, int len);
+
     // 白加黑检测: Authenticode 验签 (wintrust)
     [DllImport("wintrust.dll", CharSet = CharSet.Unicode)]
     internal static extern int WinVerifyTrust(IntPtr hwnd, ref Guid actionId, ref WINTRUST_DATA data);
@@ -257,6 +264,34 @@ public static class Scanner
     /// 实验性: ML 灵敏度 (0=高检测 1=平衡(默认) 2=低误杀)
     public static int MlMode = 1;
 
+    // ---- 实验性 ML 配置持久化 (极端模式跨重启继承: phase2 新进程从注册表恢复) ----
+    private const string MlCfgKey = @"Software\SFCleaner";
+
+    public static void SaveMlConfig()
+    {
+        try
+        {
+            using var rk = Registry.LocalMachine.CreateSubKey(MlCfgKey);
+            rk.SetValue("MlEnabled", MlEnabled ? 1 : 0, RegistryValueKind.DWord);
+            rk.SetValue("DeepMl", DeepMlScan ? 1 : 0, RegistryValueKind.DWord);
+            rk.SetValue("MlMode", MlMode, RegistryValueKind.DWord);
+        }
+        catch { /* 持久化尽力而为 */ }
+    }
+
+    public static void LoadMlConfig()
+    {
+        try
+        {
+            using var rk = Registry.LocalMachine.OpenSubKey(MlCfgKey);
+            if (rk is null) return;
+            MlEnabled = Convert.ToInt32(rk.GetValue("MlEnabled", 0)) != 0;
+            DeepMlScan = Convert.ToInt32(rk.GetValue("DeepMl", 0)) != 0;
+            MlMode = Math.Clamp(Convert.ToInt32(rk.GetValue("MlMode", 1)), 0, 2);
+        }
+        catch { /* 无配置=默认 */ }
+    }
+
     private const uint MEM_COMMIT = 0x1000;
     private const uint PAGE_GUARD = 0x100;
     private const uint PAGE_NOACCESS = 0x01;
@@ -320,7 +355,7 @@ public static class Scanner
         }
         var t1 = Task.Run(() => { Emit(ScanTasks()); Step(); Emit(ScanServices()); Step(); });
         var t2 = Task.Run(() => { Emit(ScanProcs()); Step(); Emit(ScanCtfmon()); Step(); });
-        var t3 = Task.Run(() => { Emit(ScanFiles(log, found)); Step(); Emit(ScanMlDeep()); Step(); Emit(ScanHosts()); Step(); Emit(ScanWu()); Step(); });
+        var t3 = Task.Run(() => { Emit(ScanFiles(log, found)); Step(); Emit(ScanMlDeep(log)); Step(); Emit(ScanHosts()); Step(); Emit(ScanWu()); Step(); });
         var t4 = Task.Run(() => { Emit(ScanWb()); Step(); Emit(ScanWd()); Step(); });
         Task.WaitAll(t1, t2, t3, t4);
         var all = bag.ToList();
@@ -444,10 +479,12 @@ public static class Scanner
         {
             if (name.Equals("srl.exe", StringComparison.OrdinalIgnoreCase))
             {
+                /* 关键进程标记前置, 保证 Clean 的 "pid " 解析不受影响 */
+                bool crit = IsBreakOnTermination(id);
                 res.Add(new Finding
                 {
                     Kind = "PROCESS", High = true,
-                    Detail = $"SrL.exe (pid {id})",
+                    Detail = crit ? $"[关键进程] SrL.exe (pid {id})" : $"SrL.exe (pid {id})",
                     Action = $"taskkill /f /pid {id}"
                 });
             }
@@ -522,6 +559,48 @@ public static class Scanner
     {
         try { using var p = Process.GetProcessById((int)id); return p.ProcessName.Equals("ctfmon", StringComparison.OrdinalIgnoreCase); }
         catch { return false; }
+    }
+
+    // ---- 关键进程 (BreakOnTermination) 防护 ----
+    private const int ProcessBreakOnTermination = 29;
+    private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+    private const uint PROCESS_SET_INFORMATION = 0x0200;
+
+    private static bool IsBreakOnTermination(uint pid)
+    {
+        var h = Native.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+        if (h == IntPtr.Zero) return false;
+        try
+        {
+            int val = 0;
+            return Native.NtQueryInformationProcess(h, ProcessBreakOnTermination, ref val, sizeof(int), out _) == 0
+                && val != 0;
+        }
+        catch { return false; }
+        finally { Native.CloseHandle(h); }
+    }
+
+    private static void ClearBreakOnTermination(uint pid)
+    {
+        var h = Native.OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+        if (h == IntPtr.Zero) return;
+        try
+        {
+            int val = 0;
+            Native.NtSetInformationProcess(h, ProcessBreakOnTermination, ref val, sizeof(int));
+        }
+        catch { /* 失败则照常尝试终止 */ }
+        finally { Native.CloseHandle(h); }
+    }
+
+    private static void ClearBreakOnTerminationImage(string image, IProgress<string>? log)
+    {
+        foreach (var (id, name) in SafeProcesses())
+            if (name.Equals(image, StringComparison.OrdinalIgnoreCase) && IsBreakOnTermination(id))
+            {
+                ClearBreakOnTermination(id);
+                log?.Report($"[*] 已解除关键进程标记 {name} (pid {id}) — 防 taskkill 触发蓝屏");
+            }
     }
 
     // ---- 落盘文件 ----
@@ -912,7 +991,12 @@ public static class Scanner
                 }
                 catch { /* 读取失败照常走检测 */ }
             }
-            if (rt == 1 && IsValidSigned(e)) continue;   // 随机名但签名有效 → 放行
+            /* 误杀闸门 (三层, 任中即放行):
+               1) wintrust 验签通过 (健康系统; 含 catalog 回退)
+               2) 版本信息 CompanyName 含 Microsoft — 24H2 catalog 枚举失败的确定性兜底
+               3) 内嵌 Authenticode 结构级有效 (证书链+非自签+非滥用签名者, 不依赖本机证书库) */
+            if (rt == 1 && (IsValidSigned(e) || VerCompanyIsMicrosoft(e) || HasLegitEmbeddedSig(e)))
+                continue;   // 随机名但签名有效 → 放行
             res.Add(new Finding
             {
                 Kind = "FILE",
@@ -1019,7 +1103,7 @@ public static class Scanner
     }
 
     /// <summary>实验性深度 ML 扫描 (需开启 ML): AppData / TEMP / ProgramData / Program Files 全量 PE 打分。</summary>
-    public static List<Finding> ScanMlDeep()
+    public static List<Finding> ScanMlDeep(IProgress<string>? log = null)
     {
         var res = new List<Finding>();
         if (!DeepMlScan) return res;   // 实验性: 独立开关, 默认关
@@ -1028,30 +1112,99 @@ public static class Scanner
         AddEnv(roots, "LOCALAPPDATA");
         AddEnv(roots, "TEMP");
         AddEnv(roots, "ProgramData");
+        int dop = Math.Min(Math.Max(Environment.ProcessorCount, 1), 6);   // 与 t1/t2/t4 并行, 别过载
         foreach (var root in roots.Where(Directory.Exists))
-            foreach (var p in Walk(root, 8))
+        {
+            var bag = new System.Collections.Concurrent.ConcurrentBag<Finding>();
+            long seen = 0, hits = 0;
+            var paths = Walk(root, 8)
+                .Where(p => !p.ToLowerInvariant().Contains("sf_quarantine") && !IsSelfPath(p));
+            Parallel.ForEach(paths, new ParallelOptions { MaxDegreeOfParallelism = dop }, p =>
             {
-                if (p.ToLowerInvariant().Contains("sf_quarantine") || IsSelfPath(p)) continue;
-                /* 误杀防护: 有效签名(微软/Mozilla 等)或纯托管 .NET (COM 目录)直接放行 */
-                if (IsValidSigned(p)) continue;
-                if (IsDotNetManaged(p)) continue;
-                if (MlModel.DualScore(p) is { } ds)
+                long s = Interlocked.Increment(ref seen);
+                if ((s & 0xFF) == 0)   /* 进度: 每 256 个文件一行, 深扫全程有输出不显卡死 */
+                    log?.Report($"  已深度扫描 {s} 个文件 (ML深度命中 {Volatile.Read(ref hits)} 项)");
+                try
                 {
-                    var v = MlInfer.Decide(ds.Tab, ds.Img, MlMode);
+                    if (!IsPeHeader(p)) return;          // 廉价 PE 门: 非 PE 只读 64B 头, 不做 4MB 读取
+                    if (IsDotNetManaged(p)) return;      // 纯托管 .NET (COM 目录) 放行 — 广撒网不该误杀
+                    var x = PeFeat.Extract(p);
+                    if (x == null) return;               // 非 PE / 解析失败
+                    /* 误杀闸门: 内嵌 Authenticode 结构级有效 (证书链+非自签+非滥用签名者) → 放行.
+                       不用 WinVerifyTrust: 24H2 catalog 枚举失败/证书库被清空的 VM 上它全判失败,
+                       且滥用证书(贝锐/钉钉)的样本也会被 WinVerifyTrust 放行 — 结构级判定更严 */
+                    if (x[11] > 0 && x[12] > 0 && x[13] == 0 && x[15] == 0) return;
+                    float tab = MlInfer.TabularP(x);
+                    if (tab <= MlInfer.TabFloor(MlMode)) return;   // 表格地板: CNN 只跑疑似
+                    var img = new byte[3072];
+                    if (!MlInfer.DeltaImg(p, img)) return;
+                    float imgp = MlInfer.ImageP(img);
+                    var v = MlInfer.Decide(tab, imgp, MlMode);
                     if (v.High)
                     {
+                        Interlocked.Increment(ref hits);
                         var tag = MlMode == 0 ? "高" : (MlMode == 2 ? "低" : "平");
-                        res.Add(new Finding
+                        var nf = new Finding
                         {
                             Kind = "FILE",
                             Detail = $"{p} [ML深度{tag} {v.Score:F2}]",
                             High = true,
                             Action = $"quarantine {p}"
-                        });
+                        };
+                        bag.Add(nf);
                     }
                 }
-            }
+                catch { /* 单个文件异常不阻塞整轮 */ }
+            });
+            res.AddRange(bag);
+        }
         return res;
+    }
+
+    /// 廉价 PE 门: 只读 64 字节头确认 MZ+PE — 非 PE 文件零大读取 (TEMP/AppData 里大多是 json/log/png)
+    private static bool IsPeHeader(string path)
+    {
+        try
+        {
+            using var f = File.OpenRead(path);
+            if (f.Length < 0x40) return false;
+            Span<byte> h = stackalloc byte[64];
+            f.ReadExactly(h);
+            if (h[0] != 'M' || h[1] != 'Z') return false;
+            int e = h[0x3C] | h[0x3D] << 8 | h[0x3E] << 16 | h[0x3F] << 24;
+            if (e + 4 > 64 || h[e] != 'P' || h[e + 1] != 'E' || h[e + 2] != 0 || h[e + 3] != 0) return false;
+            return true;
+        }
+        catch { return false; }
+    }
+
+    /// 内嵌 Authenticode 结构级「合法签名」: 有证书链 + 非自签 + 签名者不在滥用名单 (ml_feat 静态解析).
+    private static bool HasLegitEmbeddedSig(string path)
+    {
+        var x = PeFeat.Extract(path);
+        return x != null && x[11] > 0 && x[12] > 0 && x[13] == 0 && x[15] == 0;
+    }
+
+    /* System32 误杀闸门: 版本资源 CompanyName 含 Microsoft —
+       24H2 catalog 枚举失败/证书库被清空的 VM 上 WinVerifyTrust 全判失败时的离线确定性兜底 */
+    private static bool VerCompanyIsMicrosoft(string path)
+    {
+        try
+        {
+            uint h = 0;
+            uint sz = Native.GetFileVersionInfoSizeW(path, out h);
+            if (sz == 0 || sz > 262144) return false;
+            var vbuf = new byte[sz];
+            if (!Native.GetFileVersionInfoW(path, 0, sz, vbuf)) return false;
+            if (!Native.VerQueryValueW(vbuf, @"\VarFileInfo\Translation", out IntPtr pTrans, out uint tsz)
+                || tsz < 4) return false;
+            short lang = Marshal.ReadInt16(pTrans);
+            short cp = Marshal.ReadInt16(pTrans, 2);
+            string sub = $@"\StringFileInfo\{lang:x4}{cp:x4}\CompanyName";
+            if (!Native.VerQueryValueW(vbuf, sub, out IntPtr pComp, out uint clen) || clen < 2) return false;
+            return Marshal.PtrToStringUni(pComp)?.Contains("Microsoft", StringComparison.OrdinalIgnoreCase) == true;
+        }
+        catch { return false; }
     }
 
     /// <summary>纯托管 .NET 判定: 数据目录[14] (COM 描述符) RVA != 0 — 参考程序集/框架 DLL 常无签名。</summary>
@@ -1143,9 +1296,17 @@ public static class Scanner
             {
                 case "PROC-MEM": s = true; break;
                 case "PROCESS":
+                {
                     string pid = AfterLast(f.Detail, "pid ").Trim().TrimEnd(')');
+                    /* 关键进程防护: BreakOnTermination 进程直接 taskkill 会蓝屏 — 先解除再杀 */
+                    if (uint.TryParse(pid, out var ppid) && IsBreakOnTermination(ppid))
+                    {
+                        log?.Report($"[*] pid {ppid} 是关键进程 (BreakOnTermination) — 先解除标记再终止");
+                        ClearBreakOnTermination(ppid);
+                    }
                     s = Run("taskkill", "/f", "/pid", pid);
                     break;
+                }
                 case "TASK":
                     s = Run("schtasks", "/delete", "/tn", BeforeBracket(f.Detail), "/f");
                     break;
@@ -1223,9 +1384,10 @@ public static class Scanner
         Run("icacls", path, "/grant", "Administrators:F");
     }
 
-    /* 按映像名终止进程 (隔离运行中程序前先杀) */
-    private static void KillImage(string img)
+    /* 按映像名终止进程 (隔离运行中程序前先杀); 关键进程先解除标记再杀 */
+    private static void KillImage(string img, IProgress<string>? log)
     {
+        ClearBreakOnTerminationImage(img, log);
         try { Run("taskkill", "/f", "/im", img, "/t"); } catch { }
     }
 
@@ -1236,9 +1398,9 @@ public static class Scanner
         ulong ts = QuarCrypt.TsFromDirName(Path.GetFileName(qdir));
         TakeOwn(src);
 
-        /* .exe 先杀运行实例 (否则删除必失败) */
+        /* .exe 先杀运行实例 (否则删除必失败); 关键进程先解除标记防蓝屏 */
         if (string.Equals(Path.GetExtension(src), ".exe", StringComparison.OrdinalIgnoreCase))
-            KillImage(Path.GetFileName(src));
+            KillImage(Path.GetFileName(src), log);
 
         string staged = Path.Combine(qdir, Path.GetFileName(src));
         try { File.Move(src, staged); }
@@ -1514,6 +1676,7 @@ public static class Scanner
     public static void ExtremeRun(IProgress<string>? log)
     {
         EnablePrivileges();
+        LoadMlConfig();   // 极端模式继承当前实验性 ML 配置 (phase2 新进程从注册表恢复)
         if (MarkerGet() == 2)
         {
             Xlog("phase2: boot cleanup");
@@ -1535,6 +1698,7 @@ public static class Scanner
             AutorunSet();
             MarkerSet(2);
             SafebootSet(); // 下一轮重启进安全模式再清场
+            SaveMlConfig(); // 固化当前 ML 配置, 供 phase2 新进程继承
             log?.Report("[!!] 已写入自启动与阶段标记, 下次重启进安全模式");
             var fs = ScanAll();
             var r = Clean(fs, log);
@@ -1667,6 +1831,7 @@ public static class Scanner
     public static void NomoreRun(IProgress<string>? log = null)
     {
         EnablePrivileges();
+        LoadMlConfig();   // 不客气模式同样继承实验性 ML 配置 (phase2 新进程)
         if (MarkerGet() == 3)
         {
             NomorePhase2();
