@@ -192,6 +192,7 @@ const WM_COMMAND: u32 = 0x111;
 const WM_SETFONT: u32 = 0x30;
 const EM_SETSEL: u32 = 0xB1;
 const EM_REPLACESEL: u32 = 0xC2;
+const EM_SETLIMITTEXT: u32 = 0xC5;
 /* 进度条 (comctl32) */
 const ICC_PROGRESS_CLASS: u32 = 0x20;
 const PBM_SETRANGE32: u32 = 0x0406;
@@ -1046,7 +1047,8 @@ fn scan_files() -> Vec<Finding> {
                     if find(&hd, MAGIC_STEG) { md.push_str(" [STEGR1Xp]"); }
                     if find(&hd, MAGIC_JELG) { md.push_str(" [JELG]"); }
                     if hd.starts_with(&[0x89, b'P', b'N', b'G']) && !fnm.ends_with(".png")
-                        && !s.contains("\\packages\\") { md.push_str(" [PNG伪装]"); } /* UWP 磁贴缓存合法 */
+                        && !s.contains("\\packages\\") /* UWP 磁贴缓存合法 */
+                        && !s.contains("\\cache\\") && !s.contains("cache_data") { md.push_str(" [PNG伪装]"); }
                 }
             }
             let mut hs = "";
@@ -1939,6 +1941,7 @@ fn run_gui() {
         GUI_BAR.store(bar, Ordering::SeqCst);
         GUI_STAT.store(barstat, Ordering::SeqCst);
         let edit = CreateWindowExW(0x200, utf16("EDIT").as_ptr(), utf16("").as_ptr(), WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL | ES_WANTRETURN, 14, 74, 880, 472, hwnd, 4, inst, std::ptr::null());
+        SendMessageW(edit, EM_SETLIMITTEXT, 0x7FFFFFFF, 0);   /* 默认 32KB 上限会静默截断长扫描日志 */
         let status = CreateWindowExW(0, utf16("STATIC").as_ptr(), utf16("就绪 — 扫描 | SYSTEM + TrustedInstaller | 加密隔离: sf_quarantine (仅本工具可还原)").as_ptr(), WS_CHILD | WS_VISIBLE, 14, 556, 880, 24, hwnd, 5, inst, std::ptr::null());
         for h in [b1, b2, b3, b4, b5, b6, b7, b8, edit, status, barstat] { SendMessageW(h, WM_SETFONT, font as usize, 1); }
         GUI_LOG.store(edit, Ordering::SeqCst);
