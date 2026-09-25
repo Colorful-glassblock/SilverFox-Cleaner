@@ -4,11 +4,26 @@ using System.Collections.ObjectModel;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Windowing;
 using Windows.Graphics;
+using System.Reflection;
 
 namespace SFCleaner;
 
 public sealed partial class MainWindow : Window
 {
+    /// 版本号: CI 按命名规则注入 (<branch>-release-<ver> / <branch>-pre-<sha8>) 到
+    /// AssemblyInformationalVersion; 本地构建缺省 v5.1-dev (csproj 兜底).
+    private static string AppVer()
+    {
+        try
+        {
+            var s = typeof(MainWindow).Assembly
+                .GetCustomAttribute<AssemblyInformationalVersionAttribute>()
+                ?.InformationalVersion ?? "v5.1-dev";
+            int p = s.IndexOf('+');   // SourceLink 追加的 +<sha> 截掉
+            return p > 0 ? s[..p] : s;
+        }
+        catch { return "v5.1-dev"; }
+    }
     private List<Finding> _findings = [];
     private readonly ObservableCollection<Finding> _items = [];   /* 实时上屏 (增量动画) */
     private bool _busy;
@@ -16,11 +31,11 @@ public sealed partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        Title = "SilverFox Cleaner v5 — 银狐检测清除 (WinUI3)";
+        Title = $"SilverFox Cleaner {AppVer()} — 银狐检测清除 (WinUI3)";
         SystemBackdrop = new MicaBackdrop();
         try { AppWindow.Resize(new SizeInt32(1020, 720)); } catch { /* N/A 桌面 */ }
 
-        AppendLog("SilverFox Cleaner v5 (WinUI3) — dmo/client");
+        AppendLog($"SilverFox Cleaner {AppVer()} (WinUI3) — dmo/client");
         AppendLog("检测: 持久化 / 落盘物 / 互斥 / SrL / ctfmon内存注入");
         AppendLog("权限: SYSTEM + TrustedInstaller 提权 | 隔离: 时间戳加密 SFQENC1 (仅本工具可还原)");
         AppendLog("扫描: 多线程并行 (任务+服务 | 进程+内存 | 文件)");
@@ -339,8 +354,8 @@ public sealed partial class MainWindow : Window
         {
             TextWrapping = TextWrapping.Wrap,
             MaxWidth = 420,
-            Text = """
-                SilverFox Cleaner v5 (WinUI3)
+            Text = $"""
+                SilverFox Cleaner {AppVer()} (WinUI3)
 
                 银狐木马 (dmo/client Go RAT) 检测清除工具。
 
