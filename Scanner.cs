@@ -1054,7 +1054,9 @@ public static class Scanner
                     if (head.IndexOf(JelgMagic) >= 0) md += " [JELG]";
                     if (n >= 4 && head[0] == 0x89 && head[1] == (byte)'P' && head[2] == (byte)'N' &&
                         head[3] == (byte)'G' && !fnm.EndsWith(".png")
-                        && !p.ToLowerInvariant().Contains(@"\packages\")) md += " [PNG伪装]"; /* UWP 磁贴缓存合法 */
+                        && !p.ToLowerInvariant().Contains(@"\packages\")       /* UWP 磁贴缓存合法 */
+                        && !p.ToLowerInvariant().Contains(@"\cache\")          /* 浏览器缓存合法 */
+                        && !p.ToLowerInvariant().Contains(@"cache_data")) md += " [PNG伪装]";
                 }
                 string hs = "";
                 try
