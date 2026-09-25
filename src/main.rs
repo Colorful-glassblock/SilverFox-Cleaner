@@ -215,7 +215,9 @@ const MF_CHECKED: u32 = 0x8;
 const MF_STRING: u32 = 0x0;
 const MF_SEPARATOR: u32 = 0x800;
 const MF_BYCOMMAND: u32 = 0x0;
-const TPM_RIGHTBUTTON: u32 = 0x2;
+const TPM_LEFTALIGN: u32 = 0x0;
+const TPM_TOPALIGN: u32 = 0x0;
+/* TPM_RIGHTBUTTON 是坑: 把选中键翻成右键, 左键点菜单项会"弹得出点不动" — 勿用 */
 static FILES_DONE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static PHASE_DONE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static FIND_CNT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
@@ -1870,7 +1872,8 @@ unsafe extern "system" fn wndproc(hwnd: isize, msg: u32, wp: usize, lp: isize) -
                     let mut rc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
                     SetForegroundWindow(hwnd);
                     GetWindowRect(btn, &mut rc);
-                    TrackPopupMenu(sub, TPM_RIGHTBUTTON, rc.left, rc.bottom, 0, hwnd, std::ptr::null());
+                    /* 注意别带 TPM_RIGHTBUTTON — 它把选中键翻成右键, 左键点菜单项会"弹得出点不动" */
+                    TrackPopupMenu(sub, TPM_LEFTALIGN | TPM_TOPALIGN, rc.left, rc.bottom, 0, hwnd, std::ptr::null());
                 }
                 0
             }
