@@ -808,4 +808,12 @@ int ml_feat_extract(const char *path, double out[28])
     return 0;
 }
 
+/* 内嵌 Authenticode「结构级合法签名」: 有证书链 + 非自签 + 签名者不在滥用名单.
+ * 不依赖本机证书库/WinVerifyTrust — 24H2 catalog 枚举失败/证书库被清空的 VM 上仍可靠 */
+int ml_feat_legit_sig(const double x28[28])
+{
+    return x28[F_HAS_AUTHENTICODE] > 0.0 && x28[F_CERT_COUNT] > 0.0
+        && x28[F_IS_SELF_SIGNED] == 0.0 && x28[F_SIGNER_BLACKLISTED] == 0.0;
+}
+
 /* ---------------- (旧 22 维逻辑回归已由 ml_net.c 的表格 MLP 取代) ---------------- */

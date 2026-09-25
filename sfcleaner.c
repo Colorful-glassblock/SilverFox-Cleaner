@@ -69,6 +69,12 @@ static volatile LONG g_files_done = 0, g_phase_done = 0;
 static volatile LONG g_cleaning = 0, g_clean_done = 0, g_clean_total = 0;
 #define SFC_PHASES 7
 
+/* 前置声明 (实现靠后, 但 scan_procs/kill_srl 先用到) */
+static int is_break_on_termination(DWORD pid);
+static void clear_break_on_termination(DWORD pid);
+static void ml_cfg_save(void);
+static void ml_cfg_load(void);
+
 /* ---- 小工具 ---- */
 static CRITICAL_SECTION g_fcs;
 static int g_fcs_init = 0;
@@ -543,7 +549,11 @@ static void scan_procs(void)
         HANDLE m;
         int j, len;
         if (!_stricmp(g_procs[i].name, "srl.exe")) {
-            _snprintf(det, sizeof det - 1, "SrL.exe (pid %lu)", (unsigned long)g_procs[i].pid);
+            /* 关键进程标记前置, 保证 kill_srl 按名字枚举不受影响 */
+            if (is_break_on_termination(g_procs[i].pid))
+                _snprintf(det, sizeof det - 1, "[关键进程] SrL.exe (pid %lu)", (unsigned long)g_procs[i].pid);
+            else
+                _snprintf(det, sizeof det - 1, "SrL.exe (pid %lu)", (unsigned long)g_procs[i].pid);
             _snprintf(mn, sizeof mn - 1, "taskkill /f /pid %lu", (unsigned long)g_procs[i].pid);
             addf("PROCESS", 1, det, mn);
         }
@@ -744,6 +754,60 @@ static int ver_orig_name(const char *path, char *out, unsigned int outn)
         ok = 1;
     }
     return ok;
+}
+
+/* System32 误杀闸门: 版本资源 CompanyName 含 Microsoft.
+   24H2 catalog 枚举失败 / 证书库被清空的 VM 上 WinVerifyTrust 全判失败时,
+   版本资源是离线确定性兜底 (微软自带文件几乎都带 CompanyName=Microsoft) */
+static int ver_company_microsoft(const char *path)
+{
+    typedef DWORD (WINAPI *fn_SizeA)(LPCSTR, LPDWORD);
+    typedef BOOL  (WINAPI *fn_InfoA)(LPCSTR, DWORD, DWORD, LPVOID);
+    typedef BOOL  (WINAPI *fn_QueryA)(LPCVOID, LPCSTR, LPVOID *, PUINT);
+    static fn_SizeA pSize = NULL;
+    static fn_InfoA pInfo = NULL;
+    static fn_QueryA pQuery = NULL;
+    static int inited = 0;
+    static unsigned char vbuf[262144];
+    DWORD h = 0, sz;
+    UINT tsz = 0, olen = 0;
+    void *ptrans = NULL, *pval = NULL;
+    WORD *w;
+    char sub[256];
+    unsigned int k;
+    if (!inited) {
+        HMODULE v = LoadLibraryA("version.dll");
+        inited = 1;
+        if (v) {
+            pSize  = (fn_SizeA)GetProcAddress(v, "GetFileVersionInfoSizeA");
+            pInfo  = (fn_InfoA)GetProcAddress(v, "GetFileVersionInfoA");
+            pQuery = (fn_QueryA)GetProcAddress(v, "VerQueryValueA");
+        }
+    }
+    if (!pSize || !pInfo || !pQuery) return 0;
+    sz = pSize(path, &h);
+    if (!sz || sz > sizeof vbuf) return 0;
+    if (!pInfo(path, 0, sz, vbuf)) return 0;
+    if (!pQuery(vbuf, "\\VarFileInfo\\Translation", &ptrans, &tsz) || tsz < 4) return 0;
+    w = (WORD *)ptrans;
+    _snprintf(sub, sizeof sub - 1, "\\StringFileInfo\\%04x%04x\\CompanyName", w[0], w[1]);
+    if (!pQuery(vbuf, sub, (void **)&pval, &olen) || !pval || olen < 2) return 0;
+    for (k = 0; k < olen && k < 63; k++) {
+        char c = ((char *)pval)[k];
+        if (c == 0) break;
+        if (c >= 'A' && c <= 'Z') c += 32;   /* 小写比较: microsoft */
+        sub[k] = c;
+    }
+    sub[k] = 0;
+    return strstr(sub, "microsoft") != NULL;
+}
+
+/* 内嵌 Authenticode 结构级「合法签名」判定 (ml_feat 静态解析, 不依赖本机证书库) */
+static int ml_legit_sig_path(const char *full)
+{
+    double x28[28];
+    if (ml_feat_extract(full, x28) != 0) return 0;
+    return ml_feat_legit_sig(x28);
 }
 
 /* ---- 白加黑检测: 同目录 [有效签名EXE + 未签名DLL] (跨变种结构特征) ---- */
@@ -1089,35 +1153,46 @@ static int drv_is_selfdrv(const char *path, long long sz);
 static void ml_deep_cb(const char *full, void *ctx);
 static void scan_ml_deep(void);
 static int is_dotnet_managed(const char *path);
+static void gui_append(const char *s);
+static int is_break_on_termination(DWORD pid);
+static void clear_break_on_termination(DWORD pid);
+static void ml_cfg_save(void);
+static void ml_cfg_load(void);
 
 /* ---- 实验性深度 ML 扫描: AppData / TEMP / ProgramData / Program Files 全量 PE 打分 ---- */
 static void ml_deep_cb(const char *full, void *ctx)
 {
-    double pr;
+    double x28[28];
+    float t;
+    unsigned char dimg[3072];
+    long n;
     (void)ctx;
-    InterlockedIncrement(&g_files_done);
+    n = InterlockedIncrement(&g_files_done);
+    if ((n & 0x1FFF) == 0) {   /* 进度: 每 8192 个文件一行, 深扫全程有输出不显卡死 */
+        char pb[96];
+        _snprintf(pb, sizeof pb - 1, "  已深度扫描 %ld 个文件\n", n);
+        gui_append(pb);
+    }
     if (strstr(full, "sf_quarantine") || is_self_path(full)) return;
-    /* 误杀防护: 有效签名(微软/Mozilla 等)或纯托管 .NET (COM 目录)直接放行 */
-    if (bj_is_signed(full)) return;
+    /* 纯托管 .NET (COM 目录) 放行 — 深扫广撒网, 这类合法件不该被模型高分误杀 */
     if (is_dotnet_managed(full)) return;
+    if (ml_feat_extract(full, x28) != 0) return;   /* 非 PE */
+    /* 误杀闸门: 内嵌 Authenticode 结构级有效 → 放行. 不用 WinVerifyTrust:
+       24H2 catalog 枚举失败/证书库被清空的 VM 上它全判失败 */
+    if (ml_feat_legit_sig(x28)) return;
+    t = ml_tab_p(x28);
+    if (t <= ml_tab_floor(g_ml_mode)) return;   /* 表格地板: CNN 只跑疑似 */
     {
-        double x28[28];
-        unsigned char dimg[3072];
-        float t = -1.0f, i = -1.0f;
+        float i = 0.0f;
         MlVerdict v;
-        if (ml_feat_extract(full, x28) == 0 && ml_delta_img(full, dimg)) {
-            t = ml_tab_p(x28);
-            i = ml_img_p(dimg);
-        }
-        if (t >= 0.0f) {
-            v = ml_verdict(t, i, g_ml_mode);
-            if (v.high) {
-                char det[MAX_PATH + 96], act[MAX_PATH + 16];
-                const char *tag = g_ml_mode == 0 ? "高" : (g_ml_mode == 2 ? "低" : "平");
-                _snprintf(det, sizeof det - 1, "%s [ML深度%s %.2f]", full, tag, (double)v.score);
-                _snprintf(act, sizeof act - 1, "quarantine %s", full);
-                addf("FILE", 1, det, act);
-            }
+        if (ml_delta_img(full, dimg)) i = ml_img_p(dimg);
+        v = ml_verdict(t, i, g_ml_mode);
+        if (v.high) {
+            char det[MAX_PATH + 96], act[MAX_PATH + 16];
+            const char *tag = g_ml_mode == 0 ? "高" : (g_ml_mode == 2 ? "低" : "平");
+            _snprintf(det, sizeof det - 1, "%s [ML深度%s %.2f]", full, tag, (double)v.score);
+            _snprintf(act, sizeof act - 1, "quarantine %s", full);
+            addf("FILE", 1, det, act);
         }
     }
 }
@@ -1191,7 +1266,12 @@ static void wd_scan_dir(const char *dir, int depth)
             long long fsz = ((long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
             if (drv_is_selfdrv(full, fsz)) continue; /* SHA-512 等于本版驱动才豁免 */
         }
-        if (rt == 1 && bj_is_signed(full)) continue; /* 随机名但签名有效 → 放行 */
+        /* 误杀闸门 (三层, 任中即放行):
+           1) wintrust 验签通过 (健康系统; 含 catalog 回退)
+           2) 版本信息 CompanyName 含 Microsoft — 24H2 catalog 枚举失败的确定性兜底
+           3) 内嵌 Authenticode 结构级有效 (证书链+非自签+非滥用签名者, 不依赖本机证书库) */
+        if (rt == 1 && (bj_is_signed(full) || ver_company_microsoft(full) || ml_legit_sig_path(full)))
+            continue; /* 随机名但签名有效 → 放行 */
         {
             char det[MAX_PATH + 40], act[MAX_PATH + 16];
             _snprintf(det, sizeof det - 1, "%s [%s]", full, rt == 1 ? "随机名未签名PE" : "随机名bat");
@@ -1375,6 +1455,11 @@ static void kill_srl(void)
     for (i = 0; i < g_np; i++) {
         HANDLE h;
         if (_stricmp(g_procs[i].name, "srl.exe")) continue;
+        /* 关键进程防护: BreakOnTermination 进程直接终止会蓝屏 — 先解除标记再杀 */
+        if (is_break_on_termination(g_procs[i].pid)) {
+            clear_break_on_termination(g_procs[i].pid);
+            xlog("已解除关键进程标记 srl.exe (pid %lu) — 防终止触发蓝屏", (unsigned long)g_procs[i].pid);
+        }
         h = OpenProcess(PROCESS_TERMINATE, FALSE, g_procs[i].pid);
         if (h) { TerminateProcess(h, 1); CloseHandle(h); }
     }
@@ -1615,6 +1700,87 @@ static void marker_del(void)
     }
 }
 
+/* ---- 实验性 ML 配置持久化 (极端模式跨重启继承: phase2 新进程从注册表恢复) ---- */
+#define ML_CFG_KEY "Software\\SFCleaner"
+static void ml_cfg_save(void)
+{
+    HKEY rk;
+    DWORD v;
+    if (RegCreateKeyExA(HKEY_LOCAL_MACHINE, ML_CFG_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &rk, NULL)
+        != ERROR_SUCCESS) return;
+    v = g_ml_on ? 1 : 0;    RegSetValueExA(rk, "MlEnabled", 0, REG_DWORD, (const BYTE *)&v, sizeof v);
+    v = g_ml_deep ? 1 : 0;  RegSetValueExA(rk, "DeepMl", 0, REG_DWORD, (const BYTE *)&v, sizeof v);
+    v = (DWORD)g_ml_mode;   RegSetValueExA(rk, "MlMode", 0, REG_DWORD, (const BYTE *)&v, sizeof v);
+    RegCloseKey(rk);
+}
+
+static void ml_cfg_load(void)
+{
+    HKEY rk;
+    DWORD v, t, cb;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, ML_CFG_KEY, 0, KEY_QUERY_VALUE, &rk) != ERROR_SUCCESS) return;
+    cb = sizeof v;
+    if (RegQueryValueExA(rk, "MlEnabled", NULL, &t, (BYTE *)&v, &cb) == ERROR_SUCCESS)
+        g_ml_on = v != 0;
+    cb = sizeof v;
+    if (RegQueryValueExA(rk, "DeepMl", NULL, &t, (BYTE *)&v, &cb) == ERROR_SUCCESS)
+        g_ml_deep = v != 0;
+    cb = sizeof v;
+    if (RegQueryValueExA(rk, "MlMode", NULL, &t, (BYTE *)&v, &cb) == ERROR_SUCCESS)
+        g_ml_mode = v > 2 ? 1 : (int)v;
+    RegCloseKey(rk);
+}
+
+/* ---- 关键进程 (BreakOnTermination) 防护 ----
+   银狐把自身设为关键进程, 任何终止 (taskkill/TerminateProcess) 都触发蓝屏 — 先解除再杀 */
+typedef LONG (WINAPI *fn_NtQIP)(HANDLE, LONG, PVOID, ULONG, PULONG);
+typedef LONG (WINAPI *fn_NtSIP)(HANDLE, LONG, PVOID, ULONG);
+static fn_NtQIP pNQIP = NULL;
+static fn_NtSIP pNSIP = NULL;
+static int ntdl_ready = 0;
+
+static void ensure_ntdl(void)
+{
+    HMODULE nt;
+    if (ntdl_ready) return;
+    ntdl_ready = 1;
+    nt = GetModuleHandleA("ntdll.dll");
+    if (!nt) nt = LoadLibraryA("ntdll.dll");
+    if (nt) {
+        pNQIP = (fn_NtQIP)GetProcAddress(nt, "NtQueryInformationProcess");
+        pNSIP = (fn_NtSIP)GetProcAddress(nt, "NtSetInformationProcess");
+    }
+}
+
+static int is_break_on_termination(DWORD pid)
+{
+    HANDLE h;
+    LONG v = 0;
+    ULONG ret = 0;
+    ensure_ntdl();
+    if (!pNQIP) return 0;
+    h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return 0;
+    if (pNQIP(h, 29 /*ProcessBreakOnTermination*/, &v, sizeof v, &ret) == 0 && v != 0) {
+        CloseHandle(h);
+        return 1;
+    }
+    CloseHandle(h);
+    return 0;
+}
+
+static void clear_break_on_termination(DWORD pid)
+{
+    HANDLE h;
+    LONG v = 0;
+    ensure_ntdl();
+    if (!pNSIP) return;
+    h = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return;
+    pNSIP(h, 29, &v, sizeof v);
+    CloseHandle(h);
+}
+
 static void autorun_set(void)
 {
     char data[MAX_PATH + 64], exe[MAX_PATH], shortp[MAX_PATH];
@@ -1715,6 +1881,7 @@ static void extreme_run(void)
 {
     char msg[128];
     enable_privs();
+    ml_cfg_load();   /* 极端模式继承当前实验性 ML 配置 (phase2 新进程从注册表恢复) */
     if (marker_get() == 2) {
         xlog("phase2: boot cleanup (safe mode)");
         scan_all();
@@ -1731,6 +1898,7 @@ static void extreme_run(void)
         autorun_set();
         marker_set(2);
         safeboot_set();
+        ml_cfg_save();  /* 固化当前 ML 配置, 供 phase2 新进程继承 */
         scan_all();
         do_clean(msg, sizeof msg);
         xlog("phase1: %s, bsod now", msg);
@@ -1864,6 +2032,7 @@ static void nomore_phase2(void)
 static void nomore_run(void)
 {
     enable_privs();
+    ml_cfg_load();   /* 不客气模式同样继承实验性 ML 配置 (phase2 新进程) */
     if (marker_get() == 3) {
         nomore_phase2();
     } else {
@@ -2006,12 +2175,14 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
         case 0x110:
             g_ml_on = !g_ml_on;
             CheckMenuItem(g_menu, 0x110, MF_BYCOMMAND | (g_ml_on ? MF_CHECKED : MF_UNCHECKED));
+            ml_cfg_save();   /* 持久化, 极端模式跨重启继承 */
             gui_append(g_ml_on ? "[ML] 结构匹配 ML 复核已开启 (实验性; 打分>0.7 升为高置信)\n"
                                : "[ML] 结构匹配 ML 复核已关闭\n");
             return 0;
         case 0x112:
             g_ml_deep = !g_ml_deep;
             CheckMenuItem(g_menu, 0x112, MF_BYCOMMAND | (g_ml_deep ? MF_CHECKED : MF_UNCHECKED));
+            ml_cfg_save();   /* 持久化, 极端模式跨重启继承 */
             gui_append(g_ml_deep ? "[ML] 深度 ML 扫描已开启 (实验性; AppData/TEMP/PF/ProgramData 全量打分)\n"
                                  : "[ML] 深度 ML 扫描已关闭\n");
             return 0;
@@ -2021,6 +2192,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
             CheckMenuItem(g_menu, 0x120, MF_BYCOMMAND | (mode == 0 ? MF_CHECKED : MF_UNCHECKED));
             CheckMenuItem(g_menu, 0x121, MF_BYCOMMAND | (mode == 1 ? MF_CHECKED : MF_UNCHECKED));
             CheckMenuItem(g_menu, 0x122, MF_BYCOMMAND | (mode == 2 ? MF_CHECKED : MF_UNCHECKED));
+            ml_cfg_save();   /* 持久化, 极端模式跨重启继承 */
             gui_append(mode == 0 ? "[ML] 灵敏度: 高检测率\n"
                                 : mode == 2 ? "[ML] 灵敏度: 低误杀\n"
                                             : "[ML] 灵敏度: 平衡\n");
@@ -2039,8 +2211,6 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
             }
             return 0;
         case 8:
-            break;
-        case 10:
             {
                 RECT rc;
                 SetForegroundWindow(hwnd);
@@ -2049,6 +2219,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
                                rc.left, rc.bottom, 0, hwnd, NULL);
             }
             return 0;
+        case 10:
+            break;
         case 6:
             if (MessageBoxA(hwnd, "极端模式确认\n\n"
                             "序列: 自启动+标记 -> 安全模式启动 -> 清除 -> 蓝屏\n"

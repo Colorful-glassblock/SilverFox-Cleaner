@@ -11,3 +11,4 @@ int ml_delta_img(const char *path, unsigned char out[3072]);
 float ml_img_p(const unsigned char img[3072]);
 MlVerdict ml_verdict(float tab, float img, int mode);
 float ml_tab_threshold(int mode);
+float ml_tab_floor(int mode);
