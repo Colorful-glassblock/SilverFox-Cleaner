@@ -160,9 +160,11 @@ static GUI_BAR: AtomicIsize = AtomicIsize::new(0);
 static GUI_STAT: AtomicIsize = AtomicIsize::new(0);
 /* ---- 实验性功能: 结构匹配 ML 复核 (默认关) ---- */
 static ML_ENABLED: AtomicI32 = AtomicI32::new(0);
+static ML_DEEP: AtomicI32 = AtomicI32::new(0);   /* 实验性: 深度 ML 扫描, 默认关 */
 static MENU_SUB: AtomicIsize = AtomicIsize::new(0);
 static CLEANING: AtomicI32 = AtomicI32::new(0);   /* 清除进行中: 防重入 */
 const MENU_ML_TOGGLE: usize = 0x110;
+const MENU_ML_DEEP: usize = 0x112;
 const MF_CHECKED: u32 = 0x8;
 const MF_STRING: u32 = 0x0;
 const MF_BYCOMMAND: u32 = 0x0;
@@ -261,6 +263,27 @@ fn ui_tick() {
     if bar != 0 {
         unsafe { SendMessageW(bar, PBM_SETMARQUEE, 1, 40); }
     }
+}
+
+/// 快速判定纯托管 .NET 程序集: 数据目录[14] (COM 描述符) RVA != 0。
+/// 参考程序集/框架 DLL 常无签名 (metadata-only), 签名豁免救不了, 需此单独放行。
+fn is_dotnet_managed(p: &Path) -> bool {
+    use std::io::Read;
+    let mut f = match fs::File::open(p) { Ok(f) => f, Err(_) => return false };
+    let mut h = [0u8; 4096];
+    let n = f.read(&mut h).unwrap_or(0);
+    let rd16 = |o: usize| -> u16 { u16::from_le_bytes([h[o], h[o + 1]]) };
+    let rd32 = |o: usize| -> u32 { u32::from_le_bytes([h[o], h[o + 1], h[o + 2], h[o + 3]]) };
+    if n < 0x40 || h[0] != b'M' || h[1] != b'Z' { return false; }
+    let e = rd32(0x3C) as usize;
+    if e + 4 > n || &h[e..e + 4] != b"PE\0\0" { return false; }
+    let magic = rd16(e + 24);
+    if magic != 0x10B && magic != 0x20B { return false; }
+    let dd = e + 24 + if magic == 0x20B { 112 } else { 96 };
+    if dd < 4 || dd + 14 * 8 + 8 > n { return false; }
+    let nrv = rd32(dd - 4) as usize;
+    if nrv <= 14 { return false; }
+    rd32(dd + 14 * 8) != 0
 }
 
 fn scan_all() -> Vec<Finding> { scan_all_with(false) }
@@ -1013,7 +1036,7 @@ fn walk_deep(dir: &Path, depth: usize, max: usize, cb: &mut impl FnMut(&Path)) {
 /// 实验性深度 ML 扫描 (需开启 ML): AppData / TEMP / ProgramData / Program Files 全量 PE 打分
 fn scan_ml_deep() -> Vec<Finding> {
     let mut out = Vec::new();
-    if ML_ENABLED.load(Ordering::Relaxed) == 0 { return out; }
+    if ML_DEEP.load(Ordering::Relaxed) == 0 { return out; }   /* 实验性: 独立开关, 默认关 */
     let mut roots: Vec<PathBuf> = Vec::new();
     for v in ["APPDATA", "LOCALAPPDATA", "TEMP", "ProgramData"] {
         if let Ok(p) = std::env::var(v) { roots.push(PathBuf::from(p)); }
@@ -1025,6 +1048,10 @@ fn scan_ml_deep() -> Vec<Finding> {
         walk_deep(root, 0, 8, &mut |p| {
             let s = p.to_string_lossy().to_lowercase();
             if s.contains(QUAR) || is_self_path(p) { return; }
+            /* 误杀防护: 有效签名(微软/Mozilla 等)或纯托管 .NET (COM 目录)直接放行 —
+               深度扫描是广撒网, 这两类合法件不该被模型的高分误杀 */
+            if wb_is_signed(p) { return; }
+            if is_dotnet_managed(p) { return; }
             if let Some(pr) = ml_feat::ml_score(p) {
                 if pr > 0.7 {
                     out.push(Finding {
@@ -1681,6 +1708,13 @@ unsafe extern "system" fn wndproc(hwnd: isize, msg: u32, wp: usize, lp: isize) -
                 gui_append(&format!("[ML] 结构匹配 ML 复核已{} (实验性; 打分>0.7 升为高置信)\n", if on { "开启" } else { "关闭" }));
                 0
             }
+            MENU_ML_DEEP => {
+                let on = ML_DEEP.fetch_xor(1, Ordering::SeqCst) == 0;
+                CheckMenuItem(MENU_SUB.load(Ordering::SeqCst), MENU_ML_DEEP,
+                              if on { MF_BYCOMMAND | MF_CHECKED } else { MF_BYCOMMAND });
+                gui_append(&format!("[ML] 深度 ML 扫描已{} (实验性; AppData/TEMP/PF/ProgramData 全量打分)\n", if on { "开启" } else { "关闭" }));
+                0
+            }
             10 => {
                 /* 实验性功能弹出菜单 (从按钮下方弹出) */
                 let sub = MENU_SUB.load(Ordering::SeqCst);
@@ -1729,6 +1763,7 @@ fn run_gui() {
         /* 实验性功能: 按钮栏「实验性」按钮 → 弹出菜单: 开启ML (默认关, 勾选切换) */
         let menusub = CreateMenu();
         AppendMenuW(menusub, MF_STRING, MENU_ML_TOGGLE, utf16("开启 ML 复核 (实验性, 默认关)").as_ptr());
+        AppendMenuW(menusub, MF_STRING, MENU_ML_DEEP, utf16("深度 ML 扫描 (AppData/TEMP/PF/ProgramData)").as_ptr());
         MENU_SUB.store(menusub, Ordering::SeqCst);
         let hwnd = CreateWindowExW(0, cn.as_ptr(), title.as_ptr(), WS_OVERLAPPEDWINDOW | WS_VISIBLE, 200, 200, 1060, 640, 0, 0, inst, std::ptr::null());
         if hwnd == 0 { return; }
