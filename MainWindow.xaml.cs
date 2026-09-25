@@ -41,6 +41,15 @@ public sealed partial class MainWindow : Window
         TblStatus.Text = Scanner.MlEnabled ? "ML 复核: 开 (实验性)" : "ML 复核: 关";
     }
 
+    private void DeepScanToggle_Click(object sender, RoutedEventArgs e)
+    {
+        Scanner.DeepMlScan = DeepScanToggle.IsChecked == true;
+        AppendLog(Scanner.DeepMlScan
+            ? "[ML] 深度 ML 扫描已开启 (实验性; AppData/TEMP/PF/ProgramData 全量 PE 打分, >0.7 报 ML深度)"
+            : "[ML] 深度 ML 扫描已关闭 (默认)");
+        TblStatus.Text = Scanner.DeepMlScan ? "深度ML: 开 (实验性)" : "深度ML: 关";
+    }
+
     private async void Scan_Click(object sender, RoutedEventArgs e) => await RunScanAsync();
 
     private async Task RunScanAsync()

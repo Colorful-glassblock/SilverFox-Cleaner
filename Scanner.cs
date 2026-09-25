@@ -251,6 +251,9 @@ public static class Scanner
     /// 实验性: 结构匹配 ML 复核开关 (默认关; 「实验性功能」菜单可开启)
     public static bool MlEnabled;
 
+    /// 实验性: 深度 ML 扫描开关 (默认关; 独立于 MlEnabled, 扫 AppData/TEMP/PF/ProgramData 全量 PE)
+    public static bool DeepMlScan;
+
     private const uint MEM_COMMIT = 0x1000;
     private const uint PAGE_GUARD = 0x100;
     private const uint PAGE_NOACCESS = 0x01;
@@ -1016,7 +1019,7 @@ public static class Scanner
     public static List<Finding> ScanMlDeep()
     {
         var res = new List<Finding>();
-        if (!MlEnabled) return res;   // 实验性: 默认关
+        if (!DeepMlScan) return res;   // 实验性: 独立开关, 默认关
         var roots = new List<string> { @"C:\Program Files", @"C:\Program Files (x86)" };
         AddEnv(roots, "APPDATA");
         AddEnv(roots, "LOCALAPPDATA");
@@ -1026,6 +1029,9 @@ public static class Scanner
             foreach (var p in Walk(root, 8))
             {
                 if (p.ToLowerInvariant().Contains("sf_quarantine") || IsSelfPath(p)) continue;
+                /* 误杀防护: 有效签名(微软/Mozilla 等)或纯托管 .NET (COM 目录)直接放行 */
+                if (IsValidSigned(p)) continue;
+                if (IsDotNetManaged(p)) continue;
                 if (MlModel.ScorePath(p) is double pr && pr > 0.7)
                     res.Add(new Finding
                     {
@@ -1036,6 +1042,30 @@ public static class Scanner
                     });
             }
         return res;
+    }
+
+    /// <summary>纯托管 .NET 判定: 数据目录[14] (COM 描述符) RVA != 0 — 参考程序集/框架 DLL 常无签名。</summary>
+    private static bool IsDotNetManaged(string path)
+    {
+        try
+        {
+            using var f = File.OpenRead(path);
+            if (f.Length < 0x40) return false;
+            int cap = (int)Math.Min(4096, f.Length);
+            var h = new byte[cap];
+            int n = f.ReadAtLeast(h, cap, throwOnEndOfStream: false);
+            if (n < 0x40 || h[0] != 'M' || h[1] != 'Z') return false;
+            int e = h[0x3C] | h[0x3D] << 8 | h[0x3E] << 16 | h[0x3F] << 24;
+            if (e + 4 > n || h[e] != 'P' || h[e + 1] != 'E') return false;
+            int magic = h[e + 24] | h[e + 25] << 8;
+            if (magic != 0x10B && magic != 0x20B) return false;
+            int dd = e + 24 + (magic == 0x20B ? 112 : 96);
+            if (dd < 4 || dd + 14 * 8 + 8 > n) return false;
+            int nrv = h[dd - 4] | h[dd - 3] << 8 | h[dd - 2] << 16 | h[dd - 1] << 24;
+            if (nrv <= 14) return false;
+            return (h[dd + 14 * 8] | h[dd + 14 * 8 + 1] << 8 | h[dd + 14 * 8 + 2] << 16 | h[dd + 14 * 8 + 3] << 24) != 0;
+        }
+        catch { return false; }
     }
 
     private static void AddEnv(List<string> list, string var)

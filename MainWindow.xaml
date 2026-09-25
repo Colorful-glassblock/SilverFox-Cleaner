@@ -72,6 +72,7 @@
                 <Button.Flyout>
                     <MenuFlyout>
                         <ToggleMenuFlyoutItem x:Name="MlToggle" Text="开启 ML 复核 (实验性, 默认关)" Click="MlToggle_Click"/>
+                        <ToggleMenuFlyoutItem x:Name="DeepScanToggle" Text="深度 ML 扫描 (AppData/TEMP/PF/ProgramData)" Click="DeepScanToggle_Click"/>
                     </MenuFlyout>
                 </Button.Flyout>
             </Button>
