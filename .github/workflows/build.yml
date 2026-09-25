@@ -62,8 +62,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
       - name: Stage embedded assets
         run: cp embed-src/SFCleanerDrv.sys .
-      - name: Embed UAC manifest
-      - name: 注入版本号 (命名规则 <branch>-release-<ver> / <branch>-pre-<sha8>)
+      - name: Inject SFC version (naming rule <branch>-release-<ver> / <branch>-pre-<sha8>)
         shell: bash
         run: |
           if [ -n "${{ inputs.version }}" ]; then
@@ -71,6 +70,7 @@ jobs:
           else
             echo "SFC_VER=rust-pre-${GITHUB_SHA:0:8}" >> "$GITHUB_ENV"
           fi
+      - name: Embed UAC manifest
         run: x86_64-w64-mingw32-windres -o sfc_manifest.o sfcleaner.rc
       - name: Build
         env:
