@@ -16,7 +16,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::ml_model::{SFC_ML_B, SFC_ML_MEANS, SFC_ML_N, SFC_ML_STDS, SFC_ML_W};
+use crate::ml_model::SFC_ML_N;
 
 const READ_LIMIT: usize = 4 << 20; // 特征窗口
 const AUTH_CAP: usize = 8 << 20;   // SECURITY 目录读取上限
@@ -44,6 +44,13 @@ pub const F_ENTRY_IN_RAWLESS: usize = 18;
 pub const F_C2_IP_PORT: usize = 19;
 pub const F_ENTRY_SECTION_ENTROPY: usize = 20;
 pub const F_EP_HIGH_ENTROPY: usize = 21;
+pub const F_VS_KEYS: usize = 22;
+pub const F_HAS_MANIFEST: usize = 23;
+pub const F_HAS_TLS: usize = 24;
+pub const F_CK_ZERO: usize = 25;
+pub const F_HAS_DEBUG: usize = 26;
+pub const F_HAS_EXPORT: usize = 27;
+pub const F_COUNT: usize = 28;
 
 /* ---------------- 小工具 ---------------- */
 
@@ -854,18 +861,31 @@ pub fn ml_feat_extract(path: &Path) -> Option<[f64; SFC_ML_N]> {
     }
     out[F_ENTRY_SECTION_ENTROPY] = round4(epf);
     out[F_EP_HIGH_ENTROPY] = if ep4 >= 7.5 { 1.0 } else { 0.0 };
+
+    // ---- 2026-09-25 新判别特征 (FEATURES[22..28]) ----
+    // vs_keys: 版本块 7 个标准键 (UTF-16LE) 命中数 — 合法件齐全, 家族样本常缺
+    const VS_KEYS: [&[u8]; 7] = [
+        b"C\0o\0m\0p\0a\0n\0y\0N\0a\0m\0e\0",
+        b"O\0r\0i\0g\0i\0n\0a\0l\0F\0i\0l\0e\0n\0a\0m\0e\0",
+        b"F\0i\0l\0e\0D\0e\0s\0c\0r\0i\0p\0t\0i\0o\0n\0",
+        b"F\0i\0l\0e\0V\0e\0r\0s\0i\0o\0n\0",
+        b"P\0r\0o\0d\0u\0c\0t\0N\0a\0m\0e\0",
+        b"L\0e\0g\0a\0l\0C\0o\0p\0y\0r\0i\0g\0h\0t\0",
+        b"I\0n\0t\0e\0r\0n\0a\0l\0N\0a\0m\0e\0",
+    ];
+    out[F_VS_KEYS] = VS_KEYS.iter().filter(|k| find(&data, k)).count() as f64;
+    out[F_HAS_MANIFEST] = if find(&data, b"manifestVersion")
+        || find(&data, b"m\0a\0n\0i\0f\0e\0s\0t\0V\0e\0r\0s\0i\0o\0n\0") { 1.0 } else { 0.0 };
+    let nrv = if dd >= 4 { rd_u32(&data, dd - 4) as usize } else { 0 };
+    let dir = |i: usize| -> u32 {
+        if nrv <= i || dd + (i + 1) * 8 > nlen { return 0; }
+        rd_u32(&data, dd + i * 8)
+    };
+    out[F_HAS_TLS] = if dir(9) != 0 { 1.0 } else { 0.0 };
+    out[F_CK_ZERO] = if opt + 64 + 4 <= nlen && rd_u32(&data, opt + 64) == 0 { 1.0 } else { 0.0 };
+    out[F_HAS_DEBUG] = if dir(6) != 0 { 1.0 } else { 0.0 };
+    out[F_HAS_EXPORT] = if dir(0) != 0 { 1.0 } else { 0.0 };
     Some(out)
 }
 
-/* ---------------- 逻辑回归打分 ---------------- */
-
-/// Some(p) 概率 [0,1]; None = 非 PE / 读取失败 (调用方保持原结构匹配判定)
-pub fn ml_score(path: &Path) -> Option<f64> {
-    let x = ml_feat_extract(path)?;
-    let mut z = SFC_ML_B;
-    for i in 0..SFC_ML_N {
-        z += SFC_ML_W[i] * ((x[i] - SFC_ML_MEANS[i]) / SFC_ML_STDS[i]);
-    }
-    let zc = z.clamp(-50.0, 50.0);
-    Some(1.0 / (1.0 + (-zc).exp()))
-}
+/* ---------------- (旧逻辑回归打分已由 ml_dual.rs 的表格 MLP 取代) ---------------- */
