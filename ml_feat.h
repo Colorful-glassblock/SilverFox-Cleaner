@@ -7,7 +7,7 @@
 #define SFC_ML_FEAT_H
 
 /* 22 个精选特征, 顺序与 model_linear.json "features" 一致 */
-int ml_feat_extract(const char *path, double out[22]);
+int ml_feat_extract(const char *path, double out[28]);
 double ml_score(const char *path);
 
 #endif

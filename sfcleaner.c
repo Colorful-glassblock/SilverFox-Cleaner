@@ -18,7 +18,8 @@
 #include <wintrust.h>
 #include <commctrl.h>   /* 进度条 PROGRESS_CLASS/PBM_* */
 #include <softpub.h>
-#include "ml_feat.h"    /* ML 复核: 结构匹配文件打分 (22 特征逻辑回归) */
+#include "ml_feat.h"
+#include "ml_net.h"    /* 双模型: 表格 MLP + delta 图像 CNN */
 #include <mscat.h>
 
 /* ---- 常量 ---- */
@@ -63,6 +64,7 @@ static HWND g_hwnd = NULL, g_prog = NULL, g_stat = NULL;
 static HMENU g_menu = NULL;
 static volatile LONG g_ml_on = 0;   /* 实验性: 结构匹配 ML 复核, 默认关 */
 static volatile LONG g_ml_deep = 0;  /* 实验性: 深度 ML 扫描, 默认关 */
+static volatile int g_ml_mode = 1; /* ML 灵敏度: 0=高检测 1=平衡(默认) 2=低误杀 */
 static volatile LONG g_files_done = 0, g_phase_done = 0;
 static volatile LONG g_cleaning = 0, g_clean_done = 0, g_clean_total = 0;
 #define SFC_PHASES 7
@@ -667,10 +669,11 @@ static void file_cb(const char *full, void *unused)
             int high = byNm;
             if (!byNm && g_ml_on && !is_self_path(full)) {
                 /* 实验性: 结构匹配 → ML 复核 (菜单开启后生效): >0.7 升为高置信; 非 PE 不给分 (ml_score 返 -1) */
-                double pr = ml_score(full);
-                if (pr >= 0.0) {
-                    _snprintf(mlb, sizeof mlb - 1, " [ML %.2f]", pr);
-                    if (pr > 0.7) high = 1;
+                double x28[28];
+                if (ml_feat_extract(full, x28) == 0) {
+                    float pr = ml_tab_p(x28);
+                    _snprintf(mlb, sizeof mlb - 1, " [ML %.2f]", (double)pr);
+                    if (pr > ml_tab_threshold(g_ml_mode)) high = 1;
                 }
             }
             if (byNm) { strncpy(det, full, sizeof det - 1); det[sizeof det - 1] = 0; }
@@ -1097,12 +1100,25 @@ static void ml_deep_cb(const char *full, void *ctx)
     /* 误杀防护: 有效签名(微软/Mozilla 等)或纯托管 .NET (COM 目录)直接放行 */
     if (bj_is_signed(full)) return;
     if (is_dotnet_managed(full)) return;
-    pr = ml_score(full);
-    if (pr >= 0.0 && pr > 0.7) {
-        char det[MAX_PATH + 96], act[MAX_PATH + 16];
-        _snprintf(det, sizeof det - 1, "%s [ML深度 %.2f]", full, pr);
-        _snprintf(act, sizeof act - 1, "quarantine %s", full);
-        addf("FILE", 1, det, act);
+    {
+        double x28[28];
+        unsigned char dimg[3072];
+        float t = -1.0f, i = -1.0f;
+        MlVerdict v;
+        if (ml_feat_extract(full, x28) == 0 && ml_delta_img(full, dimg)) {
+            t = ml_tab_p(x28);
+            i = ml_img_p(dimg);
+        }
+        if (t >= 0.0f) {
+            v = ml_verdict(t, i, g_ml_mode);
+            if (v.high) {
+                char det[MAX_PATH + 96], act[MAX_PATH + 16];
+                const char *tag = g_ml_mode == 0 ? "高" : (g_ml_mode == 2 ? "低" : "平");
+                _snprintf(det, sizeof det - 1, "%s [ML深度%s %.2f]", full, tag, (double)v.score);
+                _snprintf(act, sizeof act - 1, "quarantine %s", full);
+                addf("FILE", 1, det, act);
+            }
+        }
     }
 }
 
@@ -1999,6 +2015,17 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
             gui_append(g_ml_deep ? "[ML] 深度 ML 扫描已开启 (实验性; AppData/TEMP/PF/ProgramData 全量打分)\n"
                                  : "[ML] 深度 ML 扫描已关闭\n");
             return 0;
+        case 0x120: case 0x121: case 0x122: {
+            int mode = LOWORD(wp) == 0x120 ? 0 : (LOWORD(wp) == 0x122 ? 2 : 1);
+            g_ml_mode = mode;
+            CheckMenuItem(g_menu, 0x120, MF_BYCOMMAND | (mode == 0 ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(g_menu, 0x121, MF_BYCOMMAND | (mode == 1 ? MF_CHECKED : MF_UNCHECKED));
+            CheckMenuItem(g_menu, 0x122, MF_BYCOMMAND | (mode == 2 ? MF_CHECKED : MF_UNCHECKED));
+            gui_append(mode == 0 ? "[ML] 灵敏度: 高检测率\n"
+                                : mode == 2 ? "[ML] 灵敏度: 低误杀\n"
+                                            : "[ML] 灵敏度: 平衡\n");
+            return 0;
+        }
         case 7:
             if (MessageBoxA(hwnd, "不客气模式确认 (实验性功能 - 不稳定)\n\n"
                             "警告: 需内核驱动 + testsigning, 必须关 Secure Boot\n"
@@ -2062,6 +2089,10 @@ static void run_gui(void)
     g_menu = CreatePopupMenu();
     AppendMenuA(g_menu, MF_STRING, 0x110, "开启 ML 复核 (实验性, 默认关)");
     AppendMenuA(g_menu, MF_STRING, 0x112, "深度 ML 扫描 (AppData/TEMP/PF/ProgramData)");
+    AppendMenuA(g_menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(g_menu, MF_STRING, 0x120, "灵敏度: 高检测率");
+    AppendMenuA(g_menu, MF_STRING | MF_CHECKED, 0x121, "灵敏度: 平衡 (默认)");
+    AppendMenuA(g_menu, MF_STRING, 0x122, "灵敏度: 低误杀");
     hwnd = CreateWindowExA(0, "SFC5", "SilverFox Cleaner C - NT6+ (x86/x64)",
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE, 200, 200, 1060, 640,
                            NULL, NULL, wc.hInstance, NULL);

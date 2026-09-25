@@ -562,8 +562,10 @@ enum {
     F_HAS_INJECTION_API, F_HAS_PERSISTENCE_API, F_HAS_NET_API, F_MAX_SECTION_ENTROPY,
     F_N_STRINGS, F_LOG_SIZE, F_N_URLS, F_HAS_AUTHENTICODE, F_CERT_COUNT, F_IS_SELF_SIGNED,
     F_N_IMPORT_DLLS, F_SIGNER_BLACKLISTED, F_FPTABLE_UNSIGNED, F_EMPTY_RAW_SECTIONS,
-    F_ENTRY_IN_RAWLESS, F_C2_IP_PORT, F_ENTRY_SECTION_ENTROPY, F_EP_HIGH_ENTROPY
+    F_ENTRY_IN_RAWLESS, F_C2_IP_PORT, F_ENTRY_SECTION_ENTROPY, F_EP_HIGH_ENTROPY,
+    F_VS_KEYS, F_HAS_MANIFEST, F_HAS_TLS, F_CK_ZERO, F_HAS_DEBUG, F_HAS_EXPORT
 };
+#define SFC_ML_FEAT_COUNT 28
 
 static const char *const LOW_APIS[] = { "socket", "connect", "recv", "send" };
 static const char *const INJ[] = { "VirtualAlloc", "VirtualProtect", "WriteProcessMemory",
@@ -573,7 +575,7 @@ static const char *const PERS[] = { "RegSetValueEx", "RegCreateKeyEx", "CreateSe
 static const char *const NET[] = { "URLDownloadToFile", "InternetOpen", "InternetOpenUrl",
                                    "HttpSendRequest" };
 
-int ml_feat_extract(const char *path, double out[22])
+int ml_feat_extract(const char *path, double out[28])
 {
     FILE *f;
     unsigned char *data;
@@ -750,27 +752,60 @@ int ml_feat_extract(const char *path, double out[22])
     out[F_ENTRY_SECTION_ENTROPY] = round4(ep_sec_ent_final);
     out[F_EP_HIGH_ENTROPY] = ep_sec_ent4 >= 7.5 ? 1 : 0;
 
+    /* ---- 2026-09-25 新判别特征 (FEATURES[22..28]) ---- */
+    {
+        /* 版本块 7 个标准键 (UTF-16LE, 显式长度) */
+        static const unsigned char VK_CN[]  = {'C',0,'o',0,'m',0,'p',0,'a',0,'n',0,'y',0,'N',0,'a',0,'m',0,'e',0};
+        static const unsigned char VK_OF[]  = {'O',0,'r',0,'i',0,'g',0,'i',0,'n',0,'a',0,'l',0,'F',0,'i',0,'l',0,'e',0,'n',0,'a',0,'m',0,'e',0};
+        static const unsigned char VK_FD[]  = {'F',0,'i',0,'l',0,'e',0,'D',0,'e',0,'s',0,'c',0,'r',0,'i',0,'p',0,'t',0,'i',0,'o',0,'n',0};
+        static const unsigned char VK_FV[]  = {'F',0,'i',0,'l',0,'e',0,'V',0,'e',0,'r',0,'s',0,'i',0,'o',0,'n',0};
+        static const unsigned char VK_PN[]  = {'P',0,'r',0,'o',0,'d',0,'u',0,'c',0,'t',0,'N',0,'a',0,'m',0,'e',0};
+        static const unsigned char VK_LC[]  = {'L',0,'e',0,'g',0,'a',0,'l',0,'C',0,'o',0,'p',0,'y',0,'r',0,'i',0,'g',0,'h',0,'t',0};
+        static const unsigned char VK_IN[]  = {'I',0,'n',0,'t',0,'e',0,'r',0,'n',0,'a',0,'l',0,'N',0,'a',0,'m',0,'e',0};
+        static const unsigned char *const VKS[7] = {VK_CN, VK_OF, VK_FD, VK_FV, VK_PN, VK_LC, VK_IN};
+        static const int VKL[7] = {sizeof VK_CN, sizeof VK_OF, sizeof VK_FD, sizeof VK_FV,
+                                   sizeof VK_PN, sizeof VK_LC, sizeof VK_IN};
+        static const unsigned char MANIFEST_UTF16[] =
+            {'m',0,'a',0,'n',0,'i',0,'f',0,'e',0,'s',0,'t',0,'V',0,'e',0,'r',0,'s',0,'i',0,'o',0,'n',0};
+        int vs = 0, k;
+        unsigned nrv, dir0, dir6, dir9, ck;
+        for (k = 0; k < 7; k++) if (bfind(data, (size_t)nlen, VKS[k], (size_t)VKL[k])) vs++;
+        out[F_VS_KEYS] = vs;
+        out[F_HAS_MANIFEST] = (bcontains(data, (size_t)nlen, "manifestVersion")
+            || bfind(data, (size_t)nlen, MANIFEST_UTF16, sizeof MANIFEST_UTF16)) ? 1 : 0;
+        nrv = 0; dir0 = 0; dir6 = 0; dir9 = 0;
+        {
+            int ddpos = opt + (is64 ? 112 : 96);
+            if (ddpos >= 4 && ddpos <= nlen) {
+                nrv = (unsigned)data[ddpos-4] | ((unsigned)data[ddpos-3] << 8)
+                    | ((unsigned)data[ddpos-2] << 16) | ((unsigned)data[ddpos-1] << 24);
+            }
+            if (nrv > 0 && ddpos + 8 <= nlen) {
+                dir0 = (unsigned)data[ddpos] | ((unsigned)data[ddpos+1] << 8)
+                     | ((unsigned)data[ddpos+2] << 16) | ((unsigned)data[ddpos+3] << 24);
+            }
+            if (nrv > 6 && ddpos + 6*8 + 4 <= nlen) {
+                dir6 = (unsigned)data[ddpos+6*8] | ((unsigned)data[ddpos+6*8+1] << 8)
+                     | ((unsigned)data[ddpos+6*8+2] << 16) | ((unsigned)data[ddpos+6*8+3] << 24);
+            }
+            if (nrv > 9 && ddpos + 9*8 + 4 <= nlen) {
+                dir9 = (unsigned)data[ddpos+9*8] | ((unsigned)data[ddpos+9*8+1] << 8)
+                     | ((unsigned)data[ddpos+9*8+2] << 16) | ((unsigned)data[ddpos+9*8+3] << 24);
+            }
+            ck = 0;
+            if (opt + 64 + 4 <= nlen) {
+                ck = (unsigned)data[opt+64] | ((unsigned)data[opt+65] << 8)
+                   | ((unsigned)data[opt+66] << 16) | ((unsigned)data[opt+67] << 24);
+            }
+        }
+        out[F_HAS_TLS] = dir9 ? 1 : 0;
+        out[F_CK_ZERO] = ck == 0 ? 1 : 0;
+        out[F_HAS_DEBUG] = dir6 ? 1 : 0;
+        out[F_HAS_EXPORT] = dir0 ? 1 : 0;
+    }
+
     free(data);
     return 0;
 }
 
-/* ---------------- 逻辑回归打分 ---------------- */
-
-extern const int SFC_ML_N;
-extern const double SFC_ML_MEANS[];
-extern const double SFC_ML_STDS[];
-extern const double SFC_ML_W[];
-extern const double SFC_ML_B;
-
-double ml_score(const char *path)
-{
-    double x[22], z;
-    int i;
-    if (ml_feat_extract(path, x) != 0) return -1.0;
-    z = SFC_ML_B;
-    for (i = 0; i < SFC_ML_N; i++)
-        z += SFC_ML_W[i] * ((x[i] - SFC_ML_MEANS[i]) / SFC_ML_STDS[i]);
-    if (z > 50.0) z = 50.0;
-    if (z < -50.0) z = -50.0;
-    return 1.0 / (1.0 + exp(-z));
-}
+/* ---------------- (旧 22 维逻辑回归已由 ml_net.c 的表格 MLP 取代) ---------------- */
