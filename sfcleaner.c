@@ -678,7 +678,8 @@ static void file_cb(const char *full, void *unused)
                 if (n >= 4 && hd16[0] == 0x89 && hd16[1] == 'P' && hd16[2] == 'N' && hd16[3] == 'G') {
                     size_t fl = strlen(lfnm);
                     if (!(fl >= 4 && !strcmp(lfnm + fl - 4, ".png"))
-                        && !strstr(low, "\\packages\\")) /* UWP 磁贴缓存是合法 PNG 头 .bin */
+                        && !strstr(low, "\\packages\\")  /* UWP 磁贴缓存是合法 PNG 头 .bin */
+                        && !strstr(low, "\\cache\\") && !strstr(low, "cache_data"))  /* 浏览器缓存合法 */
                         strcat(md, " [PNG伪装]");
                 }
             }
@@ -2302,6 +2303,7 @@ static void run_gui(void)
                              | ES_AUTOVSCROLL | ES_WANTRETURN,
                              14, 74, 876, 474, hwnd, (HMENU)7, wc.hInstance, NULL);
     SendMessageA(g_edit, WM_SETFONT, (WPARAM)font, TRUE);
+    SendMessageA(g_edit, EM_SETLIMITTEXT, 0x7FFFFFFF, 0);  /* 默认 32KB 上限会静默截断长扫描日志 */
     gui_append("SilverFox Cleaner C " SFC_VERSTR " (NT6+, 重写版) - dmo/client\n"
                "build: " __DATE__ " " __TIME__ "\n"
                "检测: 持久化 / 落盘物 / 互斥 / SrL / ctfmon内存注入\n"
