@@ -141,4 +141,8 @@ internal static class MlInfer
     };
 
     public static float TabThreshold(int mode) => mode == 0 ? 0.60f : (mode == 2 ? 0.85f : 0.70f);
+
+    /// 深扫表格地板: tab <= 地板 时 CNN 不必跑 (0=高检测 0.10 丢极少 img 兜底 /
+    /// 1=平衡 0.40 无损 / 2=低误杀 0.20 无损 — AND 门语义下地板即表格阈值)
+    public static float TabFloor(int mode) => mode == 0 ? 0.10f : (mode == 2 ? 0.20f : 0.40f);
 }

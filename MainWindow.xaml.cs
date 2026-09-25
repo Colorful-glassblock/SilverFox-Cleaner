@@ -35,6 +35,7 @@ public sealed partial class MainWindow : Window
     private void MlToggle_Click(object sender, RoutedEventArgs e)
     {
         Scanner.MlEnabled = MlToggle.IsChecked == true;
+        Scanner.SaveMlConfig();   // 持久化, 极端模式跨重启继承
         AppendLog(Scanner.MlEnabled
             ? "[ML] 结构匹配 ML 复核已开启 (实验性; 打分>0.7 升为高置信)"
             : "[ML] 结构匹配 ML 复核已关闭 (默认)");
@@ -44,6 +45,7 @@ public sealed partial class MainWindow : Window
     private void DeepScanToggle_Click(object sender, RoutedEventArgs e)
     {
         Scanner.DeepMlScan = DeepScanToggle.IsChecked == true;
+        Scanner.SaveMlConfig();   // 持久化, 极端模式跨重启继承
         AppendLog(Scanner.DeepMlScan
             ? "[ML] 深度 ML 扫描已开启 (实验性; AppData/TEMP/PF/ProgramData 全量 PE 打分, >0.7 报 ML深度)"
             : "[ML] 深度 ML 扫描已关闭 (默认)");
@@ -53,6 +55,7 @@ public sealed partial class MainWindow : Window
     private void SetMode(int mode, string name)
     {
         Scanner.MlMode = mode;
+        Scanner.SaveMlConfig();   // 持久化, 极端模式跨重启继承
         ModeHigh.IsChecked = mode == 0;
         ModeBal.IsChecked = mode == 1;
         ModeLow.IsChecked = mode == 2;

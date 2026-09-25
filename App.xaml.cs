@@ -13,6 +13,7 @@ public partial class App : Application
 
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
+        Scanner.LoadMlConfig();   // 实验性 ML 配置持久化: 命令行/极端模式新进程也恢复上次开关
         // 无头命令行模式（自启动 / 手动调用）:
         //   --extreme          进入极端模式(两阶段蓝屏+自毁), 阶段标记在 HKLM\Software\SFCleaner
         //   --extreme-abort    解除自启动与阶段标记
