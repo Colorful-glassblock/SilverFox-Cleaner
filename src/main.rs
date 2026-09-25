@@ -1765,7 +1765,7 @@ unsafe extern "system" fn wndproc(hwnd: isize, msg: u32, wp: usize, lp: isize) -
                     if f.is_empty() { gui_append("无可清除项\n\n"); 0 }
                     else {
                         let m = utf16(&format!("发现 {} 项银狐痕迹\n确认清除?", f.len()));
-                        let c = utf16("SilverFox Cleaner v4");
+                        let c = utf16("SilverFox Cleaner v5.1");
                         if MessageBoxW(hwnd, m.as_ptr(), c.as_ptr(), MB_OKCANCEL | MB_ICONWARNING) == IDOK {
                             gui_append(&format!("[{}] 清除中 (逐项实时显示)...\n", now_str()));
                             CLEANING.store(1, Ordering::SeqCst);
@@ -1788,7 +1788,7 @@ unsafe extern "system" fn wndproc(hwnd: isize, msg: u32, wp: usize, lp: isize) -
                 }
             }
             3 => {
-                let m = utf16("SilverFox Cleaner v4.1\n银狐 (dmo/client) 检测清除工具\n\n检测: 持久化/落盘/互斥/SrL/ctfmon注入\n权限: SYSTEM + TrustedInstaller\n隔离: SFQENC1 时间戳加密, 明文不落盘防复活\n还原: 仅本工具「还原隔离区」入口解密回写\n\n IOC: SHA256(DER)=3cef796a...");
+                let m = utf16("SilverFox Cleaner v5.1\n银狐 (dmo/client) 检测清除工具\n\n检测: 持久化/落盘/互斥/SrL/ctfmon注入\n权限: SYSTEM + TrustedInstaller\n隔离: SFQENC1 时间戳加密, 明文不落盘防复活\n还原: 仅本工具「还原隔离区」入口解密回写\n\n IOC: SHA256(DER)=3cef796a...");
                 let c = utf16("关于");
                 MessageBoxW(hwnd, m.as_ptr(), c.as_ptr(), 0);
                 0
@@ -1899,7 +1899,7 @@ fn run_gui() {
             menu: 0, class_name: cn.as_ptr(), icon_sm: 0,
         };
         RegisterClassExW(&wc as *const WndClass as *const u8);
-        let title = utf16("SilverFox Cleaner v4.2 — 银狐检测清除 (dmo/client)");
+        let title = utf16("SilverFox Cleaner v5.1 — 银狐检测清除 (dmo/client)");
         /* 实验性功能: 按钮栏「实验性」按钮 → 弹出菜单: 开启ML (默认关, 勾选切换) */
         let menusub = CreatePopupMenu();
         AppendMenuW(menusub, MF_STRING, MENU_ML_TOGGLE, utf16("开启 ML 复核 (实验性, 默认关)").as_ptr());
@@ -1931,7 +1931,7 @@ fn run_gui() {
         let status = CreateWindowExW(0, utf16("STATIC").as_ptr(), utf16("就绪 — 扫描 | SYSTEM + TrustedInstaller | 加密隔离: sf_quarantine (仅本工具可还原)").as_ptr(), WS_CHILD | WS_VISIBLE, 14, 556, 880, 24, hwnd, 5, inst, std::ptr::null());
         for h in [b1, b2, b3, b4, b5, b6, b7, b8, edit, status, barstat] { SendMessageW(h, WM_SETFONT, font as usize, 1); }
         GUI_LOG.store(edit, Ordering::SeqCst);
-        gui_append("╔════════════════════════════════════╗\n║  SilverFox Cleaner v4.1 — dmo/client ║\n╚════════════════════════════════════╝\n\n检测: 持久化 / 落盘物 / 互斥 / SrL / ctfmon内存注入\n权限: SYSTEM + TrustedInstaller 提权\n隔离: 时间戳加密 SFQENC1 (明文不落盘防复活)\n还原: [♻ 还原隔离区] 或 restore 子命令\n扫描: 多线程并行 (任务+服务 | 进程+内存 | 文件)\n\n");
+        gui_append("╔════════════════════════════════════╗\n║  SilverFox Cleaner v5.1 — dmo/client ║\n╚════════════════════════════════════╝\n\n检测: 持久化 / 落盘物 / 互斥 / SrL / ctfmon内存注入\n权限: SYSTEM + TrustedInstaller 提权\n隔离: 时间戳加密 SFQENC1 (明文不落盘防复活)\n还原: [♻ 还原隔离区] 或 restore 子命令\n扫描: 多线程并行 (任务+服务 | 进程+内存 | 文件)\n\n");
         let mut msg = [0u8; 48];
         loop {
             let r = GetMessageW(msg.as_mut_ptr(), 0, 0, 0);
