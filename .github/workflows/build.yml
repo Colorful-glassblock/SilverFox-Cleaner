@@ -68,7 +68,7 @@ jobs:
             echo "SFC_VER=winui3-pre-${GITHUB_SHA:0:8}" >> "$GITHUB_ENV"
           fi
       - name: Publish self-contained
-        run: dotnet publish -c Release -p:Platform=x64 -p:WindowsPackageType=None -p:SelfContained=true -p:InformationalVersion=$SFC_VER
+        run: dotnet publish -c Release -p:Platform=x64 -p:WindowsPackageType=None -p:SelfContained=true -p:InformationalVersion=$env:SFC_VER
       - name: Stage self-contained
         shell: cmd
         run: |
