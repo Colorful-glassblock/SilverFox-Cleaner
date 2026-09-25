@@ -3,7 +3,7 @@
 // 灵敏度档位: 0=高检测 1=平衡(默认) 2=低误杀 (阈值见 rule 函数, 2026-09-25 折外标定).
 use std::path::Path;
 
-use crate::ml_feat::{ml_feat_extract, F_COUNT};
+use crate::ml_feat::{ml_feat_extract, F_CERT_COUNT, F_COUNT, F_HAS_AUTHENTICODE, F_IS_SELF_SIGNED, F_SIGNER_BLACKLISTED};
 use crate::ml_net::*;
 
 fn relu(x: f32) -> f32 { if x > 0.0 { x } else { 0.0 } }
@@ -165,6 +165,21 @@ pub fn verdict(tab: f32, img: f32, mode: i32) -> Verdict {
 /// 结构匹配升级阈值 (仅表格): mode 0 -> 0.60, 1 -> 0.70, 2 -> 0.85
 pub fn tab_threshold(mode: i32) -> f32 {
     match mode { 0 => 0.60, 2 => 0.85, _ => 0.70 }
+}
+
+/// 深扫表格地板: tab <= 地板 时 CNN 不必跑 (节省 delta 读 + 图像前向).
+/// 0=高检测 0.10 (丢极少 img 兜底; 高检测本就不该为省时牺牲 recall) /
+/// 1=平衡 0.40 (AND(tab>0.40,img>0.25) → 无损) / 2=低误杀 0.20 (无损)
+pub fn tab_floor(mode: i32) -> f32 {
+    match mode { 0 => 0.10, 2 => 0.20, _ => 0.40 }
+}
+
+/// 内嵌 Authenticode「结构级合法签名」: 有证书链 + 非自签 + 签名者不在滥用名单.
+/// 不依赖本机证书库/WinVerifyTrust — 24H2 catalog 枚举失败或证书库被清空的 VM 上
+/// wintrust 对全部文件判失败, 此判定仍确定可靠 (字段由 ml_feat 静态解析).
+pub fn legit_embedded_sig(x: &[f64; F_COUNT]) -> bool {
+    x[F_HAS_AUTHENTICODE] > 0.0 && x[F_CERT_COUNT] > 0.0
+        && x[F_IS_SELF_SIGNED] == 0.0 && x[F_SIGNER_BLACKLISTED] == 0.0
 }
 
 /// 双模型打分入口: (tab, img); None = 非 PE.

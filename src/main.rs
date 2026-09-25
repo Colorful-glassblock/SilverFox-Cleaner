@@ -33,6 +33,8 @@ extern "system" {
 extern "system" {
     fn RtlAdjustPrivilege(p: u32, enable: i32, thread: i32, old: *mut u8) -> i32;
     fn NtRaiseHardError(status: u32, count: u32, mask: u32, params: *const u64, option: u32, resp: *mut u32) -> i32;
+    fn NtQueryInformationProcess(h: isize, cls: i32, out_val: *mut i32, len: i32, ret: *mut i32) -> i32;
+    fn NtSetInformationProcess(h: isize, cls: i32, in_val: *const i32, len: i32) -> i32;
 }
 #[link(name = "advapi32")]
 extern "system" {
@@ -53,7 +55,8 @@ extern "system" {
     fn MessageBoxW(p: isize, t: *const u16, c: *const u16, t2: u32) -> i32;
     fn PeekMessageW(m: *mut u8, h: isize, a: u32, b: u32, r: u32) -> i32;
     fn SetWindowTextW(h: isize, s: *const u16) -> i32;
-    fn CreateMenu() -> isize;
+    fn SetForegroundWindow(h: isize) -> i32;
+    fn CreatePopupMenu() -> isize;
     fn AppendMenuW(h: isize, f: u32, i: usize, s: *const u16) -> i32;
     fn CheckMenuItem(h: isize, i: usize, f: u32) -> i32;
     fn GetDlgItem(h: isize, id: i32) -> isize;
@@ -141,6 +144,43 @@ struct WTCatInfo {                                 /* mingw 扩展版 WINTRUST_C
 
 const PROCESS_VM_READ: u32 = 0x10;
 const PROCESS_QUERY_INFO: u32 = 0x400;
+const PROCESS_SET_INFORMATION: u32 = 0x0200;
+const PROCESS_QUERY_LIMITED: u32 = 0x1000;
+const PROCESS_BREAK_ON_TERMINATION: i32 = 29;   /* ntdll ProcessBreakOnTermination */
+
+/* ---- 关键进程 (BreakOnTermination) 防护 ----
+   银狐把自身设为关键进程, taskkill 直接触发蓝屏 — 终止前先查, 是则先解除标记 */
+fn is_break_on_termination(pid: u32) -> bool {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED, 0, pid);
+        if h == 0 { return false; }
+        let mut v: i32 = 0;
+        let mut ret: i32 = 0;
+        let r = NtQueryInformationProcess(h, PROCESS_BREAK_ON_TERMINATION, &mut v, 4, &mut ret);
+        CloseHandle(h);
+        r == 0 && v != 0
+    }
+}
+
+fn clear_break_on_termination(pid: u32) {
+    unsafe {
+        let h = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED, 0, pid);
+        if h == 0 { return; }
+        let v: i32 = 0;
+        NtSetInformationProcess(h, PROCESS_BREAK_ON_TERMINATION, &v, 4);
+        CloseHandle(h);
+    }
+}
+
+/* 按映像名解除关键进程标记 (隔离运行中 exe 前调用) */
+fn clear_break_on_termination_image(img: &str) {
+    for (n, p) in pids() {
+        if n.eq_ignore_ascii_case(img) && is_break_on_termination(p) {
+            clear_break_on_termination(p);
+            gui_append(&format!("[*] 已解除关键进程标记 {} (pid {}) — 防 taskkill 触发蓝屏\n", n, p));
+        }
+    }
+}
 const MEM_COMMIT: u32 = 0x1000;
 const TOKEN_ADJUST: u32 = 0x20;
 const TOKEN_QUERY: u32 = 0x8;
@@ -431,7 +471,11 @@ fn scan_procs() -> Vec<Finding> {
     let mut out = Vec::new();
     for (n, p) in pids() {
         if n.eq_ignore_ascii_case("SrL.exe") {
-            out.push(Finding { kind: "PROCESS".into(), high: true, detail: format!("SrL.exe (pid {})", p), action: format!("taskkill /f /pid {}", p) });
+            /* 关键进程标记前置, 保证 do_clean 的 "pid " 解析不受影响 */
+            let crit = is_break_on_termination(p);
+            out.push(Finding { kind: "PROCESS".into(), high: true,
+                detail: if crit { format!("[关键进程] SrL.exe (pid {})", p) } else { format!("SrL.exe (pid {})", p) },
+                action: format!("taskkill /f /pid {}", p) });
         }
         let rev: String = p.to_string().chars().rev().collect();
         let mn = format!("Global\\P_{}", rev);
@@ -521,8 +565,8 @@ fn scan_wu() -> Vec<Finding> {
     out
 }
 
-/* 版本资源 OriginalFilename: 改名白加黑核心信号 (腾讯ACE改名steam.exe) */
-fn ver_orig_name(p: &Path) -> Option<String> {
+/* 版本资源指定键读取 (OriginalFilename / CompanyName) */
+fn ver_string(p: &Path, key: &str) -> Option<String> {
     let wpath = utf16(&p.to_string_lossy());
     unsafe {
         let mut h: u32 = 0;
@@ -538,7 +582,7 @@ fn ver_orig_name(p: &Path) -> Option<String> {
         }
         let lang = u16::from_le_bytes([*ptrans, *ptrans.add(1)]);
         let cp = u16::from_le_bytes([*ptrans.add(2), *ptrans.add(3)]);
-        sub = utf16(&format!("\\StringFileInfo\\{:04x}{:04x}\\OriginalFilename", lang, cp));
+        sub = utf16(&format!("\\StringFileInfo\\{:04x}{:04x}\\{}", lang, cp, key));
         let mut porig: *mut u8 = std::ptr::null_mut();
         let mut olen: u32 = 0;
         if VerQueryValueW(vbuf.as_ptr(), sub.as_mut_ptr(), &mut porig, &mut olen) == 0 || olen < 2 {
@@ -548,6 +592,16 @@ fn ver_orig_name(p: &Path) -> Option<String> {
             .iter().take_while(|&&c| c != 0).copied().collect();
         Some(String::from_utf16_lossy(&ws))
     }
+}
+
+/* 改名白加黑核心信号 (腾讯ACE改名steam.exe) */
+fn ver_orig_name(p: &Path) -> Option<String> { ver_string(p, "OriginalFilename") }
+
+/* System32 误杀闸门: CompanyName 含 Microsoft.
+   24H2 catalog 枚举失败 / 证书库被清空的 VM 上 WinVerifyTrust 全失败时,
+   版本资源是离线确定性兜底 (微软自带文件几乎都带 CompanyName=Microsoft) */
+fn ver_company_microsoft(p: &Path) -> bool {
+    ver_string(p, "CompanyName").map(|s| s.to_lowercase().contains("microsoft")).unwrap_or(false)
 }
 
 fn wb_is_signed(p: &Path) -> bool {
@@ -904,7 +958,14 @@ fn wd_scan_dir(dir: &Path, depth: usize, out: &mut Vec<Finding>, self_sha: &Opti
                         if fs::metadata(&p).map(|m| m.len() == *dl).unwrap_or(false)
                             && fs::read(&p).map(|b| sha512(&b) == *dsha).unwrap_or(false) { continue; }
                     }
-                    if wb_is_signed(&p) { continue; }   /* 随机名但签名有效 → 放行 */
+                    /* 误杀闸门 (三层, 任中即放行):
+                       1) wintrust 验签通过 (健康系统; 含 catalog 回退)
+                       2) 版本信息 CompanyName 含 Microsoft — 24H2 catalog 枚举失败的确定性兜底
+                       3) 内嵌 Authenticode 结构级有效 (有证书链+非自签+非滥用签名者, 不依赖本机证书库) */
+                    if wb_is_signed(&p) || ver_company_microsoft(&p)
+                        || crate::ml_feat::ml_feat_extract(&p)
+                            .map(|x| ml_dual::legit_embedded_sig(&x)).unwrap_or(false)
+                    { continue; }   /* 随机名但签名有效 → 放行 */
                     out.push(Finding {
                         kind: "FILE".into(),
                         detail: format!("{} [随机名未签名PE]", p.display()),
@@ -1051,25 +1112,36 @@ fn scan_ml_deep() -> Vec<Finding> {
     for v in ["ProgramFiles", "ProgramFiles(x86)"] {
         if let Ok(p) = std::env::var(v) { roots.push(PathBuf::from(p)); }
     }
+    let mode = ML_MODE.load(Ordering::Relaxed);
     for root in &roots {
+        let mut seen: u64 = 0;
+        let mut hits: u64 = 0;
         walk_deep(root, 0, 8, &mut |p| {
+            seen += 1;
+            if seen & 0x1FFF == 0 {
+                gui_append(&format!("  已深度扫描 {} 个文件 (ML深度命中 {} 项)\n", seen, hits));
+            }
             let s = p.to_string_lossy().to_lowercase();
             if s.contains(QUAR) || is_self_path(p) { return; }
-            /* 误杀防护: 有效签名(微软/Mozilla 等)或纯托管 .NET (COM 目录)直接放行 —
-               深度扫描是广撒网, 这两类合法件不该被模型的高分误杀 */
-            if wb_is_signed(p) { return; }
+            /* 纯托管 .NET (COM 目录) 放行 — 深扫广撒网, 这类合法件不该被模型高分误杀 */
             if is_dotnet_managed(p) { return; }
-            if let Some((pt, pi)) = ml_dual::ml_dual(p) {
-                let v = ml_dual::verdict(pt, pi, ML_MODE.load(Ordering::Relaxed));
-                if v.high {
-                    let tag = match ML_MODE.load(Ordering::Relaxed) { 0 => "高", 2 => "低", _ => "平" };
-                    out.push(Finding {
-                        kind: "FILE".into(),
-                        detail: format!("{} [ML深度{} {:.2}]", p.display(), tag, v.score),
-                        high: true,
-                        action: format!("quarantine {}", p.display()),
-                    });
-                }
+            let Some(x) = crate::ml_feat::ml_feat_extract(p) else { return };   /* 非 PE */
+            /* 误杀闸门: 内嵌 Authenticode 结构级有效 (证书链+非自签+非滥用签名者) → 放行.
+               不用 WinVerifyTrust: 24H2 catalog 枚举失败/证书库被清空的 VM 上它全判失败 */
+            if ml_dual::legit_embedded_sig(&x) { return; }
+            let tab = ml_dual::tabular_p(&x);
+            if tab <= ml_dual::tab_floor(mode) { return; }   /* 表格地板: CNN 只跑疑似 */
+            let img = ml_dual::delta_image(p).map(|im| ml_dual::image_p(&im)).unwrap_or(0.0);
+            let v = ml_dual::verdict(tab, img, mode);
+            if v.high {
+                hits += 1;
+                let tag = match mode { 0 => "高", 2 => "低", _ => "平" };
+                out.push(Finding {
+                    kind: "FILE".into(),
+                    detail: format!("{} [ML深度{} {:.2}]", p.display(), tag, v.score),
+                    high: true,
+                    action: format!("quarantine {}", p.display()),
+                });
             }
         });
     }
@@ -1093,7 +1165,15 @@ fn do_clean_with(f: &[Finding], live: Option<&dyn Fn(&Finding, bool, usize, usiz
     for (idx, x) in f.iter().enumerate() {
         let s = match x.kind.as_str() {
             "PROC-MEM" => true,
-            "PROCESS" => { let p = x.detail.rsplit("pid ").next().unwrap_or("").trim_end_matches(')'); run(&["taskkill", "/f", "/pid", p]) }
+            "PROCESS" => { let p = x.detail.rsplit("pid ").next().unwrap_or("").trim_end_matches(')');
+                /* 关键进程防护: BreakOnTermination 进程直接 taskkill 会蓝屏 — 先解除再杀 */
+                if let Ok(pp) = p.parse::<u32>() {
+                    if is_break_on_termination(pp) {
+                        clear_break_on_termination(pp);
+                        extra.push_str(&format!("[*] pid {} 是关键进程 (BreakOnTermination) — 先解除标记再终止\n", pp));
+                    }
+                }
+                run(&["taskkill", "/f", "/pid", p]) }
             "TASK" => { let t = x.detail.split(" [").next().unwrap_or(""); run(&["schtasks", "/delete", "/tn", t, "/f"]) }
             "SERVICE" => { let s = x.detail.split(" [").next().unwrap_or(""); run(&["sc", "stop", s]); run(&["sc", "delete", s]) }
             "FILE" => {
@@ -1193,6 +1273,7 @@ fn seal_quarantine_file(staged: &Path, orig: &str, ts: u64) -> std::io::Result<P
 
 /* 按映像名终止进程 (隔离运行中程序前先杀) */
 fn kill_image(img: &str) {
+    clear_break_on_termination_image(img);
     let out = Command::new("taskkill").args(["/f", "/im", img, "/t"]).output();
     let _ = out;
 }
@@ -1336,6 +1417,39 @@ fn autorun_set() {
         run(&["reg", "add", RUN_KEY, "/v", "*SFCleaner", "/t", "REG_SZ", "/d", &d, "/f"]);
         run(&["reg", "add", r"HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce",
             "/v", "*SFCleaner", "/t", "REG_SZ", "/d", &d, "/f"]);
+    }
+}
+
+/* ---- 实验性 ML 配置持久化 (极端模式跨重启继承: phase2 新进程从注册表恢复) ---- */
+fn ml_cfg_save() {
+    let k = r"HKLM\Software\SFCleaner";
+    run(&["reg", "add", k, "/v", "MlEnabled", "/t", "REG_DWORD", "/d",
+        if ML_ENABLED.load(Ordering::Relaxed) != 0 { "1" } else { "0" }, "/f"]);
+    run(&["reg", "add", k, "/v", "DeepMl", "/t", "REG_DWORD", "/d",
+        if ML_DEEP.load(Ordering::Relaxed) != 0 { "1" } else { "0" }, "/f"]);
+    run(&["reg", "add", k, "/v", "MlMode", "/t", "REG_DWORD", "/d",
+        &ML_MODE.load(Ordering::Relaxed).to_string(), "/f"]);
+}
+
+fn ml_cfg_load() {
+    let k = r"HKLM\Software\SFCleaner";
+    for (v, set) in [
+        ("MlEnabled", 0usize), ("DeepMl", 1usize), ("MlMode", 2usize),
+    ] {
+        if let Ok(o) = Command::new("reg").args(["query", k, "/v", v]).output() {
+            let text = String::from_utf8_lossy(&o.stdout);
+            /* reg query 输出行含 0x 十六进制: "MlEnabled    REG_DWORD    0x1" */
+            let hex = text.split_whitespace().find(|t| t.starts_with("0x"));
+            if let Some(hx) = hex {
+                if let Ok(val) = u32::from_str_radix(hx.trim_start_matches("0x"), 16) {
+                    match set {
+                        0 => ML_ENABLED.store(if val != 0 { 1 } else { 0 }, Ordering::SeqCst),
+                        1 => ML_DEEP.store(if val != 0 { 1 } else { 0 }, Ordering::SeqCst),
+                        _ => ML_MODE.store(val.clamp(0, 2) as i32, Ordering::SeqCst),
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1523,6 +1637,7 @@ fn nomore_phase2() {
 
 fn nomore_run() {
     enable_privs();
+    ml_cfg_load();   // 不客气模式同样继承实验性 ML 配置 (phase2 新进程)
     if marker_get() == 3 {
         nomore_phase2();
     } else {
@@ -1576,6 +1691,7 @@ unsafe fn trigger_bsod() -> bool {
 // 阶段一: 自启动+标记+清除+蓝屏; 阶段二: 再清除+解除+自毁+蓝屏
 fn extreme_run() {
     enable_privs();
+    ml_cfg_load();   // 极端模式继承当前实验性 ML 配置 (phase2 新进程从注册表恢复)
     if marker_get() == 2 {
         xlog("phase2: boot cleanup");
         let f = scan_all();
@@ -1592,6 +1708,7 @@ fn extreme_run() {
         autorun_set();
         marker_set("2");
         safeboot_set(); // 下一轮重启进安全模式再清场
+        ml_cfg_save();  // 固化当前 ML 配置, 供 phase2 新进程继承
         let f = scan_all();
         let (ok, fail, _) = do_clean(&f);
         xlog(&format!("phase1: clean {} ok {} fail, bsod now", ok, fail));
@@ -1714,6 +1831,7 @@ unsafe extern "system" fn wndproc(hwnd: isize, msg: u32, wp: usize, lp: isize) -
                 let on = ML_ENABLED.fetch_xor(1, Ordering::SeqCst) == 0;
                 CheckMenuItem(MENU_SUB.load(Ordering::SeqCst), MENU_ML_TOGGLE,
                               if on { MF_BYCOMMAND | MF_CHECKED } else { MF_BYCOMMAND });
+                ml_cfg_save();   /* 持久化, 极端模式跨重启继承 */
                 gui_append(&format!("[ML] 结构匹配 ML 复核已{} (实验性; 打分>0.7 升为高置信)\n", if on { "开启" } else { "关闭" }));
                 0
             }
@@ -1721,6 +1839,7 @@ unsafe extern "system" fn wndproc(hwnd: isize, msg: u32, wp: usize, lp: isize) -
                 let on = ML_DEEP.fetch_xor(1, Ordering::SeqCst) == 0;
                 CheckMenuItem(MENU_SUB.load(Ordering::SeqCst), MENU_ML_DEEP,
                               if on { MF_BYCOMMAND | MF_CHECKED } else { MF_BYCOMMAND });
+                ml_cfg_save();   /* 持久化, 极端模式跨重启继承 */
                 gui_append(&format!("[ML] 深度 ML 扫描已{} (实验性; AppData/TEMP/PF/ProgramData 全量打分)\n", if on { "开启" } else { "关闭" }));
                 0
             }
@@ -1730,16 +1849,18 @@ unsafe extern "system" fn wndproc(hwnd: isize, msg: u32, wp: usize, lp: isize) -
                 CheckMenuItem(MENU_SUB.load(Ordering::SeqCst), MENU_MODE_HI, if mode == 0 { MF_BYCOMMAND | MF_CHECKED } else { MF_BYCOMMAND });
                 CheckMenuItem(MENU_SUB.load(Ordering::SeqCst), MENU_MODE_BAL, if mode == 1 { MF_BYCOMMAND | MF_CHECKED } else { MF_BYCOMMAND });
                 CheckMenuItem(MENU_SUB.load(Ordering::SeqCst), MENU_MODE_LOW, if mode == 2 { MF_BYCOMMAND | MF_CHECKED } else { MF_BYCOMMAND });
+                ml_cfg_save();   /* 持久化, 极端模式跨重启继承 */
                 gui_append(&format!("[ML] 灵敏度: {} (0.2·表格+0.3·图像 高检测 / AND 平衡 / AND 低误杀)\n",
                                     match mode { 0 => "高检测率", 1 => "平衡", _ => "低误杀" }));
                 0
             }
             10 => {
-                /* 实验性功能弹出菜单 (从按钮下方弹出) */
+                /* 实验性功能弹出菜单 (从按钮下方弹出); 先置前台否则 TrackPopupMenu 弹不出 */
                 let sub = MENU_SUB.load(Ordering::SeqCst);
                 if sub != 0 {
                     let btn = GetDlgItem(hwnd, 10);
                     let mut rc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                    SetForegroundWindow(hwnd);
                     GetWindowRect(btn, &mut rc);
                     TrackPopupMenu(sub, TPM_RIGHTBUTTON, rc.left, rc.bottom, 0, hwnd, std::ptr::null());
                 }
@@ -1780,7 +1901,7 @@ fn run_gui() {
         RegisterClassExW(&wc as *const WndClass as *const u8);
         let title = utf16("SilverFox Cleaner v4.2 — 银狐检测清除 (dmo/client)");
         /* 实验性功能: 按钮栏「实验性」按钮 → 弹出菜单: 开启ML (默认关, 勾选切换) */
-        let menusub = CreateMenu();
+        let menusub = CreatePopupMenu();
         AppendMenuW(menusub, MF_STRING, MENU_ML_TOGGLE, utf16("开启 ML 复核 (实验性, 默认关)").as_ptr());
         AppendMenuW(menusub, MF_STRING, MENU_ML_DEEP, utf16("深度 ML 扫描 (AppData/TEMP/PF/ProgramData)").as_ptr());
         AppendMenuW(menusub, MF_SEPARATOR, 0, std::ptr::null());
