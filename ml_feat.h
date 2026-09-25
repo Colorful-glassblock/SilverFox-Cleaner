@@ -10,4 +10,8 @@
 int ml_feat_extract(const char *path, double out[28]);
 double ml_score(const char *path);
 
+/* 内嵌 Authenticode「结构级合法签名」: 有证书链 + 非自签 + 签名者不在滥用名单.
+ * 不依赖本机证书库/WinVerifyTrust — 24H2 catalog 枚举失败或证书库被清空的 VM 上仍确定可靠. */
+int ml_feat_legit_sig(const double x28[28]);
+
 #endif
