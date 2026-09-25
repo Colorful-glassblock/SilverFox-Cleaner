@@ -54,7 +54,13 @@ extern "system" {
     fn CreateMenu() -> isize;
     fn AppendMenuW(h: isize, f: u32, i: usize, s: *const u16) -> i32;
     fn CheckMenuItem(h: isize, i: usize, f: u32) -> i32;
+    fn GetDlgItem(h: isize, id: i32) -> isize;
+    fn GetWindowRect(h: isize, r: *mut RECT) -> i32;
+    fn TrackPopupMenu(m: isize, f: u32, x: i32, y: i32, r: i32, h: isize, rp: *const u8) -> i32;
 }
+
+#[repr(C)]
+struct RECT { left: i32, top: i32, right: i32, bottom: i32 }
 #[link(name = "comctl32")]
 extern "system" {
     fn InitCommonControlsEx(p: *const u8) -> i32;
@@ -154,18 +160,17 @@ static GUI_BAR: AtomicIsize = AtomicIsize::new(0);
 static GUI_STAT: AtomicIsize = AtomicIsize::new(0);
 /* ---- 实验性功能: 结构匹配 ML 复核 (默认关) ---- */
 static ML_ENABLED: AtomicI32 = AtomicI32::new(0);
-static MENU_MAIN: AtomicIsize = AtomicIsize::new(0);
+static MENU_SUB: AtomicIsize = AtomicIsize::new(0);
+static CLEANING: AtomicI32 = AtomicI32::new(0);   /* 清除进行中: 防重入 */
 const MENU_ML_TOGGLE: usize = 0x110;
-const MENU_NOMORE: usize = 0x111;
-const MF_POPUP: u32 = 0x10;
-const MF_SEPARATOR: u32 = 0x800;
 const MF_CHECKED: u32 = 0x8;
 const MF_STRING: u32 = 0x0;
 const MF_BYCOMMAND: u32 = 0x0;
+const TPM_RIGHTBUTTON: u32 = 0x2;
 static FILES_DONE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static PHASE_DONE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 static FIND_CNT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-const PHASES_TOTAL: i64 = 9;
+const PHASES_TOTAL: i64 = 10;
 static LIVE: std::sync::Mutex<Vec<Finding>> = std::sync::Mutex::new(Vec::new());
 const ES_MULTILINE: u32 = 4;
 const ES_READONLY: u32 = 0x800;
@@ -297,6 +302,7 @@ fn scan_all_with(live: bool) -> Vec<Finding> {
         handles.push(thread::spawn(move || {
             let mut all: Vec<Finding> = Vec::new();
             let f = scan_files(); if live { live_push(&f); } all.extend(f); PHASE_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let f = scan_ml_deep(); if live { live_push(&f); } all.extend(f); PHASE_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let f = scan_hosts(); if live { live_push(&f); } all.extend(f); PHASE_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let f = scan_wu(); if live { live_push(&f); } all.extend(f); PHASE_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             r.lock().unwrap().extend(all);
@@ -824,7 +830,21 @@ fn wd_random_name(fnm: &str) -> Option<bool> /* Some(true)=PE Some(false)=bat No
         else { return None; }
     }
     if !is_pe { return Some(false); }
-    if dig >= 2 || up > 0 || bl >= 8 { return Some(true); }
+    /* 随机名形态: 大小写+数字混排, 或数字嵌在字母中间。
+       纯小写长名(ntoskrnl/vmswitch)与尾部数字(vcruntime140/msvcp140)不算 ——
+       否则 System32 大量合法文件被误判「随机名未签名PE」 */
+    let b = base.as_bytes();
+    let mut mid_digit = false;
+    for i in 0..bl {
+        if b[i].is_ascii_digit()
+            && (i == 0 || !b[i - 1].is_ascii_digit())   /* 孤立数字: 排除 gdi32full 式版本号 */
+            && i + 1 < bl && b[i + 1].is_ascii_alphabetic()
+        {
+            mid_digit = true;
+            break;
+        }
+    }
+    if (dig >= 1 && up >= 1) || mid_digit { return Some(true); }
     None
 }
 
@@ -958,12 +978,14 @@ fn read_head(p: &Path, n: u64) -> std::io::Result<Vec<u8>> {
     Ok(b)
 }
 
-fn walk(dir: &Path, depth: usize, cb: &mut impl FnMut(&Path)) {
-    if depth > 4 { return; }
+fn walk(dir: &Path, depth: usize, cb: &mut impl FnMut(&Path)) { walk_n(dir, depth, 4, cb); }
+
+fn walk_n(dir: &Path, depth: usize, max: usize, cb: &mut impl FnMut(&Path)) {
+    if depth > max { return; }
     if let Ok(rd) = fs::read_dir(dir) {
         for e in rd.flatten() {
             let p = e.path();
-            if p.is_dir() { walk(&p, depth + 1, cb); } else {
+            if p.is_dir() { walk_n(&p, depth + 1, max, cb); } else {
                 FILES_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 cb(&p);
             }
@@ -971,7 +993,57 @@ fn walk(dir: &Path, depth: usize, cb: &mut impl FnMut(&Path)) {
     }
 }
 
-fn do_clean(f: &[Finding]) -> (usize, usize, String) {
+/// 深度遍历 (跳 symlink/junction 防环), 供实验性深度 ML 扫描
+fn walk_deep(dir: &Path, depth: usize, max: usize, cb: &mut impl FnMut(&Path)) {
+    if depth > max { return; }
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let is_link = e.file_type().map(|ft| ft.is_symlink()).unwrap_or(false);
+            if p.is_dir() {
+                if !is_link { walk_deep(&p, depth + 1, max, cb); }
+            } else {
+                FILES_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                cb(&p);
+            }
+        }
+    }
+}
+
+/// 实验性深度 ML 扫描 (需开启 ML): AppData / TEMP / ProgramData / Program Files 全量 PE 打分
+fn scan_ml_deep() -> Vec<Finding> {
+    let mut out = Vec::new();
+    if ML_ENABLED.load(Ordering::Relaxed) == 0 { return out; }
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for v in ["APPDATA", "LOCALAPPDATA", "TEMP", "ProgramData"] {
+        if let Ok(p) = std::env::var(v) { roots.push(PathBuf::from(p)); }
+    }
+    for v in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(p) = std::env::var(v) { roots.push(PathBuf::from(p)); }
+    }
+    for root in &roots {
+        walk_deep(root, 0, 8, &mut |p| {
+            let s = p.to_string_lossy().to_lowercase();
+            if s.contains(QUAR) || is_self_path(p) { return; }
+            if let Some(pr) = ml_feat::ml_score(p) {
+                if pr > 0.7 {
+                    out.push(Finding {
+                        kind: "FILE".into(),
+                        detail: format!("{} [ML深度 {:.2}]", p.display(), pr),
+                        high: true,
+                        action: format!("quarantine {}", p.display()),
+                    });
+                }
+            }
+        });
+    }
+    out
+}
+
+fn do_clean(f: &[Finding]) -> (usize, usize, String) { do_clean_with(f, None) }
+
+/// live 提供逐项回调 (清除进度 + 实时回显), 供后台线程驱动
+fn do_clean_with(f: &[Finding], live: Option<&dyn Fn(&Finding, bool, usize, usize)>) -> (usize, usize, String) {
     enable_privs();
     let mut extra = String::new();
     if f.iter().any(|x| x.kind == "PROC-MEM") {
@@ -981,7 +1053,8 @@ fn do_clean(f: &[Finding]) -> (usize, usize, String) {
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let qd = PathBuf::from(r"C:\ProgramData\sf_quarantine").join(ts.to_string());
     let (mut ok, mut fail) = (0usize, 0usize);
-    for x in f {
+    let total = f.len();
+    for (idx, x) in f.iter().enumerate() {
         let s = match x.kind.as_str() {
             "PROC-MEM" => true,
             "PROCESS" => { let p = x.detail.rsplit("pid ").next().unwrap_or("").trim_end_matches(')'); run(&["taskkill", "/f", "/pid", p]) }
@@ -1008,8 +1081,28 @@ fn do_clean(f: &[Finding]) -> (usize, usize, String) {
             _ => true,
         };
         if s { ok += 1; } else { fail += 1; }
+        if let Some(r) = live { r(x, s, idx + 1, total); }
     }
     (ok, fail, extra)
+}
+
+/// 清除逐项实时回显: 日志行 + 进度条 + 状态行 (SendMessage, 由 UI 线程泵处理)
+fn gui_clean_line(x: &Finding, s: bool, i: usize, total: usize) {
+    let p = x.detail.split(" [").next().unwrap_or("");
+    gui_append(&format!("[清除 {}/{}] {} {} -> {}\n", i, total, if s { "[+]" } else { "[-]" }, p, if s { "成功" } else { "失败" }));
+    let bar = GUI_BAR.load(Ordering::SeqCst);
+    let stat = GUI_STAT.load(Ordering::SeqCst);
+    if bar != 0 {
+        let pct = if total == 0 { 0 } else { (i * 100 / total) as usize };
+        unsafe {
+            SendMessageW(bar, PBM_SETRANGE32, 0, 100);
+            SendMessageW(bar, PBM_SETPOS, pct, 0);
+        }
+    }
+    if stat != 0 {
+        let t = utf16(&format!("清除中 {}/{} ({:.0}%)", i, total, i as f64 / total as f64 * 100.0));
+        unsafe { SetWindowTextW(stat, t.as_ptr()); }
+    }
 }
 
 fn run(c: &[&str]) -> bool { Command::new(c[0]).args(&c[1..]).output().map(|o| o.status.success()).unwrap_or(false) }
@@ -1511,18 +1604,34 @@ unsafe extern "system" fn wndproc(hwnd: isize, msg: u32, wp: usize, lp: isize) -
                 0
             }
             2 => {
-                let f = scan_all();
-                if f.is_empty() { gui_append("无可清除项\n\n"); 0 }
-                else {
-                    let m = utf16(&format!("发现 {} 项银狐痕迹\n确认清除?", f.len()));
-                    let c = utf16("SilverFox Cleaner v4");
-                    if MessageBoxW(hwnd, m.as_ptr(), c.as_ptr(), MB_OKCANCEL | MB_ICONWARNING) == IDOK {
-                        gui_append(&format!("[{}] 清除中 (TrustedInstaller 提权)...\n", now_str()));
-                        let (ok, fail, extra) = do_clean(&f);
-                        gui_append(&extra);
-                        gui_append(&format!("完成: {} 成功, {} 失败\n建议重启确认无复活\n\n", ok, fail));
-                    }
+                if CLEANING.load(Ordering::SeqCst) != 0 {
+                    gui_append("[!] 清除进行中, 请稍候\n");
                     0
+                } else {
+                    let f = scan_all();
+                    if f.is_empty() { gui_append("无可清除项\n\n"); 0 }
+                    else {
+                        let m = utf16(&format!("发现 {} 项银狐痕迹\n确认清除?", f.len()));
+                        let c = utf16("SilverFox Cleaner v4");
+                        if MessageBoxW(hwnd, m.as_ptr(), c.as_ptr(), MB_OKCANCEL | MB_ICONWARNING) == IDOK {
+                            gui_append(&format!("[{}] 清除中 (逐项实时显示)...\n", now_str()));
+                            CLEANING.store(1, Ordering::SeqCst);
+                            let f2 = f.clone();
+                            let h = thread::spawn(move || {
+                                let (ok, fail, extra) = do_clean_with(&f2, Some(&gui_clean_line));
+                                gui_append(&extra);
+                                gui_append(&format!("完成: {} 成功, {} 失败\n建议重启确认无复活\n\n", ok, fail));
+                                CLEANING.store(0, Ordering::SeqCst);
+                            });
+                            while !h.is_finished() { ui_tick(); std::thread::sleep(std::time::Duration::from_millis(25)); }
+                            h.join().unwrap();
+                            let bar = GUI_BAR.load(Ordering::SeqCst);
+                            if bar != 0 { unsafe { SendMessageW(bar, PBM_SETPOS, 100, 0); } }
+                            let stat = GUI_STAT.load(Ordering::SeqCst);
+                            if stat != 0 { let t = utf16("清除完成"); unsafe { SetWindowTextW(stat, t.as_ptr()); } }
+                        }
+                        0
+                    }
                 }
             }
             3 => {
@@ -1567,28 +1676,24 @@ unsafe extern "system" fn wndproc(hwnd: isize, msg: u32, wp: usize, lp: isize) -
             }
             MENU_ML_TOGGLE => {
                 let on = ML_ENABLED.fetch_xor(1, Ordering::SeqCst) == 0;
-                CheckMenuItem(MENU_MAIN.load(Ordering::SeqCst), MENU_ML_TOGGLE,
+                CheckMenuItem(MENU_SUB.load(Ordering::SeqCst), MENU_ML_TOGGLE,
                               if on { MF_BYCOMMAND | MF_CHECKED } else { MF_BYCOMMAND });
                 gui_append(&format!("[ML] 结构匹配 ML 复核已{} (实验性; 打分>0.7 升为高置信)\n", if on { "开启" } else { "关闭" }));
                 0
             }
-            MENU_NOMORE => {
-                let m = utf16("⚡ 不客气模式 (实验性功能 — 不稳定)
-
-⚠ 警告: 需内核驱动 + testsigning, 必须关 Secure Boot
-过程: 导入自定义证书 → 蓝屏重启 → 驱动清理 → 卸载 → 删证书
-仅限虚拟机, 先保存全部工作!
-
-确定继续?");
-                let c = utf16("SilverFox Cleaner 不客气模式");
-                if MessageBoxW(hwnd, m.as_ptr(), c.as_ptr(), MB_OKCANCEL | MB_ICONWARNING) == IDOK {
-                    gui_append("[!!] 不客气模式启动 (实验性, 不稳定)\n");
-                    nomore_run();
+            10 => {
+                /* 实验性功能弹出菜单 (从按钮下方弹出) */
+                let sub = MENU_SUB.load(Ordering::SeqCst);
+                if sub != 0 {
+                    let btn = GetDlgItem(hwnd, 10);
+                    let mut rc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                    GetWindowRect(btn, &mut rc);
+                    TrackPopupMenu(sub, TPM_RIGHTBUTTON, rc.left, rc.bottom, 0, hwnd, std::ptr::null());
                 }
                 0
             }
             7 => {
-                let m = utf16("⚡ 不客气模式确认\n\n导入自定义证书 + 装载内核驱动清理\ntestsigning ON → 蓝屏重启 → 驱动清理\n→ 卸载 → 删证书 → testsigning OFF\n\n材料: SFCleanerDrv.sys + SFCleanerCert.pfx 同目录");
+                let m = utf16("⚡ 不客气模式确认 (实验性功能 — 不稳定)\n\n⚠ 警告: 需内核驱动 + testsigning, 必须关 Secure Boot\n过程: 导入自定义证书 → 蓝屏重启 → 驱动清理\n→ 卸载 → 删证书 → testsigning OFF\n仅限虚拟机, 先保存全部工作!\n\n材料: SFCleanerDrv.sys + SFCleanerCert.pfx 同目录");
                 let c = utf16("SilverFox Cleaner 不客气模式");
                 if MessageBoxW(hwnd, m.as_ptr(), c.as_ptr(), MB_OKCANCEL | MB_ICONWARNING) == IDOK {
                     gui_append("[!!] 不客气模式启动\n");
@@ -1621,15 +1726,11 @@ fn run_gui() {
         };
         RegisterClassExW(&wc as *const WndClass as *const u8);
         let title = utf16("SilverFox Cleaner v4.2 — 银狐检测清除 (dmo/client)");
-        /* 实验性功能菜单: 开启ML (默认关, 勾选切换) / 不客气模式 (不稳定) */
-        let menumain = CreateMenu();
+        /* 实验性功能: 按钮栏「实验性」按钮 → 弹出菜单: 开启ML (默认关, 勾选切换) */
         let menusub = CreateMenu();
         AppendMenuW(menusub, MF_STRING, MENU_ML_TOGGLE, utf16("开启 ML 复核 (实验性, 默认关)").as_ptr());
-        AppendMenuW(menusub, MF_SEPARATOR, 0, std::ptr::null());
-        AppendMenuW(menusub, MF_STRING, MENU_NOMORE, utf16("不客气模式 (不稳定)…").as_ptr());
-        AppendMenuW(menumain, MF_POPUP, menusub as usize, utf16("实验性功能").as_ptr());
-        MENU_MAIN.store(menumain, Ordering::SeqCst);
-        let hwnd = CreateWindowExW(0, cn.as_ptr(), title.as_ptr(), WS_OVERLAPPEDWINDOW | WS_VISIBLE, 200, 200, 920, 640, 0, menumain, inst, std::ptr::null());
+        MENU_SUB.store(menusub, Ordering::SeqCst);
+        let hwnd = CreateWindowExW(0, cn.as_ptr(), title.as_ptr(), WS_OVERLAPPEDWINDOW | WS_VISIBLE, 200, 200, 1060, 640, 0, 0, inst, std::ptr::null());
         if hwnd == 0 { return; }
         let font = GetStockObject(DEFAULT_GUI_FONT);
         let b1 = CreateWindowExW(0, utf16("BUTTON").as_ptr(), utf16("🔍 扫描").as_ptr(), WS_CHILD | WS_VISIBLE, 14, 12, 120, 38, hwnd, 1, inst, std::ptr::null());
@@ -1639,6 +1740,7 @@ fn run_gui() {
         let b5 = CreateWindowExW(0, utf16("BUTTON").as_ptr(), utf16("🗑 清空隔离区").as_ptr(), WS_CHILD | WS_VISIBLE, 504, 12, 150, 38, hwnd, 5, inst, std::ptr::null());
         let b6 = CreateWindowExW(0, utf16("BUTTON").as_ptr(), utf16("☢ 极端").as_ptr(), WS_CHILD | WS_VISIBLE, 624, 12, 110, 38, hwnd, 6, inst, std::ptr::null());
         let b7 = CreateWindowExW(0, utf16("BUTTON").as_ptr(), utf16("⚡ 不客气").as_ptr(), WS_CHILD | WS_VISIBLE, 744, 12, 130, 38, hwnd, 7, inst, std::ptr::null());
+        let b8 = CreateWindowExW(0, utf16("BUTTON").as_ptr(), utf16("⚗ 实验性").as_ptr(), WS_CHILD | WS_VISIBLE, 884, 12, 120, 38, hwnd, 10, inst, std::ptr::null());
         /* 注册进度条类 (comctl32) 并强制链接导入 */
         let icc: Vec<u8> = [8u32.to_le_bytes(), ICC_PROGRESS_CLASS.to_le_bytes()].concat();
         InitCommonControlsEx(icc.as_ptr());
@@ -1648,7 +1750,7 @@ fn run_gui() {
         GUI_STAT.store(barstat, Ordering::SeqCst);
         let edit = CreateWindowExW(0x200, utf16("EDIT").as_ptr(), utf16("").as_ptr(), WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL | ES_WANTRETURN, 14, 74, 880, 472, hwnd, 4, inst, std::ptr::null());
         let status = CreateWindowExW(0, utf16("STATIC").as_ptr(), utf16("就绪 — 扫描 | SYSTEM + TrustedInstaller | 加密隔离: sf_quarantine (仅本工具可还原)").as_ptr(), WS_CHILD | WS_VISIBLE, 14, 556, 880, 24, hwnd, 5, inst, std::ptr::null());
-        for h in [b1, b2, b3, b4, b5, b6, b7, edit, status, barstat] { SendMessageW(h, WM_SETFONT, font as usize, 1); }
+        for h in [b1, b2, b3, b4, b5, b6, b7, b8, edit, status, barstat] { SendMessageW(h, WM_SETFONT, font as usize, 1); }
         GUI_LOG.store(edit, Ordering::SeqCst);
         gui_append("╔════════════════════════════════════╗\n║  SilverFox Cleaner v4.1 — dmo/client ║\n╚════════════════════════════════════╝\n\n检测: 持久化 / 落盘物 / 互斥 / SrL / ctfmon内存注入\n权限: SYSTEM + TrustedInstaller 提权\n隔离: 时间戳加密 SFQENC1 (明文不落盘防复活)\n还原: [♻ 还原隔离区] 或 restore 子命令\n扫描: 多线程并行 (任务+服务 | 进程+内存 | 文件)\n\n");
         let mut msg = [0u8; 48];
