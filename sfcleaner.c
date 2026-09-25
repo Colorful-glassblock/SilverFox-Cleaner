@@ -2224,7 +2224,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
                 RECT rc;
                 SetForegroundWindow(hwnd);
                 GetWindowRect(g_btn[7], &rc);
-                TrackPopupMenu(g_menu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON,
+                TrackPopupMenu(g_menu, TPM_LEFTALIGN | TPM_TOPALIGN,
                                rc.left, rc.bottom, 0, hwnd, NULL);
             }
             return 0;
