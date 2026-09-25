@@ -50,6 +50,20 @@ public sealed partial class MainWindow : Window
         TblStatus.Text = Scanner.DeepMlScan ? "深度ML: 开 (实验性)" : "深度ML: 关";
     }
 
+    private void SetMode(int mode, string name)
+    {
+        Scanner.MlMode = mode;
+        ModeHigh.IsChecked = mode == 0;
+        ModeBal.IsChecked = mode == 1;
+        ModeLow.IsChecked = mode == 2;
+        AppendLog($"[ML] 灵敏度: {name}");
+        TblStatus.Text = $"ML灵敏度: {name}";
+    }
+
+    private void ModeHigh_Click(object sender, RoutedEventArgs e) => SetMode(0, "高检测率");
+    private void ModeBal_Click(object sender, RoutedEventArgs e) => SetMode(1, "平衡 (默认)");
+    private void ModeLow_Click(object sender, RoutedEventArgs e) => SetMode(2, "低误杀");
+
     private async void Scan_Click(object sender, RoutedEventArgs e) => await RunScanAsync();
 
     private async Task RunScanAsync()

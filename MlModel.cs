@@ -1,105 +1,26 @@
-// MlModel.cs — 逻辑回归常量 (由 ml/model_linear.json 生成, 经 score_pe.py 验证一致)
+// MlModel.cs — 双模型打分入口 (权重与前向在 MlNet.cs / MlInfer.cs)
+using System;
+
 namespace SFCleaner;
 
 internal static class MlModel
 {
-    internal const int N = 22;
-    internal static readonly string[] Features =
-    {
-        "has_go_buildid", "has_golang", "unusual_sections", "suspicious_apis", "has_injection_api", "has_persistence_api", "has_net_api", "max_section_entropy", "n_strings", "log_size", "n_urls", "has_authenticode", "cert_count", "is_self_signed", "n_import_dlls", "signer_blacklisted", "fptable_unsigned", "empty_raw_sections", "entry_in_rawless", "c2_ip_port", "entry_section_entropy", "ep_high_entropy"
-    };
-    internal static readonly double[] Means =
-    {
-    0.016891891891891893,
-    0.015765765765765764,
-    0.46396396396396394,
-    0.5461711711711712,
-    0.20608108108108109,
-    0.2927927927927928,
-    0.02927927927927928,
-    5.772693693693694,
-    2038.9166666666667,
-    12.011932770270269,
-    7.565315315315315,
-    0.47635135135135137,
-    1.4031531531531531,
-    0.0,
-    21.704954954954953,
-    0.04279279279279279,
-    0.00563063063063063,
-    0.060810810810810814,
-    0.0,
-    0.7556306306306306,
-    5.162823198198199,
-    0.013513513513513514
-    };
-    internal static readonly double[] Stds =
-    {
-    0.12886642650513955,
-    0.12456807936058409,
-    1.0172204481541085,
-    0.9715009875952924,
-    0.4044893930643101,
-    0.45504414432161355,
-    0.16858826496575982,
-    1.0596357352950516,
-    4037.578340778098,
-    2.1390733257842087,
-    46.37683742155022,
-    0.49944042829660157,
-    1.650031111899956,
-    1.0,
-    93.2989763312408,
-    0.20238964814877736,
-    0.0748259756323433,
-    0.38367036136432625,
-    1.0,
-    13.676440082895978,
-    2.066682827543827,
-    0.11545951007185853
-    };
-    internal static readonly double[] W =
-    {
-    0.7532767871424171,
-    -3.8550044343772636,
-    -3.4465738922111795,
-    0.6342279451524381,
-    5.325395222596065,
-    -6.938121629393158,
-    1.829914606412086,
-    -3.7644538060573938,
-    9.933039455642463,
-    0.8337534568637915,
-    0.6248662312589616,
-    -27.31034023964103,
-    -22.321101855194463,
-    0.0,
-    1.489974843553355,
-    24.458214034908863,
-    6.168058276610006,
-    7.436008297048799,
-    0.0,
-    -10.650837637090529,
-    6.20030321132325,
-    5.189011279343047
-    };
-    internal const double B = -35.844952315818325;
-
-    // ---- 打分: z = b + Σ w·((x-mean)/std), p = sigmoid(clamp(z,±50)) ----
-
-    internal static double Score(double[] x)
-    {
-        double z = B;
-        for (int i = 0; i < N; i++)
-            z += W[i] * ((x[i] - Means[i]) / Stds[i]);
-        z = Math.Clamp(z, -50.0, 50.0);
-        return 1.0 / (1.0 + Math.Exp(-z));
-    }
-
-    /// <summary>结构匹配文件的 ML 复核: null = 非 PE (调用方保持原结构匹配判定)</summary>
-    internal static double? ScorePath(string path)
+    /// <summary>双模型打分 (tab, img); null = 非 PE / 无法编码.</summary>
+    public static (float Tab, float Img)? DualScore(string path)
     {
         var x = PeFeat.Extract(path);
-        return x == null ? null : Score(x);
+        if (x == null) return null;
+        var img = new byte[3072];
+        if (!MlInfer.DeltaImg(path, img)) return null;
+        return (MlInfer.TabularP(x), MlInfer.ImageP(img));
+    }
+
+    /// <summary>结构匹配升级: 仅表格分支 + 灵敏度阈值.</summary>
+    public static (float Score, bool High)? TabScore(string path, int mode)
+    {
+        var x = PeFeat.Extract(path);
+        if (x == null) return null;
+        float p = MlInfer.TabularP(x);
+        return (p, p > MlInfer.TabThreshold(mode));
     }
 }

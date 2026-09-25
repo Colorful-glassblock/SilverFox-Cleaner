@@ -73,6 +73,10 @@
                     <MenuFlyout>
                         <ToggleMenuFlyoutItem x:Name="MlToggle" Text="开启 ML 复核 (实验性, 默认关)" Click="MlToggle_Click"/>
                         <ToggleMenuFlyoutItem x:Name="DeepScanToggle" Text="深度 ML 扫描 (AppData/TEMP/PF/ProgramData)" Click="DeepScanToggle_Click"/>
+                        <MenuFlyoutSeparator/>
+                        <ToggleMenuFlyoutItem x:Name="ModeHigh" Text="灵敏度: 高检测率" Click="ModeHigh_Click"/>
+                        <ToggleMenuFlyoutItem x:Name="ModeBal" Text="灵敏度: 平衡 (默认)" IsChecked="True" Click="ModeBal_Click"/>
+                        <ToggleMenuFlyoutItem x:Name="ModeLow" Text="灵敏度: 低误杀" Click="ModeLow_Click"/>
                     </MenuFlyout>
                 </Button.Flyout>
             </Button>

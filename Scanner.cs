@@ -254,6 +254,9 @@ public static class Scanner
     /// 实验性: 深度 ML 扫描开关 (默认关; 独立于 MlEnabled, 扫 AppData/TEMP/PF/ProgramData 全量 PE)
     public static bool DeepMlScan;
 
+    /// 实验性: ML 灵敏度 (0=高检测 1=平衡(默认) 2=低误杀)
+    public static int MlMode = 1;
+
     private const uint MEM_COMMIT = 0x1000;
     private const uint PAGE_GUARD = 0x100;
     private const uint PAGE_NOACCESS = 0x01;
@@ -984,10 +987,10 @@ public static class Scanner
                     string mls = "";
                     if (!byNm && MlEnabled && !IsSelfPath(p))
                     {
-                        if (MlModel.ScorePath(p) is double pr)
+                        if (MlModel.TabScore(p, MlMode) is { } v)
                         {
-                            mls = $" [ML {pr:F2}]";
-                            if (pr > 0.7) high = true;
+                            mls = $" [ML {v.Score:F2}]";
+                            if (v.High) high = true;
                         }
                     }
                     var nf = new Finding
@@ -1032,14 +1035,21 @@ public static class Scanner
                 /* 误杀防护: 有效签名(微软/Mozilla 等)或纯托管 .NET (COM 目录)直接放行 */
                 if (IsValidSigned(p)) continue;
                 if (IsDotNetManaged(p)) continue;
-                if (MlModel.ScorePath(p) is double pr && pr > 0.7)
-                    res.Add(new Finding
+                if (MlModel.DualScore(p) is { } ds)
+                {
+                    var v = MlInfer.Decide(ds.Tab, ds.Img, MlMode);
+                    if (v.High)
                     {
-                        Kind = "FILE",
-                        Detail = $"{p} [ML深度 {pr:F2}]",
-                        High = true,
-                        Action = $"quarantine {p}"
-                    });
+                        var tag = MlMode == 0 ? "高" : (MlMode == 2 ? "低" : "平");
+                        res.Add(new Finding
+                        {
+                            Kind = "FILE",
+                            Detail = $"{p} [ML深度{tag} {v.Score:F2}]",
+                            High = true,
+                            Action = $"quarantine {p}"
+                        });
+                    }
+                }
             }
         return res;
     }

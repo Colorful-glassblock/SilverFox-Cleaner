@@ -529,7 +529,7 @@ internal static class PeFeat
             secVa.Add(vaddr);
         }
         int nsecs = secNames.Count;
-        var x = new double[22];
+        var x = new double[28];
 
         x[0] = Contains(data, "Go build ID:") ? 1 : 0;
         x[1] = Contains(data, "golang.org") || Contains(data, "runtime.main") || Contains(data, "main.main") ? 1 : 0;
@@ -602,6 +602,22 @@ internal static class PeFeat
         }
         x[20] = Round4(epf);
         x[21] = ep4 >= 7.5 ? 1 : 0;
+        // 2026-09-25 新判别特征 (FEATURES[22..28])
+        {
+            var vsKeys = new[] { "CompanyName", "OriginalFilename", "FileDescription",
+                                 "FileVersion", "ProductName", "LegalCopyright", "InternalName" }
+                .Select(n => Encoding.Unicode.GetBytes(n)).ToArray();
+            x[22] = vsKeys.Count(k => Find(data, k));
+            x[23] = Find(data, "manifestVersion"u8.ToArray())
+                    || Find(data, Encoding.Unicode.GetBytes("manifestVersion")) ? 1 : 0;
+            int ddoff = opt + (is64 ? 112 : 96);
+            int nrv = ddoff >= 4 ? (int)U32(data, ddoff - 4) : 0;
+            uint D(int i) => nrv > i && ddoff + (i + 1) * 8 <= data.Length ? U32(data, ddoff + i * 8) : 0;
+            x[24] = D(9) != 0 ? 1 : 0;
+            x[25] = opt + 64 + 4 <= data.Length && U32(data, opt + 64) == 0 ? 1 : 0;
+            x[26] = D(6) != 0 ? 1 : 0;
+            x[27] = D(0) != 0 ? 1 : 0;
+        }
         return x;
     }
 }
