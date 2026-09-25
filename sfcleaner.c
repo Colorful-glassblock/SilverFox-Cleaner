@@ -44,6 +44,15 @@
 #define QMAGIC "SFQENC1\0"
 #define MAXF 1024
 
+/* 版本号: CI 按命名规则注入 -DSFC_VER=<branch>-release-<ver>|<branch>-pre-<sha8> (build.sh 读 $SFC_VER);
+   本地构建缺省 v5.1-dev. SFC_VERSTR_2 做字符串化, 保证 SFC_VER 不带引号 */
+#ifndef SFC_VER
+#define SFC_VER v5.1-dev
+#endif
+#define SFC_VERSTR_2(x) #x
+#define SFC_VERSTR_1(x) SFC_VERSTR_2(x)
+#define SFC_VERSTR SFC_VERSTR_1(SFC_VER)
+
 static const char *C2_IOCS[]  = {"4d.skendh.com", "de.sjd82.org", "skendh.com", "sjd82.org", "dmo/client"};
 static const char *NAME_HITS[] = {"ekxzjr", "dd9ocged", "srl.exe", "wdybq.dll", "steam.exe",
     "drivers.dat", "drivers.dat.0",
@@ -2085,7 +2094,7 @@ static void fmt_report(char *out, size_t rsz)
 
 static void msgbox(const char *text)
 {
-    MessageBoxA(NULL, text, "SilverFox Cleaner C", MB_OK);
+    MessageBoxA(NULL, text, "SilverFox Cleaner " SFC_VERSTR, MB_OK);
 }
 
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
@@ -2149,7 +2158,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
             }
             return 0;
         case 3:
-            msgbox("SilverFox Cleaner C (x86/x64, NT6+)\n\n"
+            msgbox("SilverFox Cleaner C " SFC_VERSTR " (x86/x64, NT6+)\n\n"
                    "检测: 持久化/落盘/互斥/SrL/ctfmon注入\n"
                    "隔离: SFQENC1 时间戳加密 (三版互通)\n"
                    "极端: --extreme 蓝屏(安全模式清场)x2 + 自毁\n"
@@ -2205,7 +2214,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
                             "→ 卸载 → 删证书 → testsigning OFF\n"
                             "仅限虚拟机, 先保存全部工作!\n\n"
                             "材料: SFCleanerDrv.sys + SFCleanerCert.pfx 与程序同目录",
-                            "SilverFox Cleaner 不客气模式", MB_OKCANCEL | MB_ICONWARNING) == IDOK) {
+                            "SilverFox Cleaner " SFC_VERSTR " — 不客气模式", MB_OKCANCEL | MB_ICONWARNING) == IDOK) {
                 gui_append("[!!] 不客气模式启动\n");
                 nomore_run();
             }
@@ -2226,7 +2235,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
                             "序列: 自启动+标记 -> 安全模式启动 -> 清除 -> 蓝屏\n"
                             "重启(安全模式): 再清除 -> 解除safeboot -> 自毁 -> 蓝屏\n\n"
                             "共两次蓝屏! 请保存所有工作!",
-                            "SilverFox Cleaner 极端模式", MB_OKCANCEL | MB_ICONWARNING) == IDOK) {
+                            "SilverFox Cleaner " SFC_VERSTR " — 极端模式", MB_OKCANCEL | MB_ICONWARNING) == IDOK) {
                 gui_append("[!!] 极端模式启动\n");
                 extreme_run();
             }
@@ -2265,7 +2274,7 @@ static void run_gui(void)
     AppendMenuA(g_menu, MF_STRING, 0x120, "灵敏度: 高检测率");
     AppendMenuA(g_menu, MF_STRING | MF_CHECKED, 0x121, "灵敏度: 平衡 (默认)");
     AppendMenuA(g_menu, MF_STRING, 0x122, "灵敏度: 低误杀");
-    hwnd = CreateWindowExA(0, "SFC5", "SilverFox Cleaner C - NT6+ (x86/x64)",
+    hwnd = CreateWindowExA(0, "SFC5", "SilverFox Cleaner C " SFC_VERSTR " (x86/x64)",
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE, 200, 200, 1060, 640,
                            NULL, NULL, wc.hInstance, NULL);
     if (!hwnd) return;
@@ -2293,7 +2302,7 @@ static void run_gui(void)
                              | ES_AUTOVSCROLL | ES_WANTRETURN,
                              14, 74, 876, 474, hwnd, (HMENU)7, wc.hInstance, NULL);
     SendMessageA(g_edit, WM_SETFONT, (WPARAM)font, TRUE);
-    gui_append("SilverFox Cleaner C (NT6+, 重写版) - dmo/client\n"
+    gui_append("SilverFox Cleaner C " SFC_VERSTR " (NT6+, 重写版) - dmo/client\n"
                "build: " __DATE__ " " __TIME__ "\n"
                "检测: 持久化 / 落盘物 / 互斥 / SrL / ctfmon内存注入\n"
                "隔离: 时间戳加密 SFQENC1 (三版互通)\n"

@@ -9,6 +9,9 @@ FLAGS="-O2 -s -Wall -Wno-pointer-sign \
  -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 \
  -finput-charset=UTF-8 -fexec-charset=GBK -mwindows"
 
+# 版本号自动注入: CI 按命名规则设 $SFC_VER (<branch>-release-<ver> / <branch>-pre-<sha8>); 本地不设走源内缺省 v5.1-dev
+[ -n "$SFC_VER" ] && FLAGS="$FLAGS -DSFC_VER=$SFC_VER"
+
 # 可选: 存在驱动/证书时 xxd 生成内嵌头 (CI 或手动放置 SFCleanerDrv.sys + SFCleanerCert.cer)
 if [ -f SFCleanerDrv.sys ] && [ -f SFCleanerCert.cer ]; then
   echo "[embed] 生成 embed_drv.h + embed_cer.h (驱动+证书将内嵌进 exe)"
