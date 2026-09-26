@@ -993,12 +993,27 @@ static void bj_scan_dir(const char *dir, int depth)
             }
             if (se && ud) {
                 char det[MAX_PATH + 192], act[MAX_PATH + 16];
+                int high = renamed;
                 if (renamed)
                     _snprintf(det, sizeof det - 1, "%s [白加黑: 签名EXE被改名 (OriginalFilename=%s)+未签名DLL]", hitbuf, orig);
                 else
                     _snprintf(det, sizeof det - 1, "%s [白加黑: 有效签名EXE+未签名DLL]", hitbuf);
+                /* ML 复核门控白加黑: 开启后对未签名 DLL 打分, 高分升高置信/低分降结构, 打 [ML x.xx] */
+                if (g_ml_on && !is_self_path(hitbuf)) {
+                    double x28[28];
+                    float pr;
+                    if (ml_feat_extract(hitbuf, x28) == 0) {
+                        pr = ml_tab_p(x28);
+                        {
+                            char mlb[24];
+                            _snprintf(mlb, sizeof mlb - 1, " [ML %.2f]", (double)pr);
+                            strncat(det, mlb, sizeof det - strlen(det) - 1);
+                        }
+                        high = pr > ml_tab_threshold(g_ml_mode);
+                    }
+                }
                 _snprintf(act, sizeof act - 1, "quarantine %s", hitbuf);
-                addf("FILE", renamed, det, act);
+                addf("FILE", high, det, act);
             }
         }
     }
@@ -1178,7 +1193,7 @@ static void ml_deep_cb(const char *full, void *ctx)
     long n;
     (void)ctx;
     n = InterlockedIncrement(&g_files_done);
-    if ((n & 0x1FFF) == 0) {   /* 进度: 每 8192 个文件一行, 深扫全程有输出不显卡死 */
+    if ((n & 0x3FF) == 0) {   /* 进度: 每 1024 个文件一行, 深扫全程有输出不显卡死 */
         char pb[96];
         _snprintf(pb, sizeof pb - 1, "  已深度扫描 %ld 个文件\n", n);
         gui_append(pb);
@@ -1236,12 +1251,20 @@ static void scan_ml_deep(void)
     static const char *envs[] = {"APPDATA", "LOCALAPPDATA", "TEMP", "ProgramData",
                                  "ProgramFiles", "ProgramFiles(x86)"};
     char roots[8][MAX_PATH]; int nroots = 0, r;
+    char sum[160];
+    int before_nf;
+    long f0;
     if (!g_ml_deep) return;   /* 实验性: 独立开关, 默认关 */
     for (r = 0; r < 6 && nroots < 8; r++) {
         char *v = getenv(envs[r]);
         if (v && *v) strncpy(roots[nroots++], v, MAX_PATH - 1);
     }
+    before_nf = g_nf; f0 = g_files_done;
+    gui_append("[..] 深度 ML 扫描开始 (逐目录, 进度每 1024 文件一行)\n");
     for (r = 0; r < nroots; r++) walk_paths_n(roots[r], 0, 8, ml_deep_cb, NULL);
+    _snprintf(sum, sizeof sum - 1, "[..] 深度 ML 扫描完成: 遍历 %ld 个文件, ML 命中 %d 项\n",
+              (long)(g_files_done - f0), g_nf - before_nf);
+    gui_append(sum);
 }
 
 static void wd_scan_dir(const char *dir, int depth)
