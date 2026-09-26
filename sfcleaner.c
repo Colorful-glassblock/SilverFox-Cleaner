@@ -686,16 +686,20 @@ static void file_cb(const char *full, void *unused)
         }
         if (byNm || md[0]) {
             char det[MAX_PATH + 96], act[MAX_PATH + 16], mlb[24] = "";
-            int high = byNm;
+            int high = byNm, skip_ml = 0;
             if (!byNm && g_ml_on && !is_self_path(full)) {
-                /* 实验性: 结构匹配 → ML 复核 (菜单开启后生效): >0.7 升为高置信; 非 PE 不给分 (ml_score 返 -1) */
+                /* 实验性: 结构匹配 → ML 复核: >阈值 升为高置信; <0.5 不进清除列表; 非 PE 不给分 */
                 double x28[28];
                 if (ml_feat_extract(full, x28) == 0) {
                     float pr = ml_tab_p(x28);
-                    _snprintf(mlb, sizeof mlb - 1, " [ML %.2f]", (double)pr);
-                    if (pr > ml_tab_threshold(g_ml_mode)) high = 1;
+                    if (pr < 0.50f) skip_ml = 1;
+                    else {
+                        _snprintf(mlb, sizeof mlb - 1, " [ML %.2f]", (double)pr);
+                        if (pr > ml_tab_threshold(g_ml_mode)) high = 1;
+                    }
                 }
             }
+            if (skip_ml) return;
             if (byNm) { strncpy(det, full, sizeof det - 1); det[sizeof det - 1] = 0; }
             else _snprintf(det, sizeof det - 1, "%s%s%s", full, md, mlb);
             _snprintf(act, sizeof act - 1, "quarantine %s", full);
@@ -993,27 +997,30 @@ static void bj_scan_dir(const char *dir, int depth)
             }
             if (se && ud) {
                 char det[MAX_PATH + 192], act[MAX_PATH + 16];
-                int high = renamed;
+                int high = renamed, skip_ml = 0;
                 if (renamed)
                     _snprintf(det, sizeof det - 1, "%s [白加黑: 签名EXE被改名 (OriginalFilename=%s)+未签名DLL]", hitbuf, orig);
                 else
                     _snprintf(det, sizeof det - 1, "%s [白加黑: 有效签名EXE+未签名DLL]", hitbuf);
-                /* ML 复核门控白加黑: 开启后对未签名 DLL 打分, 高分升高置信/低分降结构, 打 [ML x.xx] */
+                /* ML 复核门控白加黑: 打分 <0.5 不进清除列表, >=0.5 高分升高置信/低分降结构 */
                 if (g_ml_on && !is_self_path(hitbuf)) {
                     double x28[28];
                     float pr;
                     if (ml_feat_extract(hitbuf, x28) == 0) {
                         pr = ml_tab_p(x28);
-                        {
+                        if (pr < 0.50f) skip_ml = 1;
+                        else {
                             char mlb[24];
                             _snprintf(mlb, sizeof mlb - 1, " [ML %.2f]", (double)pr);
                             strncat(det, mlb, sizeof det - strlen(det) - 1);
+                            high = pr > ml_tab_threshold(g_ml_mode);
                         }
-                        high = pr > ml_tab_threshold(g_ml_mode);
                     }
                 }
-                _snprintf(act, sizeof act - 1, "quarantine %s", hitbuf);
-                addf("FILE", high, det, act);
+                if (!skip_ml) {
+                    _snprintf(act, sizeof act - 1, "quarantine %s", hitbuf);
+                    addf("FILE", high, det, act);
+                }
             }
         }
     }
@@ -1212,7 +1219,7 @@ static void ml_deep_cb(const char *full, void *ctx)
         MlVerdict v;
         if (ml_delta_img(full, dimg)) i = ml_img_p(dimg);
         v = ml_verdict(t, i, g_ml_mode);
-        if (v.high) {
+        if (v.high && v.score >= 0.5f) {   /* ML 低于 0.5 不进清除列表 */
             char det[MAX_PATH + 96], act[MAX_PATH + 16];
             const char *tag = g_ml_mode == 0 ? "高" : (g_ml_mode == 2 ? "低" : "平");
             _snprintf(det, sizeof det - 1, "%s [ML深度%s %.2f]", full, tag, (double)v.score);
