@@ -868,27 +868,35 @@ public static class Scanner
                     string? hit = dlls.FirstOrDefault(d => !IsValidSigned(d));
                     if (hit != null)
                     {
-                        /* ML 复核门控白加黑: 开启后对未签名 DLL 打分, 高分升高置信/低分降结构,
-                           并打 [ML x.xx] 标签 — 123pan 这类合法 vendored DLL 目录不再高置信隔离 */
+                        /* ML 复核门控白加黑: 打分 <0.5 不进清除列表, >=0.5 高分升高置信/低分降结构 */
                         bool high = renamed;
                         string mls = "";
+                        bool skipMl = false;
                         if (MlEnabled && !IsSelfPath(hit))
                         {
                             if (MlModel.TabScore(hit, MlMode) is { } v)
                             {
-                                mls = $" [ML {v.Score:F2}]";
-                                high = v.High;
+                                if (v.Score < 0.50f) skipMl = true;
+                                else
+                                {
+                                    mls = $" [ML {v.Score:F2}]";
+                                    high = v.High;
+                                }
                             }
                         }
-                        res.Add(new Finding
+                        if (skipMl) { /* ML <0.5 不进清除列表 */ }
+                        else
                         {
-                            Kind = "FILE",
-                            Detail = (renamed
-                                ? $"{hit} [白加黑: 签名EXE被改名 (OriginalFilename={orig})+未签名DLL]"
-                                : $"{hit} [白加黑: 有效签名EXE+未签名DLL]") + mls,
-                            High = high,
-                            Action = $"quarantine {hit}",
-                        });
+                            res.Add(new Finding
+                            {
+                                Kind = "FILE",
+                                Detail = (renamed
+                                    ? $"{hit} [白加黑: 签名EXE被改名 (OriginalFilename={orig})+未签名DLL]"
+                                    : $"{hit} [白加黑: 有效签名EXE+未签名DLL]") + mls,
+                                High = high,
+                                Action = $"quarantine {hit}",
+                            });
+                        }
                     }
                 }
             }
@@ -1080,17 +1088,23 @@ public static class Scanner
                 catch { /* 属性不可读忽略 */ }
                 if (byNm || md.Length > 0 || (hs.Length > 0 && isExt))
                 {
-                    /* 结构匹配 → ML 复核: >0.7 升为高置信; 非 PE 不给分 */
+                    /* 结构匹配 → ML 复核: >0.7 升为高置信; <0.5 不进清除列表; 非 PE 不给分 */
                     bool high = byNm;
                     string mls = "";
+                    bool skipMl = false;
                     if (!byNm && MlEnabled && !IsSelfPath(p))
                     {
                         if (MlModel.TabScore(p, MlMode) is { } v)
                         {
-                            mls = $" [ML {v.Score:F2}]";
-                            if (v.High) high = true;
+                            if (v.Score < 0.50f) skipMl = true;
+                            else
+                            {
+                                mls = $" [ML {v.Score:F2}]";
+                                if (v.High) high = true;
+                            }
                         }
                     }
+                    if (skipMl) continue;
                     var nf = new Finding
                     {
                         Kind = "FILE",
@@ -1156,7 +1170,7 @@ public static class Scanner
                     if (!MlInfer.DeltaImg(p, img)) return;
                     float imgp = MlInfer.ImageP(img);
                     var v = MlInfer.Decide(tab, imgp, MlMode);
-                    if (v.High)
+                    if (v.High && v.Score >= 0.5f)   /* ML 低于 0.5 不进清除列表 */
                     {
                         Interlocked.Increment(ref hits);
                         var tag = MlMode == 0 ? "高" : (MlMode == 2 ? "低" : "平");
