@@ -775,11 +775,18 @@ fn wb_dir(dir: &Path, depth: usize, out: &mut Vec<Finding>) {
             /* 白名单目录仅当签名 EXE 被改名时才成立 */
             if !whitelisted || renamed {
                 if let Some(h) = dlls.iter().find(|d| !wb_is_signed(d)) {
-                    let (detail, high) = if renamed {
+                    let (mut detail, mut high) = if renamed {
                         (format!("{} [白加黑: 签名EXE被改名 (OriginalFilename={})+未签名DLL]", h.display(), orig), true)
                     } else {
                         (format!("{} [白加黑: 有效签名EXE+未签名DLL]", h.display()), false)
                     };
+                    /* ML 复核门控白加黑: 开启后对未签名 DLL 打分, 高分升高置信/低分降结构, 打 [ML x.xx] */
+                    if ML_ENABLED.load(Ordering::Relaxed) != 0 && !is_self_path(h) {
+                        if let Some((pr, hi)) = ml_dual::ml_tab_high(h, ML_MODE.load(Ordering::Relaxed)) {
+                            detail.push_str(&format!(" [ML {:.2}]", pr));
+                            high = hi;
+                        }
+                    }
                     out.push(Finding {
                         kind: "FILE".into(),
                         detail,
@@ -1125,12 +1132,15 @@ fn scan_ml_deep() -> Vec<Finding> {
         if let Ok(p) = std::env::var(v) { roots.push(PathBuf::from(p)); }
     }
     let mode = ML_MODE.load(Ordering::Relaxed);
+    gui_append("[..] 深度 ML 扫描开始 (逐目录, 进度每 1024 文件一行)\n");
+    let mut total_seen: u64 = 0;
+    let mut total_hits: u64 = 0;
     for root in &roots {
         let mut seen: u64 = 0;
         let mut hits: u64 = 0;
         walk_deep(root, 0, 8, &mut |p| {
             seen += 1;
-            if seen & 0x1FFF == 0 {
+            if seen & 0x3FF == 0 {
                 gui_append(&format!("  已深度扫描 {} 个文件 (ML深度命中 {} 项)\n", seen, hits));
             }
             let s = p.to_string_lossy().to_lowercase();
@@ -1156,7 +1166,10 @@ fn scan_ml_deep() -> Vec<Finding> {
                 });
             }
         });
+        total_seen += seen;
+        total_hits += hits;
     }
+    gui_append(&format!("[..] 深度 ML 扫描完成: 遍历 {} 个文件, ML 命中 {} 项\n", total_seen, total_hits));
     out
 }
 
