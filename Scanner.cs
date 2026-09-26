@@ -868,13 +868,25 @@ public static class Scanner
                     string? hit = dlls.FirstOrDefault(d => !IsValidSigned(d));
                     if (hit != null)
                     {
+                        /* ML 复核门控白加黑: 开启后对未签名 DLL 打分, 高分升高置信/低分降结构,
+                           并打 [ML x.xx] 标签 — 123pan 这类合法 vendored DLL 目录不再高置信隔离 */
+                        bool high = renamed;
+                        string mls = "";
+                        if (MlEnabled && !IsSelfPath(hit))
+                        {
+                            if (MlModel.TabScore(hit, MlMode) is { } v)
+                            {
+                                mls = $" [ML {v.Score:F2}]";
+                                high = v.High;
+                            }
+                        }
                         res.Add(new Finding
                         {
                             Kind = "FILE",
-                            Detail = renamed
+                            Detail = (renamed
                                 ? $"{hit} [白加黑: 签名EXE被改名 (OriginalFilename={orig})+未签名DLL]"
-                                : $"{hit} [白加黑: 有效签名EXE+未签名DLL]",
-                            High = renamed,
+                                : $"{hit} [白加黑: 有效签名EXE+未签名DLL]") + mls,
+                            High = high,
                             Action = $"quarantine {hit}",
                         });
                     }
@@ -1115,6 +1127,8 @@ public static class Scanner
         AddEnv(roots, "TEMP");
         AddEnv(roots, "ProgramData");
         int dop = Math.Min(Math.Max(Environment.ProcessorCount, 1), 6);   // 与 t1/t2/t4 并行, 别过载
+        log?.Report("[..] 深度 ML 扫描开始 (逐目录, 进度每 256 文件一行)");
+        long totalSeen = 0, totalHits = 0;
         foreach (var root in roots.Where(Directory.Exists))
         {
             var bag = new System.Collections.Concurrent.ConcurrentBag<Finding>();
@@ -1159,7 +1173,10 @@ public static class Scanner
                 catch { /* 单个文件异常不阻塞整轮 */ }
             });
             res.AddRange(bag);
+            totalSeen += Volatile.Read(ref seen);
+            totalHits += Volatile.Read(ref hits);
         }
+        log?.Report($"[..] 深度 ML 扫描完成: 遍历 {totalSeen} 个文件, ML 命中 {totalHits} 项");
         return res;
     }
 
