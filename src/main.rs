@@ -780,13 +780,19 @@ fn wb_dir(dir: &Path, depth: usize, out: &mut Vec<Finding>) {
                     } else {
                         (format!("{} [白加黑: 有效签名EXE+未签名DLL]", h.display()), false)
                     };
-                    /* ML 复核门控白加黑: 开启后对未签名 DLL 打分, 高分升高置信/低分降结构, 打 [ML x.xx] */
+                    /* ML 复核门控白加黑: 打分 <0.5 不进清除列表, >=0.5 高分升高置信/低分降结构 */
+                    let mut skip_ml = false;
                     if ML_ENABLED.load(Ordering::Relaxed) != 0 && !is_self_path(h) {
                         if let Some((pr, hi)) = ml_dual::ml_tab_high(h, ML_MODE.load(Ordering::Relaxed)) {
-                            detail.push_str(&format!(" [ML {:.2}]", pr));
-                            high = hi;
+                            if pr < 0.50 {
+                                skip_ml = true;
+                            } else {
+                                detail.push_str(&format!(" [ML {:.2}]", pr));
+                                high = hi;
+                            }
                         }
                     }
+                    if skip_ml { return; }
                     out.push(Finding {
                         kind: "FILE".into(),
                         detail,
@@ -1063,15 +1069,21 @@ fn scan_files() -> Vec<Finding> {
                 if GetFileAttributesW(utf16(&p.to_string_lossy()).as_ptr()) & 0x6 != 0 { hs = " [隐藏+系统]"; }
             }
             if by_nm || !md.is_empty() || (hs != "" && isext) {
-                /* 结构匹配 → ML 复核: >0.7 升为高置信; 非 PE 不给分 */
+                /* 结构匹配 → ML 复核: >阈值 升为高置信; <0.5 不进清除列表; 非 PE 不给分 */
                 let mut high = by_nm;
                 let mut marks = if by_nm { String::new() } else { format!("{}{}", md, hs) };
+                let mut skip_ml = false;
                 if !by_nm && ML_ENABLED.load(Ordering::Relaxed) != 0 && !is_self_path(&p) {
                     if let Some((pr, hi)) = ml_dual::ml_tab_high(&p, ML_MODE.load(Ordering::Relaxed)) {
-                        marks.push_str(&format!(" [ML {:.2}]", pr));
-                        if hi { high = true; }
+                        if pr < 0.50 {
+                            skip_ml = true;
+                        } else {
+                            marks.push_str(&format!(" [ML {:.2}]", pr));
+                            if hi { high = true; }
+                        }
                     }
                 }
+                if skip_ml { return; }
                 out.push(Finding { kind: "FILE".into(), detail: format!("{}{}", p.display(), marks), high, action: format!("quarantine {}", p.display()) });
             }
         });
@@ -1155,7 +1167,7 @@ fn scan_ml_deep() -> Vec<Finding> {
             if tab <= ml_dual::tab_floor(mode) { return; }   /* 表格地板: CNN 只跑疑似 */
             let img = ml_dual::delta_image(p).map(|im| ml_dual::image_p(&im)).unwrap_or(0.0);
             let v = ml_dual::verdict(tab, img, mode);
-            if v.high {
+            if v.high && v.score >= 0.5 {   /* ML 低于 0.5 不进清除列表 */
                 hits += 1;
                 let tag = match mode { 0 => "高", 2 => "低", _ => "平" };
                 out.push(Finding {
